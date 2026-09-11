@@ -335,10 +335,6 @@ extern "C" AGENTXR_API XRAPI_ATTR XrResult XRAPI_CALL xrCreateActionSpace(XrSess
 		{
 			return XR_ERROR_ACTION_TYPE_MISMATCH;
 		}
-		if (!IsAttached(*session->object, action))
-		{
-			return XR_ERROR_ACTIONSET_NOT_ATTACHED;
-		}
 		if (createInfo->subactionPath != XR_NULL_PATH && std::find(action.subactionPaths.begin(), action.subactionPaths.end(), createInfo->subactionPath) == action.subactionPaths.end())
 		{
 			return XR_ERROR_PATH_UNSUPPORTED;

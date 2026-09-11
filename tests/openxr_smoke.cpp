@@ -494,7 +494,7 @@ public:
 		return true;
 	}
 
-	bool InitializeGraphics()
+	bool InitializeGraphics(bool createDefaultResources = true)
 	{
 		if (!apiFallbackObserved)
 		{
@@ -604,7 +604,7 @@ public:
 			return false;
 		}
 		graphicsRequirementsQueried = true;
-		if (!CreateSessionOnly())
+		if (!CreateSessionOnly(createDefaultResources))
 		{
 			std::cerr << "initialize graphics: session creation failed\n";
 			return false;
@@ -884,6 +884,64 @@ public:
 		return Expect(xrBeginFrame(session, &beginInfo), XR_ERROR_CALL_ORDER_INVALID, "begin frame before wait");
 	}
 
+	bool PipelinedFrame()
+	{
+		XrFrameWaitInfo waitInfo{XR_TYPE_FRAME_WAIT_INFO};
+		XrFrameState firstState{XR_TYPE_FRAME_STATE};
+		if (!Check(xrWaitFrame(session, &waitInfo, &firstState), "pipelined-frame wait 1"))
+		{
+			return false;
+		}
+		XrFrameState duplicateWaitState{XR_TYPE_FRAME_STATE};
+		if (!Expect(xrWaitFrame(session, &waitInfo, &duplicateWaitState), XR_ERROR_CALL_ORDER_INVALID, "pipelined-frame duplicate wait"))
+		{
+			return false;
+		}
+
+		XrFrameBeginInfo beginInfo{XR_TYPE_FRAME_BEGIN_INFO};
+		if (!Check(xrBeginFrame(session, &beginInfo), "pipelined-frame begin 1"))
+		{
+			return false;
+		}
+		if (!Expect(xrBeginFrame(session, &beginInfo), XR_ERROR_CALL_ORDER_INVALID, "pipelined-frame duplicate begin"))
+		{
+			return false;
+		}
+
+		XrFrameState secondState{XR_TYPE_FRAME_STATE};
+		if (!Check(xrWaitFrame(session, &waitInfo, &secondState), "pipelined-frame wait 2"))
+		{
+			return false;
+		}
+		if (secondState.predictedDisplayTime <= firstState.predictedDisplayTime)
+		{
+			std::cerr << "pipelined-frame: second predicted display time did not increase\n";
+			return false;
+		}
+
+		XrFrameEndInfo endInfo{XR_TYPE_FRAME_END_INFO};
+		endInfo.displayTime = firstState.predictedDisplayTime;
+		endInfo.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
+		if (!Check(xrEndFrame(session, &endInfo), "pipelined-frame end 1"))
+		{
+			return false;
+		}
+		if (!Expect(xrEndFrame(session, &endInfo), XR_ERROR_CALL_ORDER_INVALID, "pipelined-frame duplicate end"))
+		{
+			return false;
+		}
+		if (!Check(xrBeginFrame(session, &beginInfo), "pipelined-frame begin 2"))
+		{
+			return false;
+		}
+		endInfo.displayTime = secondState.predictedDisplayTime;
+		if (!Check(xrEndFrame(session, &endInfo), "pipelined-frame end 2"))
+		{
+			return false;
+		}
+		return true;
+	}
+
 	bool PipelinedSwapchain()
 	{
 		XrSwapchain pipelinedSwapchain = XR_NULL_HANDLE;
@@ -1041,7 +1099,6 @@ public:
 		return destroy();
 	}
 
-
 	bool InvalidHandle()
 	{
 		XrFrameWaitInfo waitInfo{XR_TYPE_FRAME_WAIT_INFO};
@@ -1055,18 +1112,24 @@ public:
 		return CreateSessionOnly();
 	}
 
+	bool PrepareUnrealActionSetup()
+	{
+		return CreateActions(true, true) && CreateSwapchain();
+	}
+
 	bool DestroyCurrentSession()
 	{
 		DestroySessionOnly();
 		return session == XR_NULL_HANDLE;
 	}
+
 	bool HasApiFallback() const
 	{
 		return apiFallbackObserved;
 	}
 
 private:
-	bool CreateSessionOnly()
+	bool CreateSessionOnly(bool createDefaultResources = true)
 	{
 		if (!graphicsRequirementsQueried)
 		{
@@ -1082,7 +1145,7 @@ private:
 		{
 			return false;
 		}
-		if (!CreateSpaces() || !CreateActions() || !CreateSwapchain())
+		if (!CreateSpaces() || (createDefaultResources && (!CreateActions() || !CreateSwapchain())))
 		{
 			DestroySessionOnly();
 			return false;
@@ -1169,7 +1232,7 @@ private:
 		return create(XR_REFERENCE_SPACE_TYPE_VIEW, viewSpace) && create(XR_REFERENCE_SPACE_TYPE_LOCAL, localSpace) && create(XR_REFERENCE_SPACE_TYPE_STAGE, stageSpace) && create(XR_REFERENCE_SPACE_TYPE_LOCAL_FLOOR_EXT, localFloorSpace);
 	}
 
-	bool CreateActions()
+	bool CreateActions(bool createPoseSpaceBeforeAttach = false, bool useSimpleControllerProfile = false)
 	{
 		XrActionSetCreateInfo setInfo{XR_TYPE_ACTION_SET_CREATE_INFO};
 		std::strcpy(setInfo.actionSetName, "smoke");
@@ -1201,7 +1264,7 @@ private:
 		{
 			return false;
 		}
-		const XrPath profile = Path("/interaction_profiles/oculus/touch_controller");
+		const XrPath profile = Path(useSimpleControllerProfile ? "/interaction_profiles/khr/simple_controller" : "/interaction_profiles/oculus/touch_controller");
 		const XrPath bindingPath = Path("/user/hand/right/input/a/click");
 		const XrPath poseBindingPath = Path("/user/hand/right/input/grip/pose");
 		if (profile == XR_NULL_PATH || bindingPath == XR_NULL_PATH || poseBindingPath == XR_NULL_PATH)
@@ -1209,11 +1272,24 @@ private:
 			return false;
 		}
 		const XrActionSuggestedBinding suggestedBindings[] = {{action, bindingPath}, {poseAction, poseBindingPath}};
+		const XrActionSuggestedBinding simpleBinding{poseAction, poseBindingPath};
 		XrInteractionProfileSuggestedBinding suggestions{XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING};
 		suggestions.interactionProfile = profile;
-		suggestions.countSuggestedBindings = static_cast<uint32_t>(std::size(suggestedBindings));
-		suggestions.suggestedBindings = suggestedBindings;
+		suggestions.countSuggestedBindings = useSimpleControllerProfile ? 1u : static_cast<uint32_t>(std::size(suggestedBindings));
+		suggestions.suggestedBindings = useSimpleControllerProfile ? &simpleBinding : suggestedBindings;
 		if (!Check(xrSuggestInteractionProfileBindings(instance, &suggestions), "suggest bindings"))
+		{
+			return false;
+		}
+		const auto createPoseSpace = [&]()
+		{
+			XrActionSpaceCreateInfo spaceInfo{XR_TYPE_ACTION_SPACE_CREATE_INFO};
+			spaceInfo.action = poseAction;
+			spaceInfo.subactionPath = rightPath;
+			spaceInfo.poseInActionSpace = {{0.0f, 0.0f, 0.0f, 1.0f}, {0.0f, 0.0f, 0.0f}};
+			return Check(xrCreateActionSpace(session, &spaceInfo, &rightGripSpace), "create right grip space");
+		};
+		if (createPoseSpaceBeforeAttach && !createPoseSpace())
 		{
 			return false;
 		}
@@ -1224,11 +1300,11 @@ private:
 		{
 			return false;
 		}
-		XrActionSpaceCreateInfo spaceInfo{XR_TYPE_ACTION_SPACE_CREATE_INFO};
-		spaceInfo.action = poseAction;
-		spaceInfo.subactionPath = rightPath;
-		spaceInfo.poseInActionSpace = {{0.0f, 0.0f, 0.0f, 1.0f}, {0.0f, 0.0f, 0.0f}};
-		return Check(xrCreateActionSpace(session, &spaceInfo, &rightGripSpace), "create right grip space");
+		if (!createPoseSpaceBeforeAttach && !createPoseSpace())
+		{
+			return false;
+		}
+		return true;
 	}
 
 	bool CreateSwapchain()
@@ -1469,6 +1545,17 @@ int RunScenario(const std::wstring& runtimeManifest, const std::filesystem::path
 		return swapchainPassed ? 0 : 1;
 	}
 
+	if (scenarioName == "pipelined-frame")
+	{
+		const bool framePassed = client.PipelinedFrame();
+		if (!client.End())
+		{
+			std::cerr << "scenario[" << scenarioName << "]: End failed\n";
+			return 1;
+		}
+		return framePassed ? 0 : 1;
+	}
+
 	if (scenarioName == "invalid-input")
 	{
 		Json invalid;
@@ -1672,6 +1759,40 @@ int RunScenario(const std::wstring& runtimeManifest, const std::filesystem::path
 	return 0;
 }
 
+int RunUnrealActionSetup(const std::wstring& runtimeManifest)
+{
+	OpenXR client;
+	if (!client.Load(runtimeManifest) || !client.InitializeGraphics(false))
+	{
+		std::cerr << "unreal-action-setup: initialization failed\n";
+		return 1;
+	}
+	if (!client.PrepareUnrealActionSetup())
+	{
+		std::cerr << "unreal-action-setup: action setup failed\n";
+		return 1;
+	}
+	if (!client.Begin())
+	{
+		std::cerr << "unreal-action-setup: session begin failed\n";
+		return 1;
+	}
+	bool pressed = false;
+	bool poseActive = false;
+	if (!client.Sync(pressed, &poseActive))
+	{
+		std::cerr << "unreal-action-setup: sync failed\n";
+		return 1;
+	}
+	if (!client.End())
+	{
+		std::cerr << "unreal-action-setup: session end failed\n";
+		return 1;
+	}
+	std::cerr << "unreal-action-setup: poseActive=" << (poseActive ? 1 : 0) << '\n';
+	return 0;
+}
+
 int RunSessionRestart(const std::wstring& runtimeManifest)
 {
 	OpenXR client;
@@ -1761,7 +1882,7 @@ int RunLifecycle(const std::wstring& runtimeManifest)
 void PrintHelp()
 {
 	std::cerr << "usage: agent-xr-smoke.exe --runtime <manifest> [--scenario <name>]\n";
-	std::cerr << "scenarios: lifecycle session-restart stereo-composition timeline-actions tracking-recovery invalid-input pipelined-swapchain\n";
+	std::cerr << "scenarios: lifecycle session-restart stereo-composition timeline-actions tracking-recovery invalid-input pipelined-swapchain pipelined-frame unreal-action-setup\n";
 }
 
 } // namespace
@@ -1804,7 +1925,11 @@ int wmain(int argc, wchar_t** argv)
 	{
 		return RunSessionRestart(runtimeManifest);
 	}
-	if (scenarioName == "stereo-composition" || scenarioName == "timeline-actions" || scenarioName == "tracking-recovery" || scenarioName == "invalid-input" || scenarioName == "pipelined-swapchain")
+	if (scenarioName == "unreal-action-setup")
+	{
+		return RunUnrealActionSetup(runtimeManifest);
+	}
+	if (scenarioName == "stereo-composition" || scenarioName == "timeline-actions" || scenarioName == "tracking-recovery" || scenarioName == "invalid-input" || scenarioName == "pipelined-swapchain" || scenarioName == "pipelined-frame")
 	{
 		return RunScenario(runtimeManifest, std::filesystem::path(argv[0]), scenarioName);
 	}

@@ -611,20 +611,14 @@ extern "C" AGENTXR_API XRAPI_ATTR XrResult XRAPI_CALL xrSuggestInteractionProfil
 		{
 			return XR_ERROR_HANDLE_INVALID;
 		}
-		if (CheckType(suggestedBindings, XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING) != XR_SUCCESS || suggestedBindings->interactionProfile == XR_NULL_PATH)
+		if (CheckType(suggestedBindings, XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING) != XR_SUCCESS)
 		{
 			return XR_ERROR_VALIDATION_FAILURE;
-		}
-		if (instance->object->PathString(suggestedBindings->interactionProfile) != kProfilePath)
-		{
-			return XR_ERROR_PATH_UNSUPPORTED;
 		}
 		if (suggestedBindings->countSuggestedBindings > 10000 || (suggestedBindings->countSuggestedBindings != 0 && suggestedBindings->suggestedBindings == nullptr))
 		{
 			return suggestedBindings->countSuggestedBindings > 10000 ? XR_ERROR_LIMIT_REACHED : XR_ERROR_VALIDATION_FAILURE;
 		}
-		std::vector<std::pair<XrAction, XrPath>> bindings;
-		bindings.reserve(suggestedBindings->countSuggestedBindings);
 		for (uint32_t index = 0; index < suggestedBindings->countSuggestedBindings; ++index)
 		{
 			const XrActionSuggestedBinding& binding = suggestedBindings->suggestedBindings[index];
@@ -632,6 +626,21 @@ extern "C" AGENTXR_API XRAPI_ATTR XrResult XRAPI_CALL xrSuggestInteractionProfil
 			{
 				return XR_ERROR_HANDLE_INVALID;
 			}
+		}
+		const std::string profile = instance->object->PathString(suggestedBindings->interactionProfile);
+		if (profile != kProfilePath)
+		{
+			if (profile.find("/interaction_profiles/") == 0)
+			{
+				return XR_SUCCESS;
+			}
+			return XR_ERROR_PATH_UNSUPPORTED;
+		}
+		std::vector<std::pair<XrAction, XrPath>> bindings;
+		bindings.reserve(suggestedBindings->countSuggestedBindings);
+		for (uint32_t index = 0; index < suggestedBindings->countSuggestedBindings; ++index)
+		{
+			const XrActionSuggestedBinding& binding = suggestedBindings->suggestedBindings[index];
 			InputRef input;
 			const bool pose = IsPosePath(*instance->object, binding.binding);
 			const bool value = IsSupportedInputPath(*instance->object, binding.binding, input);

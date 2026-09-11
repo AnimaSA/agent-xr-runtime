@@ -338,6 +338,8 @@ struct Session
 	bool running = false;
 	bool frameWaited = false;
 	bool frameBegun = false;
+	uint64_t waitedFrameId = 0;
+	uint64_t begunFrameId = 0;
 	bool actionSetsAttached = false;
 	bool closing = false;
 	bool requestExit = false;
