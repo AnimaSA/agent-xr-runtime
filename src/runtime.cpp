@@ -1304,23 +1304,37 @@ extern "C" AGENTXR_API XRAPI_ATTR XrResult XRAPI_CALL agentxrRequestExitActiveSe
 {
 	return agentxr::GuardResult([&]() -> XrResult
 	{
-		std::lock_guard activeSessionLock(agentxr::gActiveSessionMutex);
+		std::unique_lock activeSessionLock(agentxr::gActiveSessionMutex);
 		agentxr::Session* state = agentxr::gActiveSession;
 		if (state == nullptr)
 		{
 			return XR_ERROR_SESSION_NOT_RUNNING;
 		}
-		std::lock_guard sessionLock(state->mutex);
-		if (state->closing || !state->running)
+		std::unique_lock frameEndLock(state->frameEndMutex);
+		std::unique_lock sessionLock(state->mutex);
+		if (state->closing)
 		{
 			return XR_ERROR_SESSION_NOT_RUNNING;
 		}
-		if (state->requestExit || state->state == XR_SESSION_STATE_STOPPING)
+		if (!state->running)
 		{
-			return XR_SUCCESS;
+			return state->state == XR_SESSION_STATE_READY ? XR_SUCCESS : XR_ERROR_SESSION_NOT_RUNNING;
 		}
-		state->requestExit = true;
-		state->QueueState(XR_SESSION_STATE_STOPPING);
+		state->running = false;
+		state->state = XR_SESSION_STATE_READY;
+		state->requestExit = false;
+		state->waitedFrameIds.clear();
+		state->begunFrameIds.clear();
+		state->RefreshFrameAliases();
+		state->nextDisplayTime = 0;
+		state->nextDeadlineQpc = 0;
+		state->report.status = "ready";
+		agentxr::Compositor* compositor = state->compositor;
+		sessionLock.unlock();
+		if (compositor != nullptr)
+		{
+			compositor->StopPresentation();
+		}
 		return XR_SUCCESS;
 	});
 }
