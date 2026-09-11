@@ -666,6 +666,7 @@ AGENTXR_API XRAPI_ATTR XrResult XRAPI_CALL xrReleaseSwapchainImage(XrSwapchain s
 AGENTXR_API XRAPI_ATTR XrResult XRAPI_CALL xrBeginSession(XrSession session, const XrSessionBeginInfo* beginInfo);
 AGENTXR_API XRAPI_ATTR XrResult XRAPI_CALL xrEndSession(XrSession session);
 AGENTXR_API XRAPI_ATTR XrResult XRAPI_CALL xrRequestExitSession(XrSession session);
+AGENTXR_API XRAPI_ATTR XrResult XRAPI_CALL agentxrRequestExitActiveSession();
 AGENTXR_API XRAPI_ATTR XrResult XRAPI_CALL xrWaitFrame(XrSession session, const XrFrameWaitInfo* waitInfo, XrFrameState* frameState);
 AGENTXR_API XRAPI_ATTR XrResult XRAPI_CALL xrBeginFrame(XrSession session, const XrFrameBeginInfo* beginInfo);
 AGENTXR_API XRAPI_ATTR XrResult XRAPI_CALL xrEndFrame(XrSession session, const XrFrameEndInfo* endInfo);

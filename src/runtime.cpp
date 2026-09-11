@@ -1303,6 +1303,31 @@ extern "C" AGENTXR_API XRAPI_ATTR XrResult XRAPI_CALL xrRequestExitSession(XrSes
 	});
 }
 
+extern "C" AGENTXR_API XRAPI_ATTR XrResult XRAPI_CALL agentxrRequestExitActiveSession()
+{
+	return agentxr::GuardResult([&]() -> XrResult
+	{
+		std::lock_guard activeSessionLock(agentxr::gActiveSessionMutex);
+		agentxr::Session* state = agentxr::gActiveSession;
+		if (state == nullptr)
+		{
+			return XR_ERROR_SESSION_NOT_RUNNING;
+		}
+		std::lock_guard sessionLock(state->mutex);
+		if (state->closing || !state->running)
+		{
+			return XR_ERROR_SESSION_NOT_RUNNING;
+		}
+		if (state->requestExit || state->state == XR_SESSION_STATE_STOPPING)
+		{
+			return XR_SUCCESS;
+		}
+		state->requestExit = true;
+		state->QueueState(XR_SESSION_STATE_STOPPING);
+		return XR_SUCCESS;
+	});
+}
+
 extern "C" AGENTXR_API XRAPI_ATTR XrResult XRAPI_CALL xrWaitFrame(XrSession session, const XrFrameWaitInfo* waitInfo, XrFrameState* frameState)
 {
 	return agentxr::GuardResult([&]() -> XrResult
