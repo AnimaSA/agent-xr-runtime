@@ -1,0 +1,12 @@
+OpenXR-SDK
+Revision: f2448a8797c85814aa892efc1ab8707900fbcc78
+Version: 1.1.63
+License: Apache-2.0 OR MIT
+License text: openxr/LICENSE.txt
+Source archive: openxr/OpenXR-SDK-f2448a8797c85814aa892efc1ab8707900fbcc78.zip
+
+nlohmann/json
+Version: 3.12.0
+License: MIT
+License text: nlohmann/LICENSE.MIT
+Source: https://github.com/nlohmann/json/releases/tag/v3.12.0

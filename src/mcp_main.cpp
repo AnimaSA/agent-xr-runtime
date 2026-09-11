@@ -1,0 +1,413 @@
+#include "protocol.h"
+
+#include <shobjidl.h>
+#include <tlhelp32.h>
+#include <wrl.h>
+
+#include <algorithm>
+#include <cwchar>
+#include <filesystem>
+#include <iostream>
+#include <string>
+#include <string_view>
+#include <utility>
+
+#pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "ole32.lib")
+
+namespace
+{
+using Json = agentxr::protocol::Json;
+using agentxr::protocol::PipeFrame;
+
+struct Endpoint
+{
+	uint32_t processId = 0;
+	uint64_t processCreationTime = 0;
+	std::string image;
+	std::string runtimeVersion;
+	std::string instanceId;
+	std::wstring pipe;
+	Json handshake;
+};
+
+std::filesystem::path FindRepositoryRoot()
+{
+	std::filesystem::path path = std::filesystem::current_path();
+	for (;;)
+	{
+		if (std::filesystem::exists(path / "VRRaidGame.uproject") && std::filesystem::exists(path / "Launch VRRaidGame.lnk")) return path;
+		const std::filesystem::path parent = path.parent_path();
+		if (parent == path) return {};
+		path = parent;
+	}
+}
+
+uint64_t ProcessCreationTime(HANDLE process)
+{
+	FILETIME creation{}, exitTime{}, kernel{}, user{};
+	if (!GetProcessTimes(process, &creation, &exitTime, &kernel, &user)) return 0;
+	ULARGE_INTEGER value{};
+	value.LowPart = creation.dwLowDateTime;
+	value.HighPart = creation.dwHighDateTime;
+	return value.QuadPart;
+}
+
+std::wstring ProcessImagePath(uint32_t processId)
+{
+	HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, processId);
+	if (process == nullptr) return {};
+	std::vector<wchar_t> buffer(32768);
+	DWORD length = static_cast<DWORD>(buffer.size());
+	const BOOL ok = QueryFullProcessImageNameW(process, 0, buffer.data(), &length);
+	CloseHandle(process);
+	return ok ? std::wstring(buffer.data(), buffer.data() + length) : std::wstring{};
+}
+
+std::vector<uint32_t> ProcessIdsByImage(const std::wstring& expected)
+{
+	std::vector<uint32_t> result;
+	HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+	if (snapshot == INVALID_HANDLE_VALUE) return result;
+	PROCESSENTRY32W entry{};
+	entry.dwSize = sizeof(entry);
+	if (Process32FirstW(snapshot, &entry))
+	{
+		do
+		{
+			const std::wstring image = ProcessImagePath(entry.th32ProcessID);
+			if (!image.empty() && _wcsicmp(image.c_str(), expected.c_str()) == 0) result.push_back(entry.th32ProcessID);
+		}
+		while (Process32NextW(snapshot, &entry));
+	}
+	CloseHandle(snapshot);
+	return result;
+}
+
+bool OpenEndpoint(const std::wstring& pipeName, Endpoint& endpoint)
+{
+	HANDLE pipe = CreateFileW(pipeName.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr);
+	if (pipe == INVALID_HANDLE_VALUE) return false;
+	DWORD serverProcessId = 0;
+	if (!GetNamedPipeServerProcessId(pipe, &serverProcessId))
+	{
+		CloseHandle(pipe);
+		return false;
+	}
+	const Json request = {{"op", "handshake"}};
+	if (!agentxr::protocol::WriteFrame(pipe, request, {}, 500))
+	{
+		CloseHandle(pipe);
+		return false;
+	}
+	PipeFrame response;
+	if (!agentxr::protocol::ReadFrame(pipe, response, 1000) || !response.message.value("ok", false) || response.message.value("processId", 0u) != serverProcessId)
+	{
+		CloseHandle(pipe);
+		return false;
+	}
+	endpoint.processId = response.message.value("processId", 0u);
+	endpoint.processCreationTime = response.message.value("processCreationTime", 0ull);
+	endpoint.image = response.message.value("image", std::string{});
+	endpoint.runtimeVersion = response.message.value("runtimeVersion", std::string{});
+	endpoint.instanceId = response.message.value("instanceId", std::string{});
+	endpoint.pipe = pipeName;
+	endpoint.handshake = response.message;
+	CloseHandle(pipe);
+	return endpoint.processId != 0 && !endpoint.instanceId.empty();
+}
+
+std::vector<Endpoint> DiscoverEndpoints()
+{
+	std::vector<Endpoint> result;
+	WIN32_FIND_DATAW data{};
+	HANDLE find = FindFirstFileW(L"\\\\.\\pipe\\AgentXR.*", &data);
+	if (find == INVALID_HANDLE_VALUE) return result;
+	do
+	{
+		const std::wstring pipe = std::wstring(L"\\\\.\\pipe\\") + data.cFileName;
+		Endpoint endpoint;
+		if (OpenEndpoint(pipe, endpoint)) result.push_back(std::move(endpoint));
+	}
+	while (FindNextFileW(find, &data));
+	FindClose(find);
+	return result;
+}
+
+std::wstring MakeEnvironment(const std::wstring& runtimeManifest)
+{
+	std::wstring environment;
+	LPWCH block = GetEnvironmentStringsW();
+	if (block != nullptr)
+	{
+		for (LPWCH entry = block; *entry != L'\0'; entry += std::wcslen(entry) + 1)
+		{
+			if (_wcsnicmp(entry, L"XR_RUNTIME_JSON=", 16) != 0)
+			{
+				environment.append(entry);
+				environment.push_back(L'\0');
+			}
+		}
+		FreeEnvironmentStringsW(block);
+	}
+	environment.append(L"XR_RUNTIME_JSON=");
+	environment.append(runtimeManifest);
+	environment.push_back(L'\0');
+	environment.push_back(L'\0');
+	return environment;
+}
+
+Json LaunchEditor(const Json& arguments)
+{
+	const std::filesystem::path root = FindRepositoryRoot();
+	if (root.empty()) return agentxr::protocol::Error("project_not_found", "repository root or canonical shortcut not found");
+	const std::filesystem::path shortcut = root / "Launch VRRaidGame.lnk";
+	const std::filesystem::path manifest = root / "agent-xr" / "dist" / "agent-xr.json";
+	if (!std::filesystem::exists(manifest)) return agentxr::protocol::Error("runtime_not_installed", "agent-xr/dist/agent-xr.json not found");
+	HRESULT init = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+	const bool uninitialize = SUCCEEDED(init);
+	IShellLinkW* shellLinkRaw = nullptr;
+	HRESULT result = CoCreateInstance(CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&shellLinkRaw));
+	if (FAILED(result))
+	{
+		if (uninitialize) CoUninitialize();
+		return agentxr::protocol::Error("shortcut_failed", "cannot create ShellLink");
+	}
+	Microsoft::WRL::ComPtr<IShellLinkW> shellLink;
+	shellLink.Attach(shellLinkRaw);
+	Microsoft::WRL::ComPtr<IPersistFile> persist;
+	if (FAILED(shellLink.As(&persist)) || FAILED(persist->Load(shortcut.c_str(), STGM_READ)))
+	{
+		if (uninitialize) CoUninitialize();
+		return agentxr::protocol::Error("shortcut_failed", "cannot load canonical shortcut");
+	}
+	WCHAR targetBuffer[32768]{};
+	WIN32_FIND_DATAW findData{};
+	WCHAR argumentsBuffer[32768]{};
+	if (FAILED(shellLink->GetPath(targetBuffer, ARRAYSIZE(targetBuffer), &findData, SLGP_RAWPATH)) || FAILED(shellLink->GetArguments(argumentsBuffer, ARRAYSIZE(argumentsBuffer))))
+	{
+		if (uninitialize) CoUninitialize();
+		return agentxr::protocol::Error("shortcut_failed", "cannot resolve canonical shortcut");
+	}
+	const std::wstring target(targetBuffer);
+	std::wstring shortcutArguments(argumentsBuffer);
+	if (shortcutArguments.find(L"VRRaidGame.uproject") == std::wstring::npos)
+	{
+		if (uninitialize) CoUninitialize();
+		return agentxr::protocol::Error("project_mismatch", "canonical shortcut does not target VRRaidGame");
+	}
+	if (!ProcessIdsByImage(target).empty())
+	{
+		if (uninitialize) CoUninitialize();
+		return agentxr::protocol::Error("editor_already_running", "matching Unreal editor already running");
+	}
+	std::wstring command = L"\"" + target + L"\" " + shortcutArguments;
+	std::vector<wchar_t> commandLine(command.begin(), command.end());
+	commandLine.push_back(L'\0');
+	const std::wstring environment = MakeEnvironment(std::filesystem::absolute(manifest).wstring());
+	STARTUPINFOW startup{};
+	startup.cb = sizeof(startup);
+	PROCESS_INFORMATION processInfo{};
+	const BOOL created = CreateProcessW(nullptr, commandLine.data(), nullptr, nullptr, FALSE, CREATE_UNICODE_ENVIRONMENT, const_cast<wchar_t*>(environment.c_str()), root.c_str(), &startup, &processInfo);
+	if (uninitialize) CoUninitialize();
+	if (!created) return agentxr::protocol::Error("launch_failed", "CreateProcess failed");
+	const uint32_t processId = processInfo.dwProcessId;
+	CloseHandle(processInfo.hThread);
+	CloseHandle(processInfo.hProcess);
+	return {{"ok", true}, {"result", {{"processId", processId}, {"manifest", std::filesystem::absolute(manifest).string()}}}};
+}
+
+class RuntimeConnection
+{
+public:
+	~RuntimeConnection()
+	{
+		Close();
+	}
+
+	bool Connect(const Endpoint& endpoint)
+	{
+		Close();
+		pipe = CreateFileW(endpoint.pipe.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr);
+		if (pipe == INVALID_HANDLE_VALUE) return false;
+		processId = endpoint.processId;
+		instanceId = endpoint.instanceId;
+		return true;
+	}
+
+	void Close()
+	{
+		if (pipe != INVALID_HANDLE_VALUE)
+		{
+			CloseHandle(pipe);
+			pipe = INVALID_HANDLE_VALUE;
+		}
+		processId = 0;
+		instanceId.clear();
+	}
+
+	bool Send(const Json& request, PipeFrame& response)
+	{
+		return pipe != INVALID_HANDLE_VALUE && agentxr::protocol::WriteFrame(pipe, request, {}, 2000) && agentxr::protocol::ReadFrame(pipe, response, 2500);
+	}
+
+	uint32_t processId = 0;
+	std::string instanceId;
+
+private:
+	HANDLE pipe = INVALID_HANDLE_VALUE;
+};
+
+Json TextResult(const Json& value)
+{
+	return {{"content", Json::array({{{"type", "text"}, {"text", value.dump()}}})}};
+}
+
+Json ToolFailure(const Json& value)
+{
+	Json result = TextResult(value);
+	result["isError"] = true;
+	return result;
+}
+
+Json ListProcesses()
+{
+	Json processes = Json::array();
+	for (const Endpoint& endpoint : DiscoverEndpoints())
+	{
+		Json item = endpoint.handshake;
+		item["pipe"] = agentxr::protocol::Utf8FromWide(endpoint.pipe);
+		processes.push_back(std::move(item));
+	}
+	return {{"content", Json::array({{{"type", "text"}, {"text", processes.dump()}}})}};
+}
+
+Json CallXr(const Json& arguments, RuntimeConnection& connection)
+{
+	if (!arguments.is_object() || !arguments.contains("action") || !arguments.at("action").is_string()) return ToolFailure(agentxr::protocol::Error("invalid_arguments", "xr action is required"));
+	const std::string action = arguments.at("action").get<std::string>();
+	if (action == "list_processes") return ListProcesses();
+	if (action == "launch_editor")
+	{
+		Json launch = LaunchEditor(arguments);
+		return launch.value("ok", false) ? TextResult(launch) : ToolFailure(launch);
+	}
+	if (!arguments.contains("processId") || !arguments.contains("instanceId") || !arguments.at("processId").is_number_unsigned() || !arguments.at("instanceId").is_string()) return ToolFailure(agentxr::protocol::Error("invalid_arguments", "processId and instanceId required"));
+	const uint32_t processId = arguments.at("processId").get<uint32_t>();
+	const std::string instanceId = arguments.at("instanceId").get<std::string>();
+	if (connection.processId != processId || connection.instanceId != instanceId)
+	{
+		Endpoint selected;
+		for (const Endpoint& endpoint : DiscoverEndpoints())
+		{
+			if (endpoint.processId == processId && endpoint.instanceId == instanceId)
+			{
+				selected = endpoint;
+				break;
+			}
+		}
+		if (selected.pipe.empty() || !connection.Connect(selected)) return ToolFailure(agentxr::protocol::Error("runtime_unavailable", "runtime endpoint not found"));
+	}
+	Json request = arguments;
+	request["op"] = action;
+	PipeFrame response;
+	if (!connection.Send(request, response))
+	{
+		connection.Close();
+		return ToolFailure(agentxr::protocol::Error("runtime_closed", "runtime endpoint closed connection"));
+	}
+	if (!response.message.value("ok", false)) return ToolFailure(response.message);
+	if (action == "capture")
+	{
+		Json result = response.message.value("result", Json::object());
+		Json output = TextResult(result);
+		if (!response.binary.empty()) output["content"].push_back({{"type", "image"}, {"data", agentxr::protocol::Base64Encode(response.binary)}, {"mimeType", "image/png"}});
+		return output;
+	}
+	return TextResult(response.message.value("result", response.message));
+}
+
+Json JsonRpcError(const Json& id, int code, std::string_view message)
+{
+	return {{"jsonrpc", "2.0"}, {"id", id}, {"error", {{"code", code}, {"message", message}}}};
+}
+
+Json HandleRpc(const Json& request, RuntimeConnection& connection, bool& respond)
+{
+	respond = request.contains("id");
+	const Json id = request.contains("id") ? request.at("id") : nullptr;
+	if (!request.is_object() || request.value("jsonrpc", std::string{}) != "2.0" || !request.contains("method") || !request.at("method").is_string()) return JsonRpcError(id, -32600, "invalid request");
+	const std::string method = request.at("method").get<std::string>();
+	if (method.rfind("notifications/", 0) == 0)
+	{
+		respond = false;
+		return {};
+	}
+	if (method == "initialize")
+	{
+		return {{"jsonrpc", "2.0"}, {"id", id}, {"result", {{"protocolVersion", agentxr::protocol::kMcpProtocolVersion}, {"capabilities", {{"tools", Json::object()}}}, {"serverInfo", {{"name", "agent-xr-mcp"}, {"version", "1.0.0"}}}}}};
+	}
+	if (method == "ping") return {{"jsonrpc", "2.0"}, {"id", id}, {"result", Json::object()}};
+	if (method == "tools/list")
+	{
+		Json properties = Json::object();
+		properties["action"] = Json::object();
+		properties["action"]["type"] = "string";
+		properties["action"]["enum"] = Json::array({"list_processes", "launch_editor", "snapshot", "submit_timeline", "get_report", "cancel_timeline", "capture"});
+		properties["processId"] = Json{{"type", "integer"}};
+		properties["instanceId"] = Json{{"type", "string"}};
+		properties["sessionGeneration"] = Json{{"type", "integer"}};
+		properties["timelineId"] = Json{{"type", "integer"}};
+		properties["cursor"] = Json{{"type", "integer"}};
+		properties["limit"] = Json{{"type", "integer"}};
+		properties["afterFrameId"] = Json{{"type", "integer"}};
+		properties["timeline"] = Json{{"type", "object"}};
+		Json inputSchema = Json::object();
+		inputSchema["type"] = "object";
+		inputSchema["properties"] = std::move(properties);
+		inputSchema["required"] = Json::array({"action"});
+		Json tool = Json::object();
+		tool["name"] = "xr";
+		tool["description"] = "AgentXR runtime control and evidence";
+		tool["inputSchema"] = std::move(inputSchema);
+		return {{"jsonrpc", "2.0"}, {"id", id}, {"result", {{"tools", Json::array({tool})}}}};
+	}
+	if (method == "tools/call")
+	{
+		if (!request.contains("params") || !request.at("params").is_object() || request.at("params").value("name", std::string{}) != "xr") return JsonRpcError(id, -32602, "unknown tool");
+		const Json arguments = request.at("params").value("arguments", Json::object());
+		return {{"jsonrpc", "2.0"}, {"id", id}, {"result", CallXr(arguments, connection)}};
+	}
+	return JsonRpcError(id, -32601, "method not found");
+}
+
+} // namespace
+
+int wmain()
+{
+	std::ios::sync_with_stdio(false);
+	RuntimeConnection connection;
+	std::string line;
+	while (std::getline(std::cin, line))
+	{
+		if (line.size() > agentxr::protocol::kMaxMessageBytes)
+		{
+			std::cout << JsonRpcError(nullptr, -32600, "request exceeds 4 MiB limit").dump() << '\n' << std::flush;
+			continue;
+		}
+		Json request;
+		try
+		{
+			request = Json::parse(line);
+		}
+		catch (...)
+		{
+			std::cout << JsonRpcError(nullptr, -32700, "parse error").dump() << '\n' << std::flush;
+			continue;
+		}
+		bool respond = true;
+		Json response = HandleRpc(request, connection, respond);
+		if (respond && !response.is_null()) std::cout << response.dump() << '\n' << std::flush;
+	}
+	return 0;
+}
