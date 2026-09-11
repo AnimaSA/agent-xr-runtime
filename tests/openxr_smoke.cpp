@@ -1269,6 +1269,27 @@ public:
 			return false;
 		}
 
+		std::array<XrFrameState, 2> beginCreditStates{};
+		if (!waitFrame(beginCreditStates[0], "begin-credit W1") || !waitFrame(beginCreditStates[1], "begin-credit W2") || !beginFrame("begin-credit B1"))
+		{
+			return false;
+		}
+		if (!endFrame(beginCreditStates[1].predictedDisplayTime, "begin-credit E2 before E1"))
+		{
+			return false;
+		}
+		XrFrameEndInfo waitedEndInfo{XR_TYPE_FRAME_END_INFO};
+		waitedEndInfo.displayTime = beginCreditStates[0].predictedDisplayTime;
+		waitedEndInfo.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
+		if (!Expect(xrEndFrame(session, &waitedEndInfo), XR_ERROR_CALL_ORDER_INVALID, "begin-credit E1 before second Begin"))
+		{
+			return false;
+		}
+		if (!beginFrame("begin-credit B2") || !endFrame(beginCreditStates[0].predictedDisplayTime, "begin-credit E1 after second Begin"))
+		{
+			return false;
+		}
+
 		std::array<XrFrameState, 2> endStates{};
 		if (!waitFrame(endStates[0], "end-order W1") || !waitFrame(endStates[1], "end-order W2") || !beginFrame("end-order B1") || !beginFrame("end-order B2"))
 		{
@@ -1297,6 +1318,7 @@ public:
 			return false;
 		}
 		return endFrame(endStates[0].predictedDisplayTime, "end-order E1 after invalid ends");
+
 	}
 
 	bool PipelinedSwapchain()
@@ -2156,6 +2178,25 @@ bool RunLiveTimelineRegression(OpenXR& client, Control& control, const Json& rep
 	}
 	if (!checkSnapshot(oldTimelineId, "running", false, true, true, newTimelineId, "live submit replacement pending"))
 	{
+		return false;
+	}
+	Json pendingReportRequest = control.Identity();
+	pendingReportRequest["op"] = "get_report";
+	pendingReportRequest["timelineId"] = newTimelineId;
+	pendingReportRequest["cursor"] = 0;
+	pendingReportRequest["limit"] = 1000;
+	agentxr::protocol::PipeFrame pendingReportResponse;
+	if (!control.Request(pendingReportRequest, pendingReportResponse) || !pendingReportResponse.message.value("ok", false) || !pendingReportResponse.message.contains("result") || !pendingReportResponse.message.at("result").is_object())
+	{
+		std::cerr << "live submit replacement pending report: expected armed result, got response failure\n";
+		return false;
+	}
+	const Json pendingReport = pendingReportResponse.message.at("result");
+	const uint64_t pendingReportId = pendingReport.value("timelineId", 0ull);
+	const std::string pendingReportStatus = pendingReport.value("status", std::string{});
+	if (pendingReportId != newTimelineId || pendingReportStatus != "armed")
+	{
+		std::cerr << "live submit replacement pending report: expected id=" << newTimelineId << " status=armed, got id=" << pendingReportId << " status=" << pendingReportStatus << '\n';
 		return false;
 	}
 	if (!client.CheckTimelinePose(oldFrame.predictedDisplayTime, newHeadX + 0.5f, newGripX + 0.5f, "live submit retained old pose"))

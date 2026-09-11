@@ -1097,6 +1097,15 @@ protocol::Json Session::ReportPage(uint64_t timelineId, size_t cursor, size_t li
 {
 	std::lock_guard lock(mutex);
 	if (limit == 0 || limit > 1000) limit = 1000;
+	if (pendingEpoch != nullptr && pendingTimelineId == timelineId)
+	{
+		RunReport pendingReport;
+		pendingReport.timelineId = pendingTimelineId;
+		pendingReport.status = "armed";
+		pendingReport.plannedSamples = static_cast<uint32_t>(pendingEpoch->samples.size());
+		pendingReport.framePeriod = 11111111;
+		return ReportJson(pendingReport, cursor, limit);
+	}
 	if (report.timelineId == timelineId)
 	{
 		RunReport current = report;

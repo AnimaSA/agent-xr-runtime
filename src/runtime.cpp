@@ -1539,34 +1539,29 @@ extern "C" AGENTXR_API XRAPI_ATTR XrResult XRAPI_CALL xrEndFrame(XrSession sessi
 		{
 			return XR_SUCCESS;
 		}
-		if (state.begunFrameIds.empty())
+		if (state.begunFrameIds.empty() && state.waitedFrameIds.empty())
 		{
 			return XR_ERROR_CALL_ORDER_INVALID;
 		}
-		auto begunIt = std::find_if(state.begunFrameIds.begin(), state.begunFrameIds.end(), [&](uint64_t candidateId)
+		auto frameRecord = std::find_if(state.frames.begin(), state.frames.end(), [&](const agentxr::FrameRecord& record)
 		{
-			auto candidate = std::find_if(state.frames.begin(), state.frames.end(), [candidateId](const agentxr::FrameRecord& record)
-			{
-				return record.id == candidateId;
-			});
-			return candidate != state.frames.end() && candidate->begun && !candidate->ended && !candidate->discarded && candidate->displayTime == endInfo->displayTime;
-		});
-		if (begunIt == state.begunFrameIds.end())
-		{
-			return XR_ERROR_TIME_INVALID;
-		}
-		const uint64_t frameId = *begunIt;
-		auto frameRecord = std::find_if(state.frames.begin(), state.frames.end(), [frameId](const agentxr::FrameRecord& record)
-		{
-			return record.id == frameId;
+			return record.displayTime == endInfo->displayTime && !record.ended && !record.discarded;
 		});
 		if (frameRecord == state.frames.end())
 		{
-			return XR_ERROR_RUNTIME_FAILURE;
+			return XR_ERROR_TIME_INVALID;
 		}
-		if (frameRecord->displayTime != endInfo->displayTime)
+		const uint64_t frameId = frameRecord->id;
+		auto begunIt = std::find(state.begunFrameIds.begin(), state.begunFrameIds.end(), frameId);
+		auto waitedIt = std::find(state.waitedFrameIds.begin(), state.waitedFrameIds.end(), frameId);
+		if (begunIt == state.begunFrameIds.end() && waitedIt == state.waitedFrameIds.end())
 		{
 			return XR_ERROR_TIME_INVALID;
+		}
+		const bool matchedWaited = begunIt == state.begunFrameIds.end();
+		if (matchedWaited && state.begunFrameIds.empty())
+		{
+			return XR_ERROR_CALL_ORDER_INVALID;
 		}
 		if (endInfo->environmentBlendMode != XR_ENVIRONMENT_BLEND_MODE_OPAQUE)
 		{
@@ -1583,9 +1578,29 @@ extern "C" AGENTXR_API XRAPI_ATTR XrResult XRAPI_CALL xrEndFrame(XrSession sessi
 				return XR_ERROR_LAYER_INVALID;
 			}
 		}
-		const XrTime displayTime = endInfo->displayTime;
-		state.begunFrameIds.erase(begunIt);
+		if (matchedWaited)
+		{
+			const uint64_t displacedId = state.begunFrameIds.front();
+			auto displacedRecord = std::find_if(state.frames.begin(), state.frames.end(), [displacedId](const agentxr::FrameRecord& record)
+			{
+				return record.id == displacedId;
+			});
+			if (displacedRecord == state.frames.end())
+			{
+				return XR_ERROR_RUNTIME_FAILURE;
+			}
+			state.begunFrameIds.pop_front();
+			state.waitedFrameIds.erase(waitedIt);
+			displacedRecord->begun = false;
+			state.waitedFrameIds.push_front(displacedId);
+			frameRecord->begun = true;
+		}
+		else
+		{
+			state.begunFrameIds.erase(begunIt);
+		}
 		state.RefreshFrameAliases();
+		const XrTime displayTime = endInfo->displayTime;
 		lock.unlock();
 		const XrResult composeResult = state.compositor == nullptr ? XR_ERROR_GRAPHICS_DEVICE_INVALID : state.compositor->Compose(*endInfo, frameId);
 		lock.lock();
