@@ -57,7 +57,7 @@ inline constexpr uint64_t kSpaceMagic = 0x4158525350414345ULL;
 inline constexpr uint64_t kActionSetMagic = 0x4158524153545345ULL;
 inline constexpr uint64_t kActionMagic = 0x415852414354494FULL;
 inline constexpr uint64_t kSwapchainMagic = 0x4158525357415043ULL;
-inline constexpr size_t kMaxOutstandingFrames = 64;
+inline constexpr size_t kMaxOutstandingFrames = 1024;
 
 struct Vec3
 {

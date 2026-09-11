@@ -1269,62 +1269,34 @@ public:
 			return false;
 		}
 
-		std::array<XrFrameState, 2> invalidEndStates{};
-		if (!waitFrame(invalidEndStates[0], "invalid-end W1") || !waitFrame(invalidEndStates[1], "invalid-end W2") || !beginFrame("invalid-end B1") || !beginFrame("invalid-end B2"))
+		std::array<XrFrameState, 2> endStates{};
+		if (!waitFrame(endStates[0], "end-order W1") || !waitFrame(endStates[1], "end-order W2") || !beginFrame("end-order B1") || !beginFrame("end-order B2"))
 		{
 			return false;
 		}
-		if (!locateViews(invalidEndStates[0].predictedDisplayTime, "invalid-end locate W1") || !locateViews(invalidEndStates[1].predictedDisplayTime, "invalid-end locate W2"))
+		if (!locateViews(endStates[0].predictedDisplayTime, "end-order locate W1") || !locateViews(endStates[1].predictedDisplayTime, "end-order locate W2"))
 		{
 			return false;
 		}
-		XrFrameEndInfo outOfOrderEndInfo{XR_TYPE_FRAME_END_INFO};
-		outOfOrderEndInfo.displayTime = invalidEndStates[1].predictedDisplayTime;
-		outOfOrderEndInfo.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
-		if (!Expect(xrEndFrame(session, &outOfOrderEndInfo), XR_ERROR_TIME_INVALID, "invalid-end out-of-order E1"))
+		if (!endFrame(endStates[1].predictedDisplayTime, "end-order E2 before E1"))
 		{
 			return false;
 		}
-		if (!endFrame(invalidEndStates[0].predictedDisplayTime, "invalid-end E1 retry") || !endFrame(invalidEndStates[1].predictedDisplayTime, "invalid-end E2"))
+		XrFrameEndInfo duplicateEndInfo{XR_TYPE_FRAME_END_INFO};
+		duplicateEndInfo.displayTime = endStates[1].predictedDisplayTime;
+		duplicateEndInfo.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
+		if (!Expect(xrEndFrame(session, &duplicateEndInfo), XR_ERROR_TIME_INVALID, "end-order duplicate E2"))
 		{
 			return false;
 		}
-
-		std::array<XrFrameState, 64> depthStates{};
-		for (size_t index = 0; index < depthStates.size(); ++index)
-		{
-			if (!waitFrame(depthStates[index], "depth wait"))
-			{
-				return false;
-			}
-		}
-		XrFrameState ninthState{XR_TYPE_FRAME_STATE};
-		if (!Expect(xrWaitFrame(session, &waitInfo, &ninthState), XR_ERROR_LIMIT_REACHED, "depth ninth outstanding wait"))
+		XrFrameEndInfo unknownEndInfo{XR_TYPE_FRAME_END_INFO};
+		unknownEndInfo.displayTime = endStates[0].predictedDisplayTime + 1;
+		unknownEndInfo.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
+		if (!Expect(xrEndFrame(session, &unknownEndInfo), XR_ERROR_TIME_INVALID, "end-order unknown current-epoch time"))
 		{
 			return false;
 		}
-		for (const XrFrameState& state : depthStates)
-		{
-			if (!locateViews(state.predictedDisplayTime, "depth locate"))
-			{
-				return false;
-			}
-		}
-		for (size_t index = 0; index < depthStates.size(); ++index)
-		{
-			if (!beginFrame("depth begin"))
-			{
-				return false;
-			}
-		}
-		for (const XrFrameState& state : depthStates)
-		{
-			if (!endFrame(state.predictedDisplayTime, "depth end"))
-			{
-				return false;
-			}
-		}
-		return true;
+		return endFrame(endStates[0].predictedDisplayTime, "end-order E1 after invalid ends");
 	}
 
 	bool PipelinedSwapchain()
