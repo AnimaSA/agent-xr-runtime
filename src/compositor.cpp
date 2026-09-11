@@ -264,6 +264,7 @@ void Compositor::WindowHostLoop()
 			ownedWindow = nullptr;
 			hostWindow.store(nullptr, std::memory_order_release);
 			presentationWindowClosed.store(true, std::memory_order_release);
+			session.NotifyContentIdle();
 		}
 
 		HANDLE wakeEvent = hostWakeEvent;

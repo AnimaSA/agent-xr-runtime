@@ -68,7 +68,7 @@ Launcher:
 
 No registry writes or machine-wide runtime changes occur.
 
-AgentXR creates its compositor preview window when an XR session begins. Explicit session end disposes it immediately. If an application keeps its OpenXR session running after preview stops, one second without a submitted non-empty composition layer disposes the window; next non-empty composition recreates it.
+AgentXR creates its compositor preview window when an XR session begins. Explicit session end disposes it immediately. One second without a submitted non-empty composition layer disposes the window and transitions a focused session to `XR_SESSION_STATE_STOPPING`; after application ends that session, it can begin again from `XR_SESSION_STATE_READY`.
 
 ## Configure MCP
 

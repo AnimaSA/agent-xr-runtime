@@ -1241,6 +1241,80 @@ public:
 		return Expect(xrStringToPath(instance, "interaction_profiles/agentxr/malformed", &malformed), XR_ERROR_PATH_FORMAT_INVALID, "malformed path");
 	}
 
+	bool RestartAfterIdle()
+	{
+		const auto consumeStates = [&](const auto& expected, std::string_view operation)
+		{
+			size_t next = 0;
+			for (int attempt = 0; attempt < 100 && next < expected.size(); ++attempt)
+			{
+				XrEventDataBuffer event{XR_TYPE_EVENT_DATA_BUFFER};
+				XrResult pollResult = XR_EVENT_UNAVAILABLE;
+				while ((pollResult = xrPollEvent(instance, &event)) == XR_SUCCESS)
+				{
+					if (event.type == XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED)
+					{
+						const auto* changed = reinterpret_cast<const XrEventDataSessionStateChanged*>(&event);
+						if (changed->session == session && next < expected.size() && changed->state == expected[next])
+						{
+							++next;
+						}
+					}
+					event = {XR_TYPE_EVENT_DATA_BUFFER};
+				}
+				if (pollResult != XR_EVENT_UNAVAILABLE)
+				{
+					std::cerr << operation << " event polling failed: " << static_cast<int>(pollResult) << '\n';
+					return false;
+				}
+				if (next < expected.size())
+				{
+					Sleep(1);
+				}
+			}
+			if (next != expected.size())
+			{
+				std::cerr << operation << " timed out waiting for session states\n";
+				return false;
+			}
+			return true;
+		};
+
+		if (session == XR_NULL_HANDLE || !running)
+		{
+			return false;
+		}
+		const std::array<XrSessionState, 1> stopping = {XR_SESSION_STATE_STOPPING};
+		if (!consumeStates(stopping, "session stopping"))
+		{
+			return false;
+		}
+		if (!Check(xrEndSession(session), "end session"))
+		{
+			return false;
+		}
+		running = false;
+		const std::array<XrSessionState, 2> ended = {XR_SESSION_STATE_IDLE, XR_SESSION_STATE_READY};
+		if (!consumeStates(ended, "session idle/ready"))
+		{
+			return false;
+		}
+		XrSessionBeginInfo beginInfo{XR_TYPE_SESSION_BEGIN_INFO};
+		beginInfo.primaryViewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+		if (!Check(xrBeginSession(session, &beginInfo), "restart session"))
+		{
+			return false;
+		}
+		const std::array<XrSessionState, 3> started = {XR_SESSION_STATE_SYNCHRONIZED, XR_SESSION_STATE_VISIBLE, XR_SESSION_STATE_FOCUSED};
+		if (!consumeStates(started, "session synchronized/visible/focused"))
+		{
+			return false;
+		}
+		running = true;
+		return true;
+	}
+
+
 	bool DestroyCurrentSession()
 	{
 		DestroySessionOnly();
@@ -2018,6 +2092,10 @@ int RunSessionRestart(const std::wstring& runtimeManifest)
 		Sleep(10);
 	}
 	if (!expectWindowCount(0, "frame inactivity"))
+	{
+		return 1;
+	}
+	if (!client.RestartAfterIdle() || !client.Frame(true, frames) || !expectWindowCount(1, "frame after session restart"))
 	{
 		return 1;
 	}

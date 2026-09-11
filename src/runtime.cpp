@@ -553,6 +553,16 @@ bool Session::IsFocused() const
 {
 	return running && state == XR_SESSION_STATE_FOCUSED && !closing;
 }
+void Session::NotifyContentIdle()
+{
+	std::lock_guard lock(mutex);
+	if (!running || closing || state != XR_SESSION_STATE_FOCUSED || requestExit)
+	{
+		return;
+	}
+	requestExit = true;
+	QueueState(XR_SESSION_STATE_STOPPING);
+}
 
 void Session::QueueState(XrSessionState newState)
 {
