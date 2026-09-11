@@ -1321,7 +1321,7 @@ extern "C" AGENTXR_API XRAPI_ATTR XrResult XRAPI_CALL xrWaitFrame(XrSession sess
 		{
 			return XR_ERROR_SESSION_NOT_RUNNING;
 		}
-		if (state.waitedFrameId != 0 || state.frameWaited)
+		if (state.waitedFrameId != 0)
 		{
 			return XR_ERROR_CALL_ORDER_INVALID;
 		}
