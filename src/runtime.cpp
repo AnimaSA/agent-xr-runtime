@@ -1232,11 +1232,13 @@ extern "C" AGENTXR_API XRAPI_ATTR XrResult XRAPI_CALL xrBeginSession(XrSession s
 		state.waitedFrameIds.clear();
 		state.begunFrameIds.clear();
 		state.RefreshFrameAliases();
+		state.frameEpochStartTime = 0;
 		state.viewConfiguration = beginInfo->primaryViewConfigurationType;
 		state.running = true;
 		state.requestExit = false;
 		state.nextDisplayTime = state.instance->clock.Now() + 11111111;
 		state.nextDeadlineQpc = state.instance->clock.ToQpc(state.nextDisplayTime);
+		state.frameEpochStartTime = state.nextDisplayTime;
 		state.QueueState(XR_SESSION_STATE_SYNCHRONIZED);
 		state.QueueState(XR_SESSION_STATE_VISIBLE);
 		state.QueueState(XR_SESSION_STATE_FOCUSED);
@@ -1265,6 +1267,7 @@ extern "C" AGENTXR_API XRAPI_ATTR XrResult XRAPI_CALL xrEndSession(XrSession ses
 			state.waitedFrameIds.clear();
 			state.begunFrameIds.clear();
 			state.RefreshFrameAliases();
+			state.frameEpochStartTime = 0;
 			state.nextDisplayTime = 0;
 			state.nextDeadlineQpc = 0;
 			state.QueueState(XR_SESSION_STATE_IDLE);
@@ -1316,9 +1319,28 @@ extern "C" AGENTXR_API XRAPI_ATTR XrResult XRAPI_CALL agentxrRequestExitActiveSe
 		{
 			return XR_ERROR_SESSION_NOT_RUNNING;
 		}
+		auto resetSwapchains = [&]()
+		{
+			if (state->compositor == nullptr)
+			{
+				return;
+			}
+			for (XrSwapchain handle : state->swapchains)
+			{
+				if (handle != XR_NULL_HANDLE && handle->object != nullptr)
+				{
+					state->compositor->PrepareSwapchainDestroy(*handle->object, true);
+				}
+			}
+		};
 		if (!state->running)
 		{
-			return state->state == XR_SESSION_STATE_READY ? XR_SUCCESS : XR_ERROR_SESSION_NOT_RUNNING;
+			if (state->state == XR_SESSION_STATE_READY)
+			{
+				resetSwapchains();
+				return XR_SUCCESS;
+			}
+			return XR_ERROR_SESSION_NOT_RUNNING;
 		}
 		state->running = false;
 		state->state = XR_SESSION_STATE_READY;
@@ -1328,7 +1350,9 @@ extern "C" AGENTXR_API XRAPI_ATTR XrResult XRAPI_CALL agentxrRequestExitActiveSe
 		state->RefreshFrameAliases();
 		state->nextDisplayTime = 0;
 		state->nextDeadlineQpc = 0;
+		state->frameEpochStartTime = 0;
 		state->report.status = "ready";
+		resetSwapchains();
 		agentxr::Compositor* compositor = state->compositor;
 		sessionLock.unlock();
 		if (compositor != nullptr)
@@ -1384,6 +1408,10 @@ extern "C" AGENTXR_API XRAPI_ATTR XrResult XRAPI_CALL xrWaitFrame(XrSession sess
 		if (predicted <= state.nextDisplayTime)
 		{
 			predicted = state.nextDisplayTime + 1;
+		}
+		if (state.frameEpochStartTime == 0)
+		{
+			state.frameEpochStartTime = predicted;
 		}
 		state.nextDisplayTime = predicted;
 		state.nextDeadlineQpc = deadline + state.instance->clock.qpcFrequency / 90;
@@ -1499,6 +1527,10 @@ extern "C" AGENTXR_API XRAPI_ATTR XrResult XRAPI_CALL xrEndFrame(XrSession sessi
 		agentxr::Session& state = *session->object;
 		std::unique_lock endOrderLock(state.frameEndMutex);
 		std::unique_lock lock(state.mutex);
+		if (state.frameEpochStartTime > 0 && endInfo->displayTime > 0 && endInfo->displayTime < state.frameEpochStartTime)
+		{
+			return XR_SUCCESS;
+		}
 		if (state.begunFrameIds.empty())
 		{
 			return XR_ERROR_CALL_ORDER_INVALID;

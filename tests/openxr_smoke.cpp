@@ -879,6 +879,45 @@ public:
 		return Check(requestExit(), "request active session exit");
 	}
 
+	bool HoldSwapchainImage()
+	{
+		if (swapchain == XR_NULL_HANDLE || heldSwapchainImage)
+		{
+			return false;
+		}
+		uint32_t imageIndex = 0;
+		XrSwapchainImageAcquireInfo acquireInfo{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+		if (!Check(xrAcquireSwapchainImage(swapchain, &acquireInfo, &imageIndex), "hold swapchain image acquire"))
+		{
+			return false;
+		}
+		XrSwapchainImageWaitInfo waitInfo{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
+		waitInfo.timeout = 2000000000LL;
+		if (!Check(xrWaitSwapchainImage(swapchain, &waitInfo), "hold swapchain image wait"))
+		{
+			return false;
+		}
+		heldSwapchainImage = true;
+		return true;
+	}
+
+	bool DestroyHeldSwapchain()
+	{
+		if (swapchain == XR_NULL_HANDLE || !heldSwapchainImage)
+		{
+			return false;
+		}
+		if (!Check(xrDestroySwapchain(swapchain), "destroy held swapchain"))
+		{
+			return false;
+		}
+		swapchain = XR_NULL_HANDLE;
+		images.clear();
+		heldSwapchainImage = false;
+		return true;
+	}
+
+
 
 	bool StaleProjectionFrames(uint32_t& frameCount)
 	{
@@ -1190,7 +1229,7 @@ public:
 			return false;
 		}
 
-		std::array<XrFrameState, 8> depthStates{};
+		std::array<XrFrameState, 64> depthStates{};
 		for (size_t index = 0; index < depthStates.size(); ++index)
 		{
 			if (!waitFrame(depthStates[index], "depth wait"))
@@ -1453,6 +1492,16 @@ public:
 			return false;
 		}
 
+		const std::array<XrActionSuggestedBinding, 2> duplicateBindings = {unknownProfileBinding, unknownProfileBinding};
+		XrInteractionProfileSuggestedBinding duplicateSuggestions{XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING};
+		duplicateSuggestions.interactionProfile = oculusProfile;
+		duplicateSuggestions.countSuggestedBindings = static_cast<uint32_t>(duplicateBindings.size());
+		duplicateSuggestions.suggestedBindings = duplicateBindings.data();
+		if (!Check(xrSuggestInteractionProfileBindings(instance, &duplicateSuggestions), "suggest duplicate identical bindings"))
+		{
+			return false;
+		}
+
 		const XrActionSuggestedBinding unsupportedComponentBinding{action, unsupportedComponent};
 		XrInteractionProfileSuggestedBinding unsupportedComponentSuggestions{XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING};
 		unsupportedComponentSuggestions.interactionProfile = oculusProfile;
@@ -1523,6 +1572,7 @@ public:
 			return false;
 		}
 		running = false;
+		priorEpochDisplayTime = lastDisplayTime;
 		lastDisplayTime = 0;
 		XrSessionBeginInfo beginInfo{XR_TYPE_SESSION_BEGIN_INFO};
 		beginInfo.primaryViewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
@@ -1537,6 +1587,48 @@ public:
 		running = true;
 		return true;
 	}
+
+	bool RecreateSwapchain()
+	{
+		return CreateSwapchain();
+	}
+
+	bool EndPriorEpochFrame()
+	{
+		if (session == XR_NULL_HANDLE || !running || priorEpochDisplayTime <= 0)
+		{
+			return false;
+		}
+		XrFrameWaitInfo waitInfo{XR_TYPE_FRAME_WAIT_INFO};
+		XrFrameState currentState{XR_TYPE_FRAME_STATE};
+		if (!Check(xrWaitFrame(session, &waitInfo, &currentState), "prior-epoch current wait"))
+		{
+			return false;
+		}
+		if (currentState.predictedDisplayTime <= lastDisplayTime || currentState.predictedDisplayPeriod <= 0)
+		{
+			std::cerr << "prior-epoch current frame timing is invalid\n";
+			return false;
+		}
+		lastDisplayTime = currentState.predictedDisplayTime;
+		XrFrameBeginInfo beginInfo{XR_TYPE_FRAME_BEGIN_INFO};
+		if (!Check(xrBeginFrame(session, &beginInfo), "prior-epoch current begin"))
+		{
+			return false;
+		}
+		XrFrameEndInfo priorEndInfo{XR_TYPE_FRAME_END_INFO};
+		priorEndInfo.displayTime = priorEpochDisplayTime;
+		priorEndInfo.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
+		if (!Expect(xrEndFrame(session, &priorEndInfo), XR_SUCCESS, "prior-epoch end"))
+		{
+			return false;
+		}
+		XrFrameEndInfo currentEndInfo{XR_TYPE_FRAME_END_INFO};
+		currentEndInfo.displayTime = currentState.predictedDisplayTime;
+		currentEndInfo.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
+		return Expect(xrEndFrame(session, &currentEndInfo), XR_SUCCESS, "prior-epoch current end");
+	}
+
 
 
 
@@ -1607,6 +1699,7 @@ private:
 		{
 			xrDestroySwapchain(swapchain);
 			swapchain = XR_NULL_HANDLE;
+			heldSwapchainImage = false;
 		}
 		if (session != XR_NULL_HANDLE && xrDestroySession != nullptr)
 		{
@@ -1822,6 +1915,7 @@ private:
 		{
 			return false;
 		}
+		heldSwapchainImage = false;
 		uint32_t imageCount = 0;
 		if (!Check(xrEnumerateSwapchainImages(swapchain, 0, &imageCount, nullptr), "image count"))
 		{
@@ -1909,6 +2003,8 @@ private:
 	bool graphicsRequirementsQueried = false;
 	bool running = false;
 	XrTime lastDisplayTime = 0;
+	bool heldSwapchainImage = false;
+	XrTime priorEpochDisplayTime = 0;
 };
 
 bool SubmitTimeline(Control& control, const Json& timeline, uint64_t& timelineId, bool expectSuccess)
@@ -2324,7 +2420,11 @@ int RunSessionRestart(const std::wstring& runtimeManifest)
 	{
 		return 1;
 	}
-	if (!client.RequestActiveSessionExit() || !client.RestartAfterForcedReady() || !client.Frame(true, frames) || !expectWindowCount(1, "frame after session restart"))
+	if (!client.HoldSwapchainImage() || !client.RequestActiveSessionExit() || !client.DestroyHeldSwapchain())
+	{
+		return 1;
+	}
+	if (!client.RestartAfterForcedReady() || !client.EndPriorEpochFrame() || !client.RecreateSwapchain() || !client.Frame(true, frames) || !expectWindowCount(1, "frame after session restart"))
 	{
 		return 1;
 	}

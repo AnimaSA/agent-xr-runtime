@@ -57,7 +57,7 @@ inline constexpr uint64_t kSpaceMagic = 0x4158525350414345ULL;
 inline constexpr uint64_t kActionSetMagic = 0x4158524153545345ULL;
 inline constexpr uint64_t kActionMagic = 0x415852414354494FULL;
 inline constexpr uint64_t kSwapchainMagic = 0x4158525357415043ULL;
-inline constexpr size_t kMaxOutstandingFrames = 8;
+inline constexpr size_t kMaxOutstandingFrames = 64;
 
 struct Vec3
 {
@@ -348,6 +348,7 @@ struct Session
 	bool actionSetsAttached = false;
 	bool closing = false;
 	bool requestExit = false;
+	XrTime frameEpochStartTime = 0;
 	XrTime nextDisplayTime = 0;
 	int64_t nextDeadlineQpc = 0;
 	uint64_t frameId = 0;
@@ -472,6 +473,7 @@ public:
 	XrResult AcquireSwapchainImage(Swapchain& swapchain, uint32_t* index);
 	XrResult WaitSwapchainImage(Swapchain& swapchain, XrDuration timeout);
 	XrResult ReleaseSwapchainImage(Swapchain& swapchain);
+	bool PrepareSwapchainDestroy(Swapchain& swapchain, bool forceReset);
 	XrResult Compose(const XrFrameEndInfo& endInfo, uint64_t frameId);
 	XrResult Capture(uint64_t afterFrameId, protocol::Json& metadata, std::vector<uint8_t>& png, uint32_t timeoutMs);
 	uint64_t LastCompletedFrame() const;

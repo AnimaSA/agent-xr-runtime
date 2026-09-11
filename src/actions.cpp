@@ -669,7 +669,7 @@ extern "C" AGENTXR_API XRAPI_ATTR XrResult XRAPI_CALL xrSuggestInteractionProfil
 			}
 			if (std::find(bindings.begin(), bindings.end(), std::pair<XrAction, XrPath>{binding.action, binding.binding}) != bindings.end())
 			{
-				return XR_ERROR_NAME_DUPLICATED;
+				continue;
 			}
 			bindings.emplace_back(binding.action, binding.binding);
 		}

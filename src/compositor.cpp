@@ -845,6 +845,21 @@ XrResult Compositor::ReleaseSwapchainImage(Swapchain& swapchain)
 	swapchain.lastReleasedIndex = candidate;
 	return XR_SUCCESS;
 }
+bool Compositor::PrepareSwapchainDestroy(Swapchain& swapchain, bool forceReset)
+{
+	std::lock_guard lock(mutex);
+	if (forceReset)
+	{
+		swapchain.acquiredIndices.clear();
+		swapchain.waitedIndices.clear();
+		for (SwapchainImage& image : swapchain.images)
+		{
+			image.acquired = false;
+			image.waited = false;
+		}
+	}
+	return swapchain.acquiredIndices.empty() && swapchain.waitedIndices.empty();
+}
 
 XrResult Compositor::Compose(const XrFrameEndInfo& endInfo, uint64_t frameId)
 {
@@ -1214,17 +1229,20 @@ extern "C" AGENTXR_API XRAPI_ATTR XrResult XRAPI_CALL xrCreateSwapchain(XrSessio
 	{
 		if (!IsValidSession(session)) return XR_ERROR_HANDLE_INVALID;
 		if (CheckType(createInfo, XR_TYPE_SWAPCHAIN_CREATE_INFO) != XR_SUCCESS || swapchain == nullptr) return XR_ERROR_VALIDATION_FAILURE;
+		Session* owner = session->object;
+		std::lock_guard sessionLock(owner->mutex);
+		if (owner->compositor == nullptr || owner->closing)
+		{
+			return XR_ERROR_SESSION_NOT_RUNNING;
+		}
 		auto state = std::make_unique<Swapchain>();
-		state->session = session->object;
+		state->session = owner;
 		auto handle = std::make_unique<XrSwapchain_T>();
 		handle->object = state.get();
 		state->handle = handle.get();
-		const XrResult result = session->object->compositor->CreateSwapchain(*createInfo, *state);
+		const XrResult result = owner->compositor->CreateSwapchain(*createInfo, *state);
 		if (result != XR_SUCCESS) return result;
-		{
-			std::lock_guard lock(session->object->mutex);
-			session->object->swapchains.push_back(handle.get());
-		}
+		owner->swapchains.push_back(handle.get());
 		*swapchain = handle.release();
 		state.release();
 		return XR_SUCCESS;
@@ -1237,12 +1255,18 @@ extern "C" AGENTXR_API XRAPI_ATTR XrResult XRAPI_CALL xrDestroySwapchain(XrSwapc
 	{
 		if (!IsValidSwapchain(swapchain)) return XR_ERROR_HANDLE_INVALID;
 		Swapchain* state = swapchain->object;
-		if (!state->acquiredIndices.empty() || !state->waitedIndices.empty()) return XR_ERROR_CALL_ORDER_INVALID;
 		Session* owner = state->session;
+		std::lock_guard ownerLock(owner->mutex);
+		if (owner->compositor == nullptr)
 		{
-			std::lock_guard lock(owner->mutex);
-			owner->swapchains.erase(std::remove(owner->swapchains.begin(), owner->swapchains.end(), swapchain), owner->swapchains.end());
+			return XR_ERROR_SESSION_NOT_RUNNING;
 		}
+		const bool forceReset = !owner->running && owner->state == XR_SESSION_STATE_READY;
+		if (!owner->compositor->PrepareSwapchainDestroy(*state, forceReset))
+		{
+			return XR_ERROR_CALL_ORDER_INVALID;
+		}
+		owner->swapchains.erase(std::remove(owner->swapchains.begin(), owner->swapchains.end(), swapchain), owner->swapchains.end());
 		delete state;
 		swapchain->object = nullptr;
 		swapchain->alive = false;
