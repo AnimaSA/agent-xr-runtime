@@ -471,6 +471,7 @@ bool Compositor::StartPresentation()
 	{
 		if (SendWindowHostCommand(HostCommand::Show))
 		{
+			lastComposeTick.store(GetTickCount64(), std::memory_order_release);
 			return true;
 		}
 		DestroyPresentationLocked();
@@ -484,6 +485,7 @@ bool Compositor::StartPresentation()
 		DestroyPresentationLocked();
 		return false;
 	}
+	lastComposeTick.store(GetTickCount64(), std::memory_order_release);
 	return true;
 }
 
@@ -850,12 +852,32 @@ XrResult Compositor::Compose(const XrFrameEndInfo& endInfo, uint64_t frameId)
 	{
 		return XR_ERROR_GRAPHICS_DEVICE_INVALID;
 	}
-	lastComposeTick.store(GetTickCount64(), std::memory_order_release);
-	if (ConsumePresentationWindowClosed())
+	const bool hasContent = endInfo.layerCount != 0;
+	if (hasContent)
+	{
+		lastComposeTick.store(GetTickCount64(), std::memory_order_release);
+	}
+	const bool presentationClosed = ConsumePresentationWindowClosed();
+	if (presentationClosed)
 	{
 		DestroyPresentationLocked(true);
 	}
-	if (window == nullptr || hostWindow.load(std::memory_order_acquire) == nullptr || windowSwapchain == nullptr || output == nullptr || rtvHeap == nullptr || windowBufferCount == 0)
+	if (!hasContent && presentationClosed)
+	{
+		return XR_SUCCESS;
+	}
+	if (!hasContent)
+	{
+		if (window == nullptr || hostWindow.load(std::memory_order_acquire) == nullptr || windowSwapchain == nullptr || output == nullptr || rtvHeap == nullptr || windowBufferCount == 0)
+		{
+			if (window != nullptr || hostWindow.load(std::memory_order_acquire) != nullptr || windowSwapchain != nullptr || output != nullptr || rtvHeap != nullptr || windowBufferCount != 0)
+			{
+				DestroyPresentationLocked();
+			}
+			return XR_SUCCESS;
+		}
+	}
+	else if (window == nullptr || hostWindow.load(std::memory_order_acquire) == nullptr || windowSwapchain == nullptr || output == nullptr || rtvHeap == nullptr || windowBufferCount == 0)
 	{
 		if (window != nullptr || hostWindow.load(std::memory_order_acquire) != nullptr || windowSwapchain != nullptr || output != nullptr || rtvHeap != nullptr || windowBufferCount != 0)
 		{
@@ -867,7 +889,10 @@ XrResult Compositor::Compose(const XrFrameEndInfo& endInfo, uint64_t frameId)
 			return XR_ERROR_GRAPHICS_DEVICE_INVALID;
 		}
 	}
-	lastComposeTick.store(GetTickCount64(), std::memory_order_release);
+	if (hasContent)
+	{
+		lastComposeTick.store(GetTickCount64(), std::memory_order_release);
+	}
 	if (FAILED(allocator->Reset()) || FAILED(commandList->Reset(allocator.Get(), pipeline.Get())))
 	{
 		return XR_ERROR_RUNTIME_FAILURE;
@@ -992,7 +1017,10 @@ XrResult Compositor::Compose(const XrFrameEndInfo& endInfo, uint64_t frameId)
 		return XR_ERROR_RUNTIME_FAILURE;
 	}
 	if (present == S_OK) presentedFrame = frameId;
-	lastComposeTick.store(GetTickCount64(), std::memory_order_release);
+	if (hasContent)
+	{
+		lastComposeTick.store(GetTickCount64(), std::memory_order_release);
+	}
 	captureCv.notify_all();
 	return XR_SUCCESS;
 }

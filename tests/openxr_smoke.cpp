@@ -2000,7 +2000,7 @@ int RunSessionRestart(const std::wstring& runtimeManifest)
 		return 1;
 	}
 	uint32_t frames = 0;
-	if (!client.Frame(false, frames) || !expectWindowCount(1, "first begin"))
+	if (!client.Frame(true, frames) || !expectWindowCount(1, "first begin"))
 	{
 		return 1;
 	}
@@ -2008,7 +2008,7 @@ int RunSessionRestart(const std::wstring& runtimeManifest)
 	{
 		return 1;
 	}
-	if (!client.Begin() || !client.Frame(false, frames) || !expectWindowCount(1, "same-session begin"))
+	if (!client.Begin() || !client.Frame(true, frames) || !expectWindowCount(1, "same-session begin"))
 	{
 		return 1;
 	}
@@ -2039,7 +2039,7 @@ int RunSessionRestart(const std::wstring& runtimeManifest)
 		{
 			return 1;
 		}
-		if (!client.Frame(false, frames) || (cycle == 0 && !expectWindowCount(1, "frame after inactivity")) || !client.End() || !expectWindowCount(0, cycle + 1 == 10 ? "final end" : "cycle end"))
+		if (!client.Frame(true, frames) || (cycle == 0 && !expectWindowCount(1, "frame after inactivity")) || !client.End() || !expectWindowCount(0, cycle + 1 == 10 ? "final end" : "cycle end"))
 		{
 			return 1;
 		}
