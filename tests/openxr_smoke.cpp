@@ -1408,11 +1408,11 @@ bool Capture(Control& control, uint64_t afterFrameId, CaptureResult& capture)
 	return capture.metadata.value("binaryLength", 0ull) == capture.png.size() && capture.metadata.value("frameId", 0ull) > afterFrameId && capture.metadata.value("width", 0u) == 2048u && capture.metadata.value("height", 0u) == 1024u && ReadBigEndian(capture.png.data() + 16) == 2048u && ReadBigEndian(capture.png.data() + 20) == 1024u;
 }
 
-std::filesystem::path ResolveScenario(const std::filesystem::path& executable, std::string_view name)
+std::filesystem::path ResolveExample(const std::filesystem::path& executable, std::string_view name)
 {
 	const std::wstring wideName = agentxr::protocol::WideFromUtf8(name);
 	const std::filesystem::path fileName = wideName + L".json";
-	const std::array<std::filesystem::path, 4> candidates = {std::filesystem::current_path() / L"scenarios" / fileName, std::filesystem::current_path() / L"agent-xr" / L"scenarios" / fileName, executable.parent_path() / L"scenarios" / fileName, executable.parent_path().parent_path() / L"scenarios" / fileName};
+	const std::array<std::filesystem::path, 4> candidates = {std::filesystem::current_path() / L"examples" / fileName, std::filesystem::current_path() / L"agent-xr" / L"examples" / fileName, executable.parent_path() / L"examples" / fileName, executable.parent_path().parent_path() / L"examples" / fileName};
 	for (const auto& candidate : candidates)
 	{
 		if (std::filesystem::exists(candidate))
@@ -1472,7 +1472,7 @@ int RunScenario(const std::wstring& runtimeManifest, const std::filesystem::path
 	if (scenarioName == "invalid-input")
 	{
 		Json invalid;
-		const std::filesystem::path validPath = ResolveScenario(executable, "neutral-tracking");
+		const std::filesystem::path validPath = ResolveExample(executable, "neutral");
 		if (validPath.empty() || !ReadJsonFile(validPath, invalid))
 		{
 			return 1;
@@ -1541,17 +1541,17 @@ int RunScenario(const std::wstring& runtimeManifest, const std::filesystem::path
 		}
 		return 0;
 	}
-	const std::string timelineName = scenarioName == "timeline-actions" ? "charge-success" : std::string(scenarioName);
-	const std::filesystem::path scenarioPath = ResolveScenario(executable, timelineName);
+	const std::string exampleName = scenarioName == "timeline-actions" ? "motion-and-input" : std::string(scenarioName);
+	const std::filesystem::path examplePath = ResolveExample(executable, exampleName);
 	Json timeline;
-	if (scenarioPath.empty())
+	if (examplePath.empty())
 	{
-		std::cerr << "scenario[" << scenarioName << "]: scenario file not found for " << timelineName << '\n';
+		std::cerr << "scenario[" << scenarioName << "]: example file not found for " << exampleName << '\n';
 		return 1;
 	}
-	if (!ReadJsonFile(scenarioPath, timeline))
+	if (!ReadJsonFile(examplePath, timeline))
 	{
-		std::cerr << "scenario[" << scenarioName << "]: scenario file read failed: " << scenarioPath.string() << '\n';
+		std::cerr << "scenario[" << scenarioName << "]: example file read failed: " << examplePath.string() << '\n';
 		return 1;
 	}
 	uint64_t timelineId = 0;
