@@ -24,7 +24,7 @@ struct ShaderConstants
 	float ndcRight = 1.0f;
 	float ndcBottom = -1.0f;
 	uint32_t arraySlice = 0;
-	uint32_t blendSourceAlpha = 1;
+	uint32_t layerFlags = 0;
 	float alpha = 1.0f;
 	float padding = 0.0f;
 };
@@ -35,7 +35,7 @@ cbuffer Constants : register(b0)
     float4 uvTransform;
     float4 ndcRect;
     uint arraySlice;
-    uint blendSourceAlpha;
+    uint layerFlags;
     float alpha;
     float padding;
 };
@@ -63,14 +63,27 @@ cbuffer Constants : register(b0)
     float4 uvTransform;
     float4 ndcRect;
     uint arraySlice;
-    uint blendSourceAlpha;
+    uint layerFlags;
     float alpha;
     float padding;
 };
 float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
 {
     float4 color = sourceTexture.Sample(sourceSampler, float3(uv, arraySlice));
-    color.a = blendSourceAlpha != 0 ? color.a * alpha : alpha;
+    const float sourceAlpha = color.a;
+    if ((layerFlags & 0x00000002u) == 0u)
+    {
+        color.a = 1.0f;
+    }
+    else
+    {
+        if ((layerFlags & 0x00000004u) != 0u)
+        {
+            color.rgb *= sourceAlpha;
+        }
+        color.rgb *= alpha;
+        color.a = sourceAlpha * alpha;
+    }
     return color;
 }
 )shader";
@@ -200,7 +213,7 @@ bool Compositor::Initialize(ID3D12Device* deviceValue, ID3D12CommandQueue* queue
 		return false;
 	}
 	fenceEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-	if (fenceEvent == nullptr || !CreatePipeline() || !CreateWindowResources())
+	if (fenceEvent == nullptr || !CreatePipeline())
 	{
 		if (fenceEvent != nullptr)
 		{
@@ -212,17 +225,38 @@ bool Compositor::Initialize(ID3D12Device* deviceValue, ID3D12CommandQueue* queue
 	initialized = true;
 	return true;
 }
-void Compositor::Shutdown()
+bool Compositor::StartPresentation()
 {
 	std::lock_guard lock(mutex);
+	if (!initialized || deviceLost)
+	{
+		return false;
+	}
+	if (window != nullptr)
+	{
+		ShowWindow(window, SW_SHOWNOACTIVATE);
+		UpdateWindow(window);
+		return true;
+	}
+	if (!CreateWindowResources())
+	{
+		DestroyPresentationLocked();
+		return false;
+	}
+	return true;
+}
+
+void Compositor::StopPresentation()
+{
+	std::lock_guard lock(mutex);
+	DestroyPresentationLocked();
+}
+
+void Compositor::DestroyPresentationLocked()
+{
 	if (fence != nullptr && nextFence > 1)
 	{
 		WaitFence(nextFence - 1, 2000);
-	}
-	if (constantData != nullptr && constantBuffer != nullptr)
-	{
-		constantBuffer->Unmap(0, nullptr);
-		constantData = nullptr;
 	}
 	if (window != nullptr)
 	{
@@ -236,33 +270,48 @@ void Compositor::Shutdown()
 		UnregisterClassW(className.c_str(), GetModuleHandleW(nullptr));
 		windowClassName.clear();
 	}
-	if (fenceEvent != nullptr)
-	{
-		CloseHandle(fenceEvent);
-		fenceEvent = nullptr;
-	}
 	windowSwapchain.Reset();
 	windowBuffers[0].Reset();
 	windowBuffers[1].Reset();
 	output.Reset();
 	readback.Reset();
+	rtvHeap.Reset();
+	windowRtvHeap.Reset();
+	windowBufferCount = 0;
+	readbackRowPitch = 0;
+	readbackHeight = 0;
+	rtvStride = 0;
+	outputState = D3D12_RESOURCE_STATE_RENDER_TARGET;
+	completedFrame = 0;
+	completedFence = 0;
+	presentedFrame = 0;
+	presentOccluded = false;
+	presentResult = 0;
+	captureCv.notify_all();
+}
+void Compositor::Shutdown()
+{
+	std::lock_guard lock(mutex);
+	DestroyPresentationLocked();
+	if (constantData != nullptr && constantBuffer != nullptr)
+	{
+		constantBuffer->Unmap(0, nullptr);
+		constantData = nullptr;
+	}
+	if (fenceEvent != nullptr)
+	{
+		CloseHandle(fenceEvent);
+		fenceEvent = nullptr;
+	}
 	pipeline.Reset();
 	rootSignature.Reset();
 	constantBuffer.Reset();
 	commandList.Reset();
 	allocator.Reset();
 	fence.Reset();
-	rtvHeap.Reset();
 	srvHeap.Reset();
-	windowRtvHeap.Reset();
 	device.Reset();
 	queue.Reset();
-	windowBufferCount = 0;
-	completedFrame = 0;
-	completedFence = 0;
-	presentedFrame = 0;
-	presentOccluded = false;
-	presentResult = 0;
 	nextFence = 1;
 	initialized = false;
 	deviceLost = false;
@@ -305,7 +354,7 @@ bool Compositor::CreatePipeline()
 	if (FAILED(D3DCompile(kVertexShader, sizeof(kVertexShader) - 1, "agent-xr-vertex", nullptr, nullptr, "main", "vs_5_1", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &vertex, &errors)) || FAILED(D3DCompile(kPixelShader, sizeof(kPixelShader) - 1, "agent-xr-pixel", nullptr, nullptr, "main", "ps_5_1", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &pixel, &errors))) return false;
 	D3D12_BLEND_DESC blend{};
 	blend.RenderTarget[0].BlendEnable = TRUE;
-	blend.RenderTarget[0].SrcBlend = D3D12_BLEND_SRC_ALPHA;
+	blend.RenderTarget[0].SrcBlend = D3D12_BLEND_ONE;
 	blend.RenderTarget[0].DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
 	blend.RenderTarget[0].BlendOp = D3D12_BLEND_OP_ADD;
 	blend.RenderTarget[0].SrcBlendAlpha = D3D12_BLEND_ONE;
@@ -554,7 +603,7 @@ XrResult Compositor::ReleaseSwapchainImage(Swapchain& swapchain)
 XrResult Compositor::Compose(const XrFrameEndInfo& endInfo, uint64_t frameId)
 {
 	std::lock_guard lock(mutex);
-	if (!initialized || deviceLost) return XR_ERROR_GRAPHICS_DEVICE_INVALID;
+	if (!initialized || deviceLost || window == nullptr || windowSwapchain == nullptr || output == nullptr || rtvHeap == nullptr || windowBufferCount == 0) return XR_ERROR_GRAPHICS_DEVICE_INVALID;
 	if (FAILED(allocator->Reset()) || FAILED(commandList->Reset(allocator.Get(), pipeline.Get()))) return XR_ERROR_RUNTIME_FAILURE;
 	commandList->SetGraphicsRootSignature(rootSignature.Get());
 	ID3D12DescriptorHeap* heaps[] = {srvHeap.Get()};
@@ -570,7 +619,7 @@ XrResult Compositor::Compose(const XrFrameEndInfo& endInfo, uint64_t frameId)
 	std::array<SwapchainImage*, 64> touched{};
 	uint32_t touchedCount = 0;
 	uint32_t srvIndex = 0;
-	const auto draw = [&](Swapchain& source, const XrRect2Di& rect, uint32_t arrayIndex, float left, float top, float right, float bottom, float alpha) -> bool
+	const auto draw = [&](Swapchain& source, const XrRect2Di& rect, uint32_t arrayIndex, float left, float top, float right, float bottom, float alpha, XrCompositionLayerFlags layerFlags) -> bool
 	{
 		if (source.lastReleasedIndex == UINT32_MAX || source.lastReleasedIndex >= source.images.size() || arrayIndex >= source.info.arraySize || !ValidRect(rect, source.info.width, source.info.height) || srvIndex >= 64) return false;
 		SwapchainImage* image = &source.images[source.lastReleasedIndex];
@@ -603,9 +652,11 @@ XrResult Compositor::Compose(const XrFrameEndInfo& endInfo, uint64_t frameId)
 		constants.ndcRight = right;
 		constants.ndcBottom = bottom;
 		constants.arraySlice = arrayIndex;
+		constants.layerFlags = static_cast<uint32_t>(layerFlags);
 		constants.alpha = alpha;
-		std::memcpy(constantData, &constants, sizeof(constants));
-		commandList->SetGraphicsRootConstantBufferView(0, constantBuffer->GetGPUVirtualAddress());
+		const UINT64 constantOffset = static_cast<UINT64>(srvIndex) * D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT;
+		std::memcpy(constantData + constantOffset, &constants, sizeof(constants));
+		commandList->SetGraphicsRootConstantBufferView(0, constantBuffer->GetGPUVirtualAddress() + constantOffset);
 		commandList->SetGraphicsRootDescriptorTable(1, gpu);
 		commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
 		commandList->DrawInstanced(4, 1, 0, 0);
@@ -624,7 +675,7 @@ XrResult Compositor::Compose(const XrFrameEndInfo& endInfo, uint64_t frameId)
 				const XrSwapchainSubImage& subImage = projection->views[viewIndex].subImage;
 				if (!IsValidSwapchain(subImage.swapchain) || subImage.swapchain->object->session != &session) return XR_ERROR_LAYER_INVALID;
 				Swapchain& source = *subImage.swapchain->object;
-				if (!draw(source, subImage.imageRect, subImage.imageArrayIndex, viewIndex == 0 ? -1.0f : 0.0f, 1.0f, viewIndex == 0 ? 0.0f : 1.0f, -1.0f, 1.0f)) return XR_ERROR_LAYER_INVALID;
+				if (!draw(source, subImage.imageRect, subImage.imageArrayIndex, viewIndex == 0 ? -1.0f : 0.0f, 1.0f, viewIndex == 0 ? 0.0f : 1.0f, -1.0f, 1.0f, projection->layerFlags)) return XR_ERROR_LAYER_INVALID;
 			}
 		}
 		else if (base->type == XR_TYPE_COMPOSITION_LAYER_QUAD)
@@ -638,8 +689,8 @@ XrResult Compositor::Compose(const XrFrameEndInfo& endInfo, uint64_t frameId)
 			const float halfHeight = std::clamp(quad->size.height * 0.5f, 0.02f, 1.0f);
 			const float centerX = std::clamp(quad->pose.position.x * 0.5f, -1.0f + halfWidth, 1.0f - halfWidth);
 			const float centerY = std::clamp(quad->pose.position.y * 0.25f, -1.0f + halfHeight, 1.0f - halfHeight);
-			if (quad->eyeVisibility != XR_EYE_VISIBILITY_RIGHT && !draw(source, subImage.imageRect, subImage.imageArrayIndex, centerX - halfWidth, 1.0f - centerY - halfHeight, centerX, 1.0f - centerY, 1.0f)) return XR_ERROR_LAYER_INVALID;
-			if (quad->eyeVisibility != XR_EYE_VISIBILITY_LEFT && !draw(source, subImage.imageRect, subImage.imageArrayIndex, centerX, 1.0f - centerY - halfHeight, centerX + halfWidth, 1.0f - centerY, 1.0f)) return XR_ERROR_LAYER_INVALID;
+			if (quad->eyeVisibility != XR_EYE_VISIBILITY_RIGHT && !draw(source, subImage.imageRect, subImage.imageArrayIndex, centerX - halfWidth, 1.0f - centerY - halfHeight, centerX, 1.0f - centerY, 1.0f, quad->layerFlags)) return XR_ERROR_LAYER_INVALID;
+			if (quad->eyeVisibility != XR_EYE_VISIBILITY_LEFT && !draw(source, subImage.imageRect, subImage.imageArrayIndex, centerX, 1.0f - centerY - halfHeight, centerX + halfWidth, 1.0f - centerY, 1.0f, quad->layerFlags)) return XR_ERROR_LAYER_INVALID;
 		}
 	}
 	for (uint32_t touchedIndex = 0; touchedIndex < touchedCount; ++touchedIndex)
@@ -720,7 +771,7 @@ bool Compositor::EncodePng(std::vector<uint8_t>& png)
 XrResult Compositor::Capture(uint64_t afterFrameId, protocol::Json& metadata, std::vector<uint8_t>& png, uint32_t timeoutMs)
 {
 	std::unique_lock lock(mutex);
-	if (!initialized || deviceLost) return XR_ERROR_GRAPHICS_DEVICE_INVALID;
+	if (!initialized || deviceLost || window == nullptr || windowSwapchain == nullptr || output == nullptr || rtvHeap == nullptr || windowBufferCount == 0) return XR_ERROR_GRAPHICS_DEVICE_INVALID;
 	if (completedFrame == 0 || completedFrame <= afterFrameId) return XR_TIMEOUT_EXPIRED;
 	if (!WaitFence(completedFence, timeoutMs)) return XR_TIMEOUT_EXPIRED;
 	const D3D12_RESOURCE_DESC description = output->GetDesc();

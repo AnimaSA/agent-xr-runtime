@@ -253,12 +253,11 @@ bool BindingTypeCompatible(InputKind kind, XrActionType actionType)
 	{
 	case InputKind::Button:
 	case InputKind::Touch:
-		return actionType == XR_ACTION_TYPE_BOOLEAN_INPUT;
 	case InputKind::Trigger:
 	case InputKind::Squeeze:
 	case InputKind::ThumbstickX:
 	case InputKind::ThumbstickY:
-		return actionType == XR_ACTION_TYPE_FLOAT_INPUT;
+		return actionType == XR_ACTION_TYPE_BOOLEAN_INPUT || actionType == XR_ACTION_TYPE_FLOAT_INPUT;
 	case InputKind::Thumbstick:
 		return actionType == XR_ACTION_TYPE_VECTOR2F_INPUT;
 	case InputKind::Pose:
@@ -284,16 +283,17 @@ ActionSnapshot ReadAction(const Action& action, const SimState& state, XrPath su
 			continue;
 		}
 		const ReadValue value = ReadBinding(state, binding);
+		const bool booleanBinding = binding.input.kind == InputKind::Button || binding.input.kind == InputKind::Touch;
 		result.active = result.active || value.active;
 		switch (action.type)
 		{
 		case XR_ACTION_TYPE_BOOLEAN_INPUT:
-			result.booleanValue = result.booleanValue || value.booleanValue;
+			result.booleanValue = result.booleanValue || (booleanBinding ? value.booleanValue : value.floatValue > 0.5f);
 			break;
 		case XR_ACTION_TYPE_FLOAT_INPUT:
 			if (value.active)
 			{
-				result.floatValue = value.floatValue;
+				result.floatValue = booleanBinding ? (value.booleanValue ? 1.0f : 0.0f) : value.floatValue;
 			}
 			break;
 		case XR_ACTION_TYPE_VECTOR2F_INPUT:

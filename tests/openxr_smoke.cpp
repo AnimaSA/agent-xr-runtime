@@ -109,6 +109,39 @@ bool Expect(XrResult result, XrResult expected, std::string_view operation)
 	return false;
 }
 
+uint32_t CountAgentXRSessionWindows()
+{
+	struct Query
+	{
+		DWORD processId = 0;
+		std::wstring titlePrefix;
+		uint32_t count = 0;
+	};
+
+	const DWORD processId = GetCurrentProcessId();
+	Query query{processId, L"AgentXR PID " + std::to_wstring(processId) + L" Session", 0};
+	EnumWindows(
+		[](HWND window, LPARAM parameter) -> BOOL
+		{
+			auto& query = *reinterpret_cast<Query*>(parameter);
+			DWORD windowProcessId = 0;
+			if (GetWindowThreadProcessId(window, &windowProcessId) == 0 || windowProcessId != query.processId)
+			{
+				return TRUE;
+			}
+
+			std::array<wchar_t, 256> title{};
+			const int length = GetWindowTextW(window, title.data(), static_cast<int>(title.size()));
+			if (length > 0 && std::wstring_view(title.data(), static_cast<size_t>(length)).starts_with(query.titlePrefix))
+			{
+				++query.count;
+			}
+			return TRUE;
+		},
+		reinterpret_cast<LPARAM>(&query));
+	return query.count;
+}
+
 bool ReadJsonFile(const std::filesystem::path& path, Json& value)
 {
 	std::ifstream stream(path);
@@ -481,6 +514,7 @@ public:
 		LOAD(xrAttachSessionActionSets);
 		LOAD(xrSyncActions);
 		LOAD(xrGetActionStateBoolean);
+		LOAD(xrGetActionStateFloat);
 		LOAD(xrGetActionStatePose);
 		LOAD(xrEnumerateSwapchainFormats);
 		LOAD(xrCreateSwapchain);
@@ -696,7 +730,7 @@ public:
 		return true;
 	}
 
-	bool Frame(bool render, uint32_t& frameCount, XrViewState* stateOut = nullptr, XrTime* displayTimeOut = nullptr)
+	bool Frame(bool render, uint32_t& frameCount, XrViewState* stateOut = nullptr, XrTime* displayTimeOut = nullptr, float alpha = 1.0f)
 	{
 		XrFrameWaitInfo waitInfo{XR_TYPE_FRAME_WAIT_INFO};
 		XrFrameState frameState{XR_TYPE_FRAME_STATE};
@@ -788,7 +822,7 @@ public:
 				D3D12_CPU_DESCRIPTOR_HANDLE target = start;
 				target.ptr += static_cast<SIZE_T>(eye) * graphics.rtvStride;
 				graphics.device->CreateRenderTargetView(image.texture, &view, target);
-				const float color[4] = {eye == 0 ? 0.8f : 0.1f, eye == 0 ? 0.1f : 0.8f, 0.2f, 1.0f};
+				const float color[4] = {eye == 0 ? 0.8f : 0.1f, eye == 0 ? 0.1f : 0.8f, 0.2f, alpha};
 				graphics.list->ClearRenderTargetView(target, color, 0, nullptr);
 			}
 			if (!graphics.Submit())
@@ -826,7 +860,7 @@ public:
 		return true;
 	}
 
-	bool Sync(bool& pressed, bool* poseActive = nullptr)
+	bool Sync(bool& pressed, bool* poseActive = nullptr, bool* triggerValue = nullptr, float* aClickValue = nullptr)
 	{
 		XrActiveActionSet active{actionSet, XR_NULL_PATH};
 		XrActionsSyncInfo sync{XR_TYPE_ACTIONS_SYNC_INFO};
@@ -857,6 +891,30 @@ public:
 				return false;
 			}
 			*poseActive = poseState.isActive == XR_TRUE;
+		}
+		if (triggerValue != nullptr)
+		{
+			XrActionStateGetInfo triggerInfo{XR_TYPE_ACTION_STATE_GET_INFO};
+			triggerInfo.action = triggerValueAction;
+			triggerInfo.subactionPath = rightPath;
+			XrActionStateBoolean triggerState{XR_TYPE_ACTION_STATE_BOOLEAN};
+			if (!Check(xrGetActionStateBoolean(session, &triggerInfo, &triggerState), "read trigger boolean action"))
+			{
+				return false;
+			}
+			*triggerValue = triggerState.currentState == XR_TRUE;
+		}
+		if (aClickValue != nullptr)
+		{
+			XrActionStateGetInfo aClickInfo{XR_TYPE_ACTION_STATE_GET_INFO};
+			aClickInfo.action = aClickFloatAction;
+			aClickInfo.subactionPath = rightPath;
+			XrActionStateFloat aClickState{XR_TYPE_ACTION_STATE_FLOAT};
+			if (!Check(xrGetActionStateFloat(session, &aClickInfo, &aClickState), "read A click float action"))
+			{
+				return false;
+			}
+			*aClickValue = aClickState.currentState;
 		}
 		return true;
 	}
@@ -1114,7 +1172,7 @@ public:
 
 	bool PrepareUnrealActionSetup()
 	{
-		return CreateActions(true, true) && CreateSwapchain();
+		return CreateActions(true, true, true) && CreateSwapchain();
 	}
 
 	bool DestroyCurrentSession()
@@ -1190,6 +1248,16 @@ private:
 			xrDestroySession(session);
 			session = XR_NULL_HANDLE;
 		}
+		if (aClickFloatAction != XR_NULL_HANDLE && xrDestroyAction != nullptr)
+		{
+			xrDestroyAction(aClickFloatAction);
+			aClickFloatAction = XR_NULL_HANDLE;
+		}
+		if (triggerValueAction != XR_NULL_HANDLE && xrDestroyAction != nullptr)
+		{
+			xrDestroyAction(triggerValueAction);
+			triggerValueAction = XR_NULL_HANDLE;
+		}
 		if (poseAction != XR_NULL_HANDLE && xrDestroyAction != nullptr)
 		{
 			xrDestroyAction(poseAction);
@@ -1232,7 +1300,7 @@ private:
 		return create(XR_REFERENCE_SPACE_TYPE_VIEW, viewSpace) && create(XR_REFERENCE_SPACE_TYPE_LOCAL, localSpace) && create(XR_REFERENCE_SPACE_TYPE_STAGE, stageSpace) && create(XR_REFERENCE_SPACE_TYPE_LOCAL_FLOOR_EXT, localFloorSpace);
 	}
 
-	bool CreateActions(bool createPoseSpaceBeforeAttach = false, bool useSimpleControllerProfile = false)
+	bool CreateActions(bool createPoseSpaceBeforeAttach = false, bool useSimpleControllerProfile = false, bool includeScalarConversionBindings = false)
 	{
 		XrActionSetCreateInfo setInfo{XR_TYPE_ACTION_SET_CREATE_INFO};
 		std::strcpy(setInfo.actionSetName, "smoke");
@@ -1264,22 +1332,65 @@ private:
 		{
 			return false;
 		}
+		if (includeScalarConversionBindings)
+		{
+			std::strcpy(actionInfo.actionName, "smoke_trigger_value");
+			std::strcpy(actionInfo.localizedActionName, "Smoke Trigger Value");
+			actionInfo.actionType = XR_ACTION_TYPE_BOOLEAN_INPUT;
+			if (!Check(xrCreateAction(actionSet, &actionInfo, &triggerValueAction), "create trigger boolean action"))
+			{
+				return false;
+			}
+			std::strcpy(actionInfo.actionName, "smoke_a_click_float");
+			std::strcpy(actionInfo.localizedActionName, "Smoke A Click Float");
+			actionInfo.actionType = XR_ACTION_TYPE_FLOAT_INPUT;
+			if (!Check(xrCreateAction(actionSet, &actionInfo, &aClickFloatAction), "create A click float action"))
+			{
+				return false;
+			}
+		}
 		const XrPath profile = Path(useSimpleControllerProfile ? "/interaction_profiles/khr/simple_controller" : "/interaction_profiles/oculus/touch_controller");
 		const XrPath bindingPath = Path("/user/hand/right/input/a/click");
 		const XrPath poseBindingPath = Path("/user/hand/right/input/grip/pose");
-		if (profile == XR_NULL_PATH || bindingPath == XR_NULL_PATH || poseBindingPath == XR_NULL_PATH)
+		const XrPath oculusProfile = includeScalarConversionBindings ? Path("/interaction_profiles/oculus/touch_controller") : XR_NULL_PATH;
+		const XrPath triggerValuePath = includeScalarConversionBindings ? Path("/user/hand/right/input/trigger/value") : XR_NULL_PATH;
+		if (profile == XR_NULL_PATH || bindingPath == XR_NULL_PATH || poseBindingPath == XR_NULL_PATH || (includeScalarConversionBindings && (oculusProfile == XR_NULL_PATH || triggerValuePath == XR_NULL_PATH)))
 		{
 			return false;
 		}
 		const XrActionSuggestedBinding suggestedBindings[] = {{action, bindingPath}, {poseAction, poseBindingPath}};
 		const XrActionSuggestedBinding simpleBinding{poseAction, poseBindingPath};
+		const XrActionSuggestedBinding extendedBindings[] = {{action, bindingPath}, {poseAction, poseBindingPath}, {triggerValueAction, triggerValuePath}, {aClickFloatAction, bindingPath}};
 		XrInteractionProfileSuggestedBinding suggestions{XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING};
 		suggestions.interactionProfile = profile;
-		suggestions.countSuggestedBindings = useSimpleControllerProfile ? 1u : static_cast<uint32_t>(std::size(suggestedBindings));
-		suggestions.suggestedBindings = useSimpleControllerProfile ? &simpleBinding : suggestedBindings;
+		if (useSimpleControllerProfile)
+		{
+			suggestions.countSuggestedBindings = 1;
+			suggestions.suggestedBindings = &simpleBinding;
+		}
+		else if (includeScalarConversionBindings)
+		{
+			suggestions.countSuggestedBindings = static_cast<uint32_t>(std::size(extendedBindings));
+			suggestions.suggestedBindings = extendedBindings;
+		}
+		else
+		{
+			suggestions.countSuggestedBindings = static_cast<uint32_t>(std::size(suggestedBindings));
+			suggestions.suggestedBindings = suggestedBindings;
+		}
 		if (!Check(xrSuggestInteractionProfileBindings(instance, &suggestions), "suggest bindings"))
 		{
 			return false;
+		}
+		if (useSimpleControllerProfile && includeScalarConversionBindings)
+		{
+			suggestions.interactionProfile = oculusProfile;
+			suggestions.countSuggestedBindings = static_cast<uint32_t>(std::size(extendedBindings));
+			suggestions.suggestedBindings = extendedBindings;
+			if (!Check(xrSuggestInteractionProfileBindings(instance, &suggestions), "suggest Oculus Touch scalar bindings"))
+			{
+				return false;
+			}
 		}
 		const auto createPoseSpace = [&]()
 		{
@@ -1376,6 +1487,8 @@ private:
 	XrActionSet actionSet = XR_NULL_HANDLE;
 	XrAction action = XR_NULL_HANDLE;
 	XrAction poseAction = XR_NULL_HANDLE;
+	XrAction triggerValueAction = XR_NULL_HANDLE;
+	XrAction aClickFloatAction = XR_NULL_HANDLE;
 	XrPath rightPath = XR_NULL_PATH;
 	XrSwapchain swapchain = XR_NULL_HANDLE;
 	std::vector<XrSwapchainImageD3D12KHR> images;
@@ -1416,6 +1529,7 @@ private:
 	PFN_xrAttachSessionActionSets xrAttachSessionActionSets = nullptr;
 	PFN_xrSyncActions xrSyncActions = nullptr;
 	PFN_xrGetActionStateBoolean xrGetActionStateBoolean = nullptr;
+	PFN_xrGetActionStateFloat xrGetActionStateFloat = nullptr;
 	PFN_xrGetActionStatePose xrGetActionStatePose = nullptr;
 	PFN_xrEnumerateSwapchainFormats xrEnumerateSwapchainFormats = nullptr;
 	PFN_xrCreateSwapchain xrCreateSwapchain = nullptr;
@@ -1587,7 +1701,7 @@ int RunScenario(const std::wstring& runtimeManifest, const std::filesystem::path
 		uint32_t frames = 0;
 		for (uint32_t index = 0; index < 10; ++index)
 		{
-			if (!client.Frame(true, frames))
+			if (!client.Frame(true, frames, nullptr, nullptr, 0.0f))
 			{
 				std::cerr << "stereo-composition: initial Frame failed at index " << index << '\n';
 				return 1;
@@ -1779,9 +1893,16 @@ int RunUnrealActionSetup(const std::wstring& runtimeManifest)
 	}
 	bool pressed = false;
 	bool poseActive = false;
-	if (!client.Sync(pressed, &poseActive))
+	bool triggerValue = true;
+	float aClickValue = 1.0f;
+	if (!client.Sync(pressed, &poseActive, &triggerValue, &aClickValue))
 	{
 		std::cerr << "unreal-action-setup: sync failed\n";
+		return 1;
+	}
+	if (triggerValue || aClickValue != 0.0f)
+	{
+		std::cerr << "unreal-action-setup: scalar neutral conversion failed trigger=" << (triggerValue ? 1 : 0) << " aClick=" << aClickValue << '\n';
 		return 1;
 	}
 	if (!client.End())
@@ -1789,17 +1910,41 @@ int RunUnrealActionSetup(const std::wstring& runtimeManifest)
 		std::cerr << "unreal-action-setup: session end failed\n";
 		return 1;
 	}
-	std::cerr << "unreal-action-setup: poseActive=" << (poseActive ? 1 : 0) << '\n';
+	std::cerr << "unreal-action-setup: poseActive=" << (poseActive ? 1 : 0) << " triggerValue=" << (triggerValue ? 1 : 0) << " aClick=" << aClickValue << '\n';
 	return 0;
 }
 
 int RunSessionRestart(const std::wstring& runtimeManifest)
 {
+	const auto expectWindowCount = [](uint32_t expected, std::string_view phase)
+	{
+		const uint32_t actual = CountAgentXRSessionWindows();
+		if (actual == expected)
+		{
+			return true;
+		}
+		std::cerr << "session-restart: " << phase << " found " << actual << " AgentXR session windows, expected " << expected << '\n';
+		return false;
+	};
+
 	OpenXR client;
 	if (!client.Load(runtimeManifest) || !client.InitializeGraphics() || !client.Begin())
 	{
 		return 1;
 	}
+	if (!expectWindowCount(1, "first begin"))
+	{
+		return 1;
+	}
+	if (!client.End() || !expectWindowCount(0, "first end"))
+	{
+		return 1;
+	}
+	if (!client.Begin() || !expectWindowCount(1, "same-session begin"))
+	{
+		return 1;
+	}
+
 	std::unique_ptr<Control> staleControl;
 	for (uint32_t cycle = 0; cycle < 10; ++cycle)
 	{
@@ -1818,7 +1963,7 @@ int RunSessionRestart(const std::wstring& runtimeManifest)
 			return 1;
 		}
 		uint32_t frames = 0;
-		if (!client.Frame(false, frames) || !client.End())
+		if (!client.Frame(false, frames) || !client.End() || !expectWindowCount(0, cycle + 1 == 10 ? "final end" : "cycle end"))
 		{
 			return 1;
 		}

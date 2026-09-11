@@ -456,6 +456,8 @@ public:
 	explicit Compositor(Session& session);
 	~Compositor();
 	bool Initialize(ID3D12Device* device, ID3D12CommandQueue* queue);
+	bool StartPresentation();
+	void StopPresentation();
 	void Shutdown();
 	XrResult CreateSwapchain(const XrSwapchainCreateInfo& info, Swapchain& swapchain);
 	XrResult EnumerateSwapchainImages(Swapchain& swapchain, uint32_t capacity, uint32_t* count, XrSwapchainImageBaseHeader* images);
@@ -507,6 +509,7 @@ private:
 	std::condition_variable captureCv;
 
 	bool CreateWindowResources();
+	void DestroyPresentationLocked();
 	bool CreatePipeline();
 	bool WaitFence(uint64_t value, uint32_t timeoutMs);
 	bool SubmitAndSignal(uint64_t frameId);

@@ -3,7 +3,7 @@ cbuffer Constants : register(b0)
     float4 uvTransform;
     float4 ndcRect;
     uint arraySlice;
-    uint blendSourceAlpha;
+    uint layerFlags;
     float alpha;
     float padding;
 };
@@ -26,6 +26,19 @@ VertexOutput VSMain(uint vertexId : SV_VertexID)
 float4 PSMain(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
 {
     float4 color = sourceTexture.Sample(sourceSampler, float3(uv, arraySlice));
-    color.a = blendSourceAlpha != 0 ? color.a * alpha : alpha;
+    const float sourceAlpha = color.a;
+    if ((layerFlags & 0x00000002u) == 0u)
+    {
+        color.a = 1.0f;
+    }
+    else
+    {
+        if ((layerFlags & 0x00000004u) != 0u)
+        {
+            color.rgb *= sourceAlpha;
+        }
+        color.rgb *= alpha;
+        color.a = sourceAlpha * alpha;
+    }
     return color;
 }

@@ -1216,6 +1216,10 @@ extern "C" AGENTXR_API XRAPI_ATTR XrResult XRAPI_CALL xrBeginSession(XrSession s
 		{
 			return XR_ERROR_CALL_ORDER_INVALID;
 		}
+		if (state.compositor == nullptr || !state.compositor->StartPresentation())
+		{
+			return XR_ERROR_INITIALIZATION_FAILED;
+		}
 		state.viewConfiguration = beginInfo->primaryViewConfigurationType;
 		state.running = true;
 		state.requestExit = false;
@@ -1238,20 +1242,29 @@ extern "C" AGENTXR_API XRAPI_ATTR XrResult XRAPI_CALL xrEndSession(XrSession ses
 			return XR_ERROR_HANDLE_INVALID;
 		}
 		agentxr::Session& state = *session->object;
-		std::lock_guard lock(state.mutex);
-		if (!state.running || state.state != XR_SESSION_STATE_STOPPING)
+		agentxr::Compositor* compositor = nullptr;
 		{
-			return XR_ERROR_SESSION_NOT_STOPPING;
+			std::unique_lock lock(state.mutex);
+			if (!state.running || state.state != XR_SESSION_STATE_STOPPING)
+			{
+				return XR_ERROR_SESSION_NOT_STOPPING;
+			}
+			state.running = false;
+			state.frameWaited = false;
+			state.frameBegun = false;
+			state.waitedFrameId = 0;
+			state.begunFrameId = 0;
+			state.nextDisplayTime = 0;
+			state.nextDeadlineQpc = 0;
+			state.QueueState(XR_SESSION_STATE_IDLE);
+			state.QueueState(XR_SESSION_STATE_READY);
+			state.report.status = "ready";
+			compositor = state.compositor;
 		}
-		state.running = false;
-		state.frameWaited = false;
-		state.frameBegun = false;
-		state.waitedFrameId = 0;
-		state.begunFrameId = 0;
-		state.nextDisplayTime = 0;
-		state.nextDeadlineQpc = 0;
-		state.QueueState(XR_SESSION_STATE_IDLE);
-		state.report.status = "idle";
+		if (compositor != nullptr)
+		{
+			compositor->StopPresentation();
+		}
 		return XR_SUCCESS;
 	});
 }
