@@ -1104,6 +1104,67 @@ public:
 		return Expect(xrBeginFrame(session, &beginInfo), XR_ERROR_CALL_ORDER_INVALID, "begin frame before wait");
 	}
 
+	bool WaitFrameOnly(XrFrameState& frameState, std::string_view operation)
+	{
+		XrFrameWaitInfo waitInfo{XR_TYPE_FRAME_WAIT_INFO};
+		frameState = {XR_TYPE_FRAME_STATE};
+		if (!Check(xrWaitFrame(session, &waitInfo, &frameState), operation))
+		{
+			return false;
+		}
+		if (frameState.predictedDisplayTime <= lastDisplayTime || frameState.predictedDisplayPeriod <= 0)
+		{
+			std::cerr << operation << ": frame timing is invalid\n";
+			return false;
+		}
+		lastDisplayTime = frameState.predictedDisplayTime;
+		return true;
+	}
+
+	bool BeginFrameOnly(std::string_view operation)
+	{
+		XrFrameBeginInfo beginInfo{XR_TYPE_FRAME_BEGIN_INFO};
+		return Check(xrBeginFrame(session, &beginInfo), operation);
+	}
+
+	bool EndFrameOnly(XrTime displayTime, std::string_view operation)
+	{
+		XrFrameEndInfo endInfo{XR_TYPE_FRAME_END_INFO};
+		endInfo.displayTime = displayTime;
+		endInfo.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
+		return Expect(xrEndFrame(session, &endInfo), XR_SUCCESS, operation);
+	}
+
+	bool CheckTimelinePose(XrTime displayTime, float expectedHeadX, float expectedGripX, std::string_view operation)
+	{
+		XrViewState viewState{XR_TYPE_VIEW_STATE};
+		std::array<XrView, 2> views{XrView{XR_TYPE_VIEW}, XrView{XR_TYPE_VIEW}};
+		XrViewLocateInfo locateInfo{XR_TYPE_VIEW_LOCATE_INFO};
+		locateInfo.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+		locateInfo.displayTime = displayTime;
+		locateInfo.space = localSpace;
+		uint32_t viewCount = 0;
+		if (!Check(xrLocateViews(session, &locateInfo, &viewState, static_cast<uint32_t>(views.size()), &viewCount, views.data()), operation) || viewCount != views.size())
+		{
+			std::cerr << operation << ": expected two valid views\n";
+			return false;
+		}
+		XrSpaceLocation gripLocation{XR_TYPE_SPACE_LOCATION};
+		if (!Check(xrLocateSpace(rightGripSpace, localSpace, displayTime, &gripLocation), operation))
+		{
+			return false;
+		}
+		const XrViewStateFlags requiredViewFlags = XR_VIEW_STATE_POSITION_VALID_BIT | XR_VIEW_STATE_ORIENTATION_VALID_BIT | XR_VIEW_STATE_POSITION_TRACKED_BIT | XR_VIEW_STATE_ORIENTATION_TRACKED_BIT;
+		const XrSpaceLocationFlags requiredGripFlags = XR_SPACE_LOCATION_POSITION_VALID_BIT | XR_SPACE_LOCATION_ORIENTATION_VALID_BIT | XR_SPACE_LOCATION_POSITION_TRACKED_BIT | XR_SPACE_LOCATION_ORIENTATION_TRACKED_BIT;
+		const float headX = (views[0].pose.position.x + views[1].pose.position.x) * 0.5f;
+		if ((viewState.viewStateFlags & requiredViewFlags) != requiredViewFlags || (gripLocation.locationFlags & requiredGripFlags) != requiredGripFlags || std::fabs(headX - expectedHeadX) > 0.01f || std::fabs(gripLocation.pose.position.x - expectedGripX) > 0.01f)
+		{
+			std::cerr << operation << ": old/new timeline pose mismatch head=" << headX << " grip=" << gripLocation.pose.position.x << '\n';
+			return false;
+		}
+		return true;
+	}
+
 	bool PipelinedFrame()
 	{
 		XrFrameWaitInfo waitInfo{XR_TYPE_FRAME_WAIT_INFO};
@@ -2015,19 +2076,184 @@ bool SubmitTimeline(Control& control, const Json& timeline, uint64_t& timelineId
 	agentxr::protocol::PipeFrame response;
 	if (!control.Request(request, response))
 	{
+		std::cerr << "submit_timeline: transport request failed\n";
 		return false;
 	}
 	const bool success = response.message.value("ok", false);
 	if (success != expectSuccess)
 	{
+		const Json error = response.message.contains("error") && response.message.at("error").is_object() ? response.message.at("error") : Json::object();
+		std::cerr << "submit_timeline: expected ok=" << (expectSuccess ? 1 : 0) << " got ok=" << (success ? 1 : 0) << " code=" << error.value("code", std::string{}) << " message=" << error.value("message", std::string{}) << '\n';
 		return false;
 	}
 	if (success)
 	{
+		if (!response.message.contains("result") || !response.message.at("result").is_object())
+		{
+			std::cerr << "submit_timeline: successful response omitted result\n";
+			return false;
+		}
 		timelineId = response.message.at("result").value("timelineId", 0ull);
-		return timelineId != 0;
+		if (timelineId == 0)
+		{
+			std::cerr << "submit_timeline: successful response returned zero timeline ID\n";
+			return false;
+		}
+		return true;
 	}
-	return response.message.value("error", Json{}).value("code", std::string{}) == "invalid_timeline";
+	const Json error = response.message.contains("error") && response.message.at("error").is_object() ? response.message.at("error") : Json::object();
+	const std::string code = error.value("code", std::string{});
+	if (code != "invalid_timeline")
+	{
+		std::cerr << "submit_timeline: expected invalid_timeline rejection, got code=" << code << " message=" << error.value("message", std::string{}) << '\n';
+		return false;
+	}
+	return true;
+}
+
+bool RunLiveTimelineRegression(OpenXR& client, Control& control, const Json& replacementTimeline, uint64_t& activeTimelineId)
+{
+	const auto checkSnapshot = [&](uint64_t expectedId, std::string_view expectedStatus, bool expectedWaited, bool expectedBegun, bool expectedPending, uint64_t expectedPendingId, std::string_view operation)
+	{
+		Json snapshot;
+		if (!control.Snapshot(snapshot))
+		{
+			std::cerr << operation << ": snapshot request failed\n";
+			return false;
+		}
+		const Json timeline = snapshot.value("timeline", Json::object());
+		const uint64_t actualId = timeline.value("id", 0ull);
+		const std::string actualStatus = timeline.value("status", std::string{});
+		const bool actualWaited = snapshot.value("frameWaited", false);
+		const bool actualBegun = snapshot.value("frameBegun", false);
+		const bool actualPending = timeline.value("pending", false);
+		const uint64_t actualPendingId = timeline.value("pendingId", 0ull);
+		if (actualId != expectedId || actualStatus != expectedStatus || actualWaited != expectedWaited || actualBegun != expectedBegun || actualPending != expectedPending || actualPendingId != expectedPendingId)
+		{
+			std::cerr << operation << ": expected id=" << expectedId << " status=" << expectedStatus << " waited=" << (expectedWaited ? 1 : 0) << " begun=" << (expectedBegun ? 1 : 0) << " pending=" << (expectedPending ? 1 : 0) << " pendingId=" << expectedPendingId << " got id=" << actualId << " status=" << actualStatus << " waited=" << (actualWaited ? 1 : 0) << " begun=" << (actualBegun ? 1 : 0) << " pending=" << (actualPending ? 1 : 0) << " pendingId=" << actualPendingId << '\n';
+			return false;
+		}
+		return true;
+	};
+
+	Json oldTimeline = replacementTimeline;
+	const float newHeadX = replacementTimeline.at("initial").at("head").at("position").at(0).get<float>();
+	const float newGripX = replacementTimeline.at("initial").at("right").at("grip").at("position").at(0).get<float>();
+	oldTimeline["initial"]["head"]["position"][0] = newHeadX + 0.5f;
+	oldTimeline["initial"]["right"]["grip"]["position"][0] = newGripX + 0.5f;
+	oldTimeline["initial"]["right"]["aim"]["position"][0] = newGripX + 0.5f;
+
+	uint64_t oldTimelineId = 0;
+	if (!SubmitTimeline(control, oldTimeline, oldTimelineId, true))
+	{
+		std::cerr << "live submit old pending: submit assertion failed\n";
+		return false;
+	}
+	if (!checkSnapshot(oldTimelineId, "armed", false, false, false, 0, "live submit old pending"))
+	{
+		return false;
+	}
+	XrFrameState oldFrame{XR_TYPE_FRAME_STATE};
+	if (!client.WaitFrameOnly(oldFrame, "live submit old wait"))
+	{
+		return false;
+	}
+	if (!client.BeginFrameOnly("live submit old begin"))
+	{
+		return false;
+	}
+	if (!checkSnapshot(oldTimelineId, "running", false, true, false, 0, "live submit old active"))
+	{
+		return false;
+	}
+	if (!client.CheckTimelinePose(oldFrame.predictedDisplayTime, newHeadX + 0.5f, newGripX + 0.5f, "live submit old frame pose"))
+	{
+		return false;
+	}
+
+	uint64_t newTimelineId = 0;
+	if (!SubmitTimeline(control, replacementTimeline, newTimelineId, true))
+	{
+		std::cerr << "live submit replacement pending: submit assertion failed\n";
+		return false;
+	}
+	if (newTimelineId == oldTimelineId)
+	{
+		std::cerr << "live submit replacement pending: replacement reused old timeline ID " << oldTimelineId << '\n';
+		return false;
+	}
+	if (!checkSnapshot(oldTimelineId, "running", false, true, true, newTimelineId, "live submit replacement pending"))
+	{
+		return false;
+	}
+	if (!client.CheckTimelinePose(oldFrame.predictedDisplayTime, newHeadX + 0.5f, newGripX + 0.5f, "live submit retained old pose"))
+	{
+		return false;
+	}
+
+	XrFrameState newFrame{XR_TYPE_FRAME_STATE};
+	if (!client.WaitFrameOnly(newFrame, "live submit replacement wait"))
+	{
+		return false;
+	}
+	if (newFrame.predictedDisplayTime <= oldFrame.predictedDisplayTime)
+	{
+		std::cerr << "live submit replacement wait: predicted display time did not increase old=" << oldFrame.predictedDisplayTime << " new=" << newFrame.predictedDisplayTime << '\n';
+		return false;
+	}
+	if (!checkSnapshot(newTimelineId, "running", true, true, false, 0, "live submit replacement active"))
+	{
+		return false;
+	}
+	if (!client.BeginFrameOnly("live submit replacement begin"))
+	{
+		return false;
+	}
+	if (!client.CheckTimelinePose(newFrame.predictedDisplayTime, newHeadX, newGripX, "live submit replacement pose"))
+	{
+		return false;
+	}
+	if (!checkSnapshot(newTimelineId, "running", false, true, false, 0, "live submit replacement begun"))
+	{
+		return false;
+	}
+	if (!client.EndFrameOnly(oldFrame.predictedDisplayTime, "live submit old end"))
+	{
+		return false;
+	}
+	if (!client.EndFrameOnly(newFrame.predictedDisplayTime, "live submit replacement end"))
+	{
+		return false;
+	}
+
+	Json oldReport;
+	if (!control.Report(oldTimelineId, oldReport))
+	{
+		std::cerr << "live submit old report: request failed\n";
+		return false;
+	}
+	const uint64_t oldReportId = oldReport.value("timelineId", 0ull);
+	const std::string oldReportStatus = oldReport.value("status", std::string{});
+	if (oldReportId != oldTimelineId || oldReportStatus == "report_expired")
+	{
+		std::cerr << "live submit old report: expected id=" << oldTimelineId << " retained, got id=" << oldReportId << " status=" << oldReportStatus << '\n';
+		return false;
+	}
+	Json newReport;
+	if (!control.Report(newTimelineId, newReport))
+	{
+		std::cerr << "live submit replacement report: request failed\n";
+		return false;
+	}
+	const uint64_t newReportId = newReport.value("timelineId", 0ull);
+	const std::string newReportStatus = newReport.value("status", std::string{});
+	if (newReportId != newTimelineId || newReportStatus != "running")
+	{
+		std::cerr << "live submit replacement report: expected id=" << newTimelineId << " status=running, got id=" << newReportId << " status=" << newReportStatus << '\n';
+		return false;
+	}
+	activeTimelineId = newTimelineId;
+	return true;
 }
 
 struct CaptureResult
@@ -2218,7 +2444,15 @@ int RunScenario(const std::wstring& runtimeManifest, const std::filesystem::path
 		return 1;
 	}
 	uint64_t timelineId = 0;
-	if (!SubmitTimeline(control, timeline, timelineId, true))
+	if (scenarioName == "timeline-actions")
+	{
+		if (!RunLiveTimelineRegression(client, control, timeline, timelineId))
+		{
+			std::cerr << "scenario[" << scenarioName << "]: live SubmitTimeline regression failed\n";
+			return 1;
+		}
+	}
+	else if (!SubmitTimeline(control, timeline, timelineId, true))
 	{
 		std::cerr << "scenario[" << scenarioName << "]: SubmitTimeline failed\n";
 		return 1;

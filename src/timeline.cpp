@@ -749,7 +749,7 @@ Json StateJson(const SimState& state)
 
 Json FrameJson(const FrameRecord& frame)
 {
-	return {{"frameId", frame.id}, {"displayTime", frame.displayTime}, {"period", frame.period}, {"layerCount", frame.layerCount}, {"waited", frame.waited}, {"begun", frame.begun}, {"ended", frame.ended}, {"discarded", frame.discarded}, {"presented", frame.presented}, {"presentOccluded", frame.presentOccluded}, {"presentResult", frame.presentResult}, {"late", frame.late}, {"authoredSamples", frame.authoredSamples}, {"appliedSamples", frame.appliedSamples}, {"observedSamples", frame.observedSamples}};
+	return {{"frameId", frame.id}, {"timelineId", frame.timelineId}, {"timelineStart", frame.timelineStart}, {"displayTime", frame.displayTime}, {"period", frame.period}, {"layerCount", frame.layerCount}, {"waited", frame.waited}, {"begun", frame.begun}, {"ended", frame.ended}, {"discarded", frame.discarded}, {"presented", frame.presented}, {"presentOccluded", frame.presentOccluded}, {"presentResult", frame.presentResult}, {"late", frame.late}, {"authoredSamples", frame.authoredSamples}, {"appliedSamples", frame.appliedSamples}, {"observedSamples", frame.observedSamples}};
 }
 
 Json ActionSyncJson(const ActionSyncRecord& record)
@@ -853,12 +853,111 @@ SimState Session::StateAtLocked(XrTime time, std::shared_ptr<const TimelineEpoch
 	{
 		selectedEpoch->reset();
 	}
-	SimState result = fallbackState;
+	SimState result = previousFallbackState.has_value() ? previousFallbackState.value() : fallbackState;
 	if (inputsNeutralized)
 	{
 		neutralize(result);
 	}
 	return result;
+}
+
+void Session::PruneRetainedEpochs()
+{
+	auto hasOutstandingFrame = [this](uint64_t barrierFrameId)
+	{
+		for (uint64_t frameId : waitedFrameIds)
+		{
+			if (frameId <= barrierFrameId)
+			{
+				return true;
+			}
+		}
+		for (uint64_t frameId : begunFrameIds)
+		{
+			if (frameId <= barrierFrameId)
+			{
+				return true;
+			}
+		}
+		for (const FrameRecord& frame : frames)
+		{
+			if (frame.id <= barrierFrameId && frame.begun && !frame.ended && !frame.discarded)
+			{
+				return true;
+			}
+		}
+		return false;
+	};
+	for (auto it = retainedEpochs.begin(); it != retainedEpochs.end();)
+	{
+		if (!hasOutstandingFrame(it->barrierFrameId))
+		{
+			it = retainedEpochs.erase(it);
+		}
+		else
+		{
+			++it;
+		}
+	}
+}
+
+bool Session::ActivatePendingTimeline(XrTime startTime)
+{
+	if (pendingEpoch == nullptr)
+	{
+		return true;
+	}
+	PruneRetainedEpochs();
+	const bool retainActive = activeEpoch != nullptr && timelineStart > 0;
+	if (retainActive && retainedEpochs.size() >= 4)
+	{
+		return false;
+	}
+	std::shared_ptr<const TimelineEpoch> next = std::move(pendingEpoch);
+	pendingTimelineId = 0;
+	if (activeEpoch != nullptr)
+	{
+		report.frames.clear();
+		for (const FrameRecord& frame : frames)
+		{
+			if (frame.timelineId == activeEpoch->id)
+			{
+				report.frames.push_back(frame);
+			}
+		}
+		report.actionSyncs = actionSyncs;
+		report.haptics = haptics;
+		completedReports.emplace_back(activeEpoch->id, report);
+		if (completedReports.size() > 4)
+		{
+			completedReports.pop_front();
+		}
+		if (retainActive)
+		{
+			retainedEpochs.push_back({timelineStart, frameId, activeEpoch});
+		}
+	}
+	if (!previousFallbackState.has_value())
+	{
+		previousFallbackState = fallbackState;
+	}
+	activeEpoch = std::move(next);
+	timelineStart = startTime;
+	canceledAt.reset();
+	inputsNeutralized = false;
+	neutralizePending = false;
+	fallbackState = activeEpoch->samples.front().state;
+	lastPublishedState = fallbackState;
+	lastSyncTime = 0;
+	actionSyncs.clear();
+	haptics.clear();
+	report = {};
+	report.timelineId = activeEpoch->id;
+	report.status = "running";
+	report.authoredStart = startTime;
+	report.plannedSamples = static_cast<uint32_t>(activeEpoch->samples.size());
+	report.framePeriod = 11111111;
+	return true;
 }
 
 XrResult Session::SubmitTimeline(const Json& timeline, uint64_t& timelineId, std::string& error)
@@ -874,30 +973,44 @@ XrResult Session::SubmitTimeline(const Json& timeline, uint64_t& timelineId, std
 		error = "session must be focused";
 		return XR_SESSION_NOT_FOCUSED;
 	}
-	if (frameWaited || frameBegun)
+	if (pendingEpoch != nullptr)
 	{
-		error = "cannot replace timeline during active frame";
-		return XR_ERROR_CALL_ORDER_INVALID;
-	}
-	if (activeEpoch != nullptr && (report.status == "armed" || report.status == "running"))
-	{
-		error = "timeline already active";
+		error = "timeline already pending";
 		return XR_ERROR_LIMIT_REACHED;
 	}
+	const bool hasOutstandingFrames = !waitedFrameIds.empty() || !begunFrameIds.empty();
+	const bool activeRun = activeEpoch != nullptr && (report.status == "armed" || report.status == "running");
 	if (nextTimelineId == 0 || nextTimelineId == std::numeric_limits<uint64_t>::max())
 	{
 		error = "timeline id exhausted";
 		return XR_ERROR_LIMIT_REACHED;
 	}
+	PruneRetainedEpochs();
 	const bool retainActive = activeEpoch != nullptr && timelineStart > 0;
 	if (retainActive && retainedEpochs.size() >= 4)
 	{
 		error = "four unreleased timeline epochs retained";
 		return XR_ERROR_LIMIT_REACHED;
 	}
+	compiled->id = nextTimelineId++;
+	timelineId = compiled->id;
+	// Running or still-owned frames require activation at the next frame boundary.
+	if (activeRun || hasOutstandingFrames)
+	{
+		pendingTimelineId = timelineId;
+		pendingEpoch = std::move(compiled);
+		return XR_SUCCESS;
+	}
 	if (activeEpoch != nullptr)
 	{
-		report.frames = frames;
+		report.frames.clear();
+		for (const FrameRecord& frame : frames)
+		{
+			if (frame.timelineId == activeEpoch->id)
+			{
+				report.frames.push_back(frame);
+			}
+		}
 		report.actionSyncs = actionSyncs;
 		report.haptics = haptics;
 		completedReports.emplace_back(activeEpoch->id, report);
@@ -907,10 +1020,10 @@ XrResult Session::SubmitTimeline(const Json& timeline, uint64_t& timelineId, std
 		}
 		if (retainActive)
 		{
-			retainedEpochs.push_back({timelineStart, activeEpoch});
+			retainedEpochs.push_back({timelineStart, frameId, activeEpoch});
 		}
 	}
-	compiled->id = nextTimelineId++;
+	previousFallbackState.reset();
 	activeEpoch = std::move(compiled);
 	timelineStart = 0;
 	canceledAt.reset();
@@ -927,13 +1040,18 @@ XrResult Session::SubmitTimeline(const Json& timeline, uint64_t& timelineId, std
 	report.status = "armed";
 	report.plannedSamples = static_cast<uint32_t>(activeEpoch->samples.size());
 	report.framePeriod = 11111111;
-	timelineId = activeEpoch->id;
 	return XR_SUCCESS;
 }
 
 XrResult Session::CancelTimeline(uint64_t timelineId, std::string& error)
 {
 	std::lock_guard lock(mutex);
+	if (pendingEpoch != nullptr && pendingTimelineId == timelineId)
+	{
+		pendingEpoch.reset();
+		pendingTimelineId = 0;
+		return XR_SUCCESS;
+	}
 	if (activeEpoch == nullptr || activeEpoch->id != timelineId)
 	{
 		error = "timeline not active";
@@ -966,6 +1084,8 @@ protocol::Json Session::Snapshot() const
 {
 	std::lock_guard lock(mutex);
 	Json result = {{"sessionState", static_cast<int>(state)}, {"running", running}, {"focused", IsFocused()}, {"sessionGeneration", sessionGeneration}, {"frameId", frameId}, {"frameWaited", frameWaited}, {"frameBegun", frameBegun}, {"graphics", {{"d3d12", device != nullptr}, {"adapterLuidLow", adapterLuid.LowPart}, {"adapterLuidHigh", adapterLuid.HighPart}, {"deviceLost", compositor != nullptr && compositor->DeviceLost()}}}, {"tracking", StateJson(lastPublishedState)}, {"frame", {{"submitted", report.submittedFrameId}, {"composed", report.composedFrameId}, {"presented", report.presentedFrameId}}}, {"timeline", {{"id", report.timelineId}, {"status", report.status}, {"start", report.authoredStart}, {"end", report.authoredEnd}, {"plannedSamples", report.plannedSamples}, {"appliedSamples", report.appliedSamples}, {"observedSamples", report.observedSamples}, {"unobservedDigitalTransitions", report.unobservedDigitalTransitions}}}};
+	result["timeline"]["pendingId"] = pendingTimelineId;
+	result["timeline"]["pending"] = pendingEpoch != nullptr;
 	if (compositor != nullptr)
 	{
 		result["compositor"]["lastCompletedFrame"] = compositor->LastCompletedFrame();
@@ -980,7 +1100,14 @@ protocol::Json Session::ReportPage(uint64_t timelineId, size_t cursor, size_t li
 	if (report.timelineId == timelineId)
 	{
 		RunReport current = report;
-		current.frames = frames;
+		current.frames.clear();
+		for (const FrameRecord& frame : frames)
+		{
+			if (frame.timelineId == report.timelineId)
+			{
+				current.frames.push_back(frame);
+			}
+		}
 		current.actionSyncs = actionSyncs;
 		current.haptics = haptics;
 		return ReportJson(current, cursor, limit);

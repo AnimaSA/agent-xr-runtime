@@ -136,12 +136,15 @@ struct TimelineEpoch
 struct RetainedEpoch
 {
 	XrTime startTime = 0;
+	uint64_t barrierFrameId = 0;
 	std::shared_ptr<const TimelineEpoch> epoch;
 };
 
 struct FrameRecord
 {
 	uint64_t id = 0;
+	uint64_t timelineId = 0;
+	XrTime timelineStart = 0;
 	XrTime displayTime = 0;
 	XrDuration period = 0;
 	uint32_t layerCount = 0;
@@ -362,9 +365,12 @@ struct Session
 	bool neutralizePending = false;
 	SimState fallbackState = DefaultSimState();
 	SimState lastPublishedState = DefaultSimState();
+	std::optional<SimState> previousFallbackState;
 	RunReport report;
 	std::shared_ptr<const TimelineEpoch> activeEpoch;
 	XrTime timelineStart = 0;
+	std::shared_ptr<const TimelineEpoch> pendingEpoch;
+	uint64_t pendingTimelineId = 0;
 	std::deque<RetainedEpoch> retainedEpochs;
 	std::deque<std::pair<uint64_t, RunReport>> completedReports;
 	std::optional<XrTime> canceledAt;
@@ -386,6 +392,8 @@ struct Session
 	SimState StateAt(XrTime time, std::shared_ptr<const TimelineEpoch>* epoch = nullptr) const;
 	SimState StateAtLocked(XrTime time, std::shared_ptr<const TimelineEpoch>* epoch = nullptr) const;
 	XrResult SubmitTimeline(const protocol::Json& timeline, uint64_t& timelineId, std::string& error);
+	bool ActivatePendingTimeline(XrTime startTime);
+	void PruneRetainedEpochs();
 	XrResult CancelTimeline(uint64_t timelineId, std::string& error);
 	protocol::Json Snapshot() const;
 	protocol::Json ReportPage(uint64_t timelineId, size_t cursor, size_t limit) const;

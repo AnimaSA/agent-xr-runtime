@@ -1409,6 +1409,10 @@ extern "C" AGENTXR_API XRAPI_ATTR XrResult XRAPI_CALL xrWaitFrame(XrSession sess
 		{
 			predicted = state.nextDisplayTime + 1;
 		}
+		if (state.pendingEpoch != nullptr && !state.ActivatePendingTimeline(predicted))
+		{
+			return XR_ERROR_LIMIT_REACHED;
+		}
 		if (state.frameEpochStartTime == 0)
 		{
 			state.frameEpochStartTime = predicted;
@@ -1422,6 +1426,8 @@ extern "C" AGENTXR_API XRAPI_ATTR XrResult XRAPI_CALL xrWaitFrame(XrSession sess
 		state.frameId++;
 		agentxr::FrameRecord frameRecord;
 		frameRecord.id = state.frameId;
+		frameRecord.timelineId = state.activeEpoch != nullptr ? state.activeEpoch->id : 0;
+		frameRecord.timelineStart = state.activeEpoch != nullptr ? state.timelineStart : 0;
 		frameRecord.displayTime = predicted;
 		frameRecord.period = 11111111;
 		frameRecord.waited = true;
@@ -1446,6 +1452,8 @@ extern "C" AGENTXR_API XRAPI_ATTR XrResult XRAPI_CALL xrWaitFrame(XrSession sess
 			state.lastPublishedState = state.activeEpoch->samples.empty() ? state.fallbackState : state.activeEpoch->samples.front().state;
 		}
 		agentxr::FrameRecord& waitedRecord = state.frames.back();
+		waitedRecord.timelineId = state.activeEpoch != nullptr ? state.activeEpoch->id : 0;
+		waitedRecord.timelineStart = state.activeEpoch != nullptr ? state.timelineStart : 0;
 		if (state.activeEpoch != nullptr && predicted >= state.timelineStart + state.activeEpoch->durationNs)
 		{
 			state.report.status = state.canceledAt.has_value() ? "canceled" : "completed";
@@ -1578,35 +1586,73 @@ extern "C" AGENTXR_API XRAPI_ATTR XrResult XRAPI_CALL xrEndFrame(XrSession sessi
 			return XR_ERROR_RUNTIME_FAILURE;
 		}
 		frameRecord->presentResult = static_cast<int32_t>(composeResult);
+		agentxr::RunReport* frameReport = &state.report;
+		if (frameRecord->timelineId != state.report.timelineId)
+		{
+			frameReport = nullptr;
+			for (auto& [reportId, completed] : state.completedReports)
+			{
+				if (reportId == frameRecord->timelineId)
+				{
+					frameReport = &completed;
+					break;
+				}
+			}
+		}
+		auto syncCompletedFrame = [&]()
+		{
+			if (frameReport == nullptr || frameReport == &state.report)
+			{
+				return;
+			}
+			auto completedFrame = std::find_if(frameReport->frames.begin(), frameReport->frames.end(), [frameId](const agentxr::FrameRecord& record)
+			{
+				return record.id == frameId;
+			});
+			if (completedFrame != frameReport->frames.end())
+			{
+				*completedFrame = *frameRecord;
+			}
+		};
 		if (composeResult != XR_SUCCESS)
 		{
-			state.report.error = "compositor failed";
-			state.report.status = "failed";
+			if (frameReport != nullptr)
+			{
+				frameReport->error = "compositor failed";
+				frameReport->status = "failed";
+			}
 			frameRecord->discarded = true;
+			syncCompletedFrame();
+			state.PruneRetainedEpochs();
 			return composeResult;
 		}
 		frameRecord->ended = true;
 		frameRecord->layerCount = endInfo->layerCount;
 		frameRecord->presented = state.compositor != nullptr && state.compositor->LastPresentedFrame() == frameId;
-		state.report.submittedFrameId = frameId;
-		state.report.composedFrameId = frameId;
-		if (frameRecord->presented)
+		if (frameReport != nullptr)
 		{
-			state.report.presentedFrameId = frameId;
+			frameReport->submittedFrameId = frameId;
+			frameReport->composedFrameId = frameId;
+			if (frameRecord->presented)
+			{
+				frameReport->presentedFrameId = frameId;
+			}
+			if (frameReport->actualFirstFrame == 0)
+			{
+				frameReport->actualFirstFrame = displayTime;
+			}
+			frameReport->actualLastFrame = displayTime;
+			auto previous = std::find_if(state.frames.rbegin(), state.frames.rend(), [frameId, timelineId = frameRecord->timelineId](const agentxr::FrameRecord& record)
+			{
+				return record.id < frameId && record.timelineId == timelineId;
+			});
+			if (previous != state.frames.rend() && displayTime >= previous->displayTime)
+			{
+				frameReport->maxFrameGap = std::max(frameReport->maxFrameGap, displayTime - previous->displayTime);
+			}
 		}
-		if (state.report.actualFirstFrame == 0)
-		{
-			state.report.actualFirstFrame = displayTime;
-		}
-		state.report.actualLastFrame = displayTime;
-		auto previous = std::find_if(state.frames.rbegin(), state.frames.rend(), [frameId](const agentxr::FrameRecord& record)
-		{
-			return record.id < frameId;
-		});
-		if (previous != state.frames.rend() && displayTime >= previous->displayTime)
-		{
-			state.report.maxFrameGap = std::max(state.report.maxFrameGap, displayTime - previous->displayTime);
-		}
+		syncCompletedFrame();
+		state.PruneRetainedEpochs();
 		return XR_SUCCESS;
 	});
 }
