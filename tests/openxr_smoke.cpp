@@ -937,6 +937,87 @@ public:
 		return submitted;
 	}
 
+	bool StuckFrameAfterIdle(uint32_t& frameCount)
+	{
+		if (session == XR_NULL_HANDLE || !running)
+		{
+			return false;
+		}
+		XrFrameWaitInfo waitInfo{XR_TYPE_FRAME_WAIT_INFO};
+		XrFrameState frameState{XR_TYPE_FRAME_STATE};
+		if (!Check(xrWaitFrame(session, &waitInfo, &frameState), "stuck frame wait"))
+		{
+			return false;
+		}
+		if (frameState.predictedDisplayTime <= lastDisplayTime || frameState.predictedDisplayPeriod <= 0)
+		{
+			std::cerr << "stuck frame timing is invalid\n";
+			return false;
+		}
+		lastDisplayTime = frameState.predictedDisplayTime;
+
+		const ULONGLONG waitStart = GetTickCount64();
+		while (GetTickCount64() - waitStart < 1200)
+		{
+			Sleep(10);
+		}
+		while (CountAgentXRSessionWindows() != 0 && GetTickCount64() - waitStart < 2500)
+		{
+			Sleep(10);
+		}
+		if (CountAgentXRSessionWindows() != 0)
+		{
+			std::cerr << "stuck frame: window did not expire\n";
+			return false;
+		}
+
+		bool stopping = false;
+		for (int attempt = 0; attempt < 100 && !stopping; ++attempt)
+		{
+			XrEventDataBuffer event{XR_TYPE_EVENT_DATA_BUFFER};
+			XrResult pollResult = XR_EVENT_UNAVAILABLE;
+			while ((pollResult = xrPollEvent(instance, &event)) == XR_SUCCESS)
+			{
+				if (event.type == XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED)
+				{
+					const auto* changed = reinterpret_cast<const XrEventDataSessionStateChanged*>(&event);
+					stopping = stopping || (changed->session == session && changed->state == XR_SESSION_STATE_STOPPING);
+				}
+				event = {XR_TYPE_EVENT_DATA_BUFFER};
+			}
+			if (pollResult != XR_EVENT_UNAVAILABLE)
+			{
+				std::cerr << "stuck frame: event polling failed: " << static_cast<int>(pollResult) << '\n';
+				return false;
+			}
+			if (!stopping)
+			{
+				Sleep(1);
+			}
+		}
+		if (!stopping)
+		{
+			std::cerr << "stuck frame: STOPPING event was not queued\n";
+			return false;
+		}
+
+		XrFrameBeginInfo beginInfo{XR_TYPE_FRAME_BEGIN_INFO};
+		if (!Check(xrBeginFrame(session, &beginInfo), "stuck frame begin"))
+		{
+			return false;
+		}
+		XrFrameEndInfo endInfo{XR_TYPE_FRAME_END_INFO};
+		endInfo.displayTime = frameState.predictedDisplayTime;
+		endInfo.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
+		if (!Check(xrEndFrame(session, &endInfo), "stuck frame end"))
+		{
+			return false;
+		}
+		++frameCount;
+		return RestartAfterIdle(true);
+	}
+
+
 
 	bool Sync(bool& pressed, bool* poseActive = nullptr, bool* triggerValue = nullptr, float* aClickValue = nullptr)
 	{
@@ -1318,7 +1399,7 @@ public:
 		return Expect(xrStringToPath(instance, "interaction_profiles/agentxr/malformed", &malformed), XR_ERROR_PATH_FORMAT_INVALID, "malformed path");
 	}
 
-	bool RestartAfterIdle()
+	bool RestartAfterIdle(bool stoppingAlreadyConsumed = false)
 	{
 		const auto consumeStates = [&](const auto& expected, std::string_view operation)
 		{
@@ -1361,10 +1442,13 @@ public:
 		{
 			return false;
 		}
-		const std::array<XrSessionState, 1> stopping = {XR_SESSION_STATE_STOPPING};
-		if (!consumeStates(stopping, "session stopping"))
+		if (!stoppingAlreadyConsumed)
 		{
-			return false;
+			const std::array<XrSessionState, 1> stopping = {XR_SESSION_STATE_STOPPING};
+			if (!consumeStates(stopping, "session stopping"))
+			{
+				return false;
+			}
 		}
 		if (!Check(xrEndSession(session), "end session"))
 		{
@@ -2177,6 +2261,10 @@ int RunSessionRestart(const std::wstring& runtimeManifest)
 		return 1;
 	}
 	if (!client.RestartAfterIdle() || !client.Frame(true, frames) || !expectWindowCount(1, "frame after session restart"))
+	{
+		return 1;
+	}
+	if (!client.StuckFrameAfterIdle(frames) || !client.Frame(true, frames) || !expectWindowCount(1, "frame after stuck frame"))
 	{
 		return 1;
 	}

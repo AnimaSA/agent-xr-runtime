@@ -344,7 +344,6 @@ struct Session
 	bool actionSetsAttached = false;
 	bool closing = false;
 	bool requestExit = false;
-	bool pendingIdleExit = false;
 	XrTime nextDisplayTime = 0;
 	int64_t nextDeadlineQpc = 0;
 	uint64_t frameId = 0;
@@ -377,7 +376,6 @@ struct Session
 
 	bool IsFocused() const;
 	void NotifyContentIdle();
-	void ConsumePendingIdleExit();
 	void QueueState(XrSessionState newState);
 	XrTime ValidateTime(XrTime time) const;
 	SimState StateAt(XrTime time, std::shared_ptr<const TimelineEpoch>* epoch = nullptr) const;
