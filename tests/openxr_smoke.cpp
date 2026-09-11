@@ -861,6 +861,25 @@ public:
 		return true;
 	}
 
+	bool RequestActiveSessionExit()
+	{
+		using RequestExitFunction = XrResult (XRAPI_CALL*)();
+		const HMODULE runtimeModule = GetModuleHandleW(L"AgentXRRuntime.dll");
+		if (runtimeModule == nullptr)
+		{
+			std::cerr << "request active session exit: runtime module unavailable\n";
+			return false;
+		}
+		const auto requestExit = reinterpret_cast<RequestExitFunction>(GetProcAddress(runtimeModule, "agentxrRequestExitActiveSession"));
+		if (requestExit == nullptr)
+		{
+			std::cerr << "request active session exit: export unavailable\n";
+			return false;
+		}
+		return Check(requestExit(), "request active session exit");
+	}
+
+
 	bool StaleProjectionFrames(uint32_t& frameCount)
 	{
 		if (swapchain == XR_NULL_HANDLE || localSpace == XR_NULL_HANDLE || images.empty())
@@ -882,20 +901,12 @@ public:
 		projection.views = projectionViews;
 		const XrCompositionLayerBaseHeader* layers[1] = {reinterpret_cast<const XrCompositionLayerBaseHeader*>(&projection)};
 		const ULONGLONG start = GetTickCount64();
-		const auto expectedStop = [&](XrResult result)
-		{
-			return GetTickCount64() - start >= 900 && (result == XR_ERROR_SESSION_NOT_RUNNING || result == XR_ERROR_CALL_ORDER_INVALID);
-		};
 		bool submitted = false;
 		do
 		{
 			XrFrameWaitInfo waitInfo{XR_TYPE_FRAME_WAIT_INFO};
 			XrFrameState frameState{XR_TYPE_FRAME_STATE};
 			const XrResult waitResult = xrWaitFrame(session, &waitInfo, &frameState);
-			if (expectedStop(waitResult))
-			{
-				break;
-			}
 			if (!Check(waitResult, "stale layer wait frame"))
 			{
 				return false;
@@ -907,12 +918,7 @@ public:
 			}
 			lastDisplayTime = frameState.predictedDisplayTime;
 			XrFrameBeginInfo beginInfo{XR_TYPE_FRAME_BEGIN_INFO};
-			const XrResult beginResult = xrBeginFrame(session, &beginInfo);
-			if (expectedStop(beginResult))
-			{
-				break;
-			}
-			if (!Check(beginResult, "stale layer begin frame"))
+			if (!Check(xrBeginFrame(session, &beginInfo), "stale layer begin frame"))
 			{
 				return false;
 			}
@@ -922,10 +928,6 @@ public:
 			endInfo.layerCount = 1;
 			endInfo.layers = layers;
 			const XrResult endResult = xrEndFrame(session, &endInfo);
-			if (expectedStop(endResult))
-			{
-				break;
-			}
 			if (endResult != XR_SUCCESS && endResult != XR_FRAME_DISCARDED)
 			{
 				return Check(endResult, "stale layer end frame");
@@ -936,6 +938,7 @@ public:
 		while (GetTickCount64() - start < 1300);
 		return submitted;
 	}
+
 
 	bool StuckFrameAfterIdle(uint32_t& frameCount)
 	{
@@ -968,6 +971,10 @@ public:
 		if (CountAgentXRSessionWindows() != 0)
 		{
 			std::cerr << "stuck frame: window did not expire\n";
+			return false;
+		}
+		if (!RequestActiveSessionExit())
+		{
 			return false;
 		}
 
@@ -2260,7 +2267,7 @@ int RunSessionRestart(const std::wstring& runtimeManifest)
 	{
 		return 1;
 	}
-	if (!client.RestartAfterIdle() || !client.Frame(true, frames) || !expectWindowCount(1, "frame after session restart"))
+	if (!client.RequestActiveSessionExit() || !client.RestartAfterIdle() || !client.Frame(true, frames) || !expectWindowCount(1, "frame after session restart"))
 	{
 		return 1;
 	}

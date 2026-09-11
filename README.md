@@ -68,7 +68,9 @@ Launcher:
 
 No registry writes or machine-wide runtime changes occur.
 
-AgentXR creates its compositor preview window when an XR session begins. Explicit session end disposes it immediately. One second without newly released swapchain content disposes the window and transitions a focused session to `XR_SESSION_STATE_STOPPING`; resubmitting stale layers does not keep a preview alive. After application ends that session, it can begin again from `XR_SESSION_STATE_READY`.
+AgentXR creates its compositor preview window when an XR session begins. Explicit session end disposes it immediately. One second without newly released swapchain content disposes the window; resubmitting stale layers does not keep a preview alive.
+
+Editor integrations that stop presentation without ending their OpenXR session can resolve `agentxrRequestExitActiveSession` from the already-loaded runtime DLL. Calling this optional C ABI export transitions active session to `XR_SESSION_STATE_STOPPING`; application remains responsible for `xrEndSession`.
 
 ## Configure MCP
 

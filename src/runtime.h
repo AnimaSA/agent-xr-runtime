@@ -375,7 +375,6 @@ struct Session
 	LUID adapterLuid{};
 
 	bool IsFocused() const;
-	void NotifyContentIdle();
 	void QueueState(XrSessionState newState);
 	XrTime ValidateTime(XrTime time) const;
 	SimState StateAt(XrTime time, std::shared_ptr<const TimelineEpoch>* epoch = nullptr) const;
