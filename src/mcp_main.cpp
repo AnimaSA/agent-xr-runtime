@@ -8,6 +8,7 @@
 #include <cwchar>
 #include <cwctype>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <string>
 #include <string_view>
@@ -297,22 +298,83 @@ Json LaunchEditor(const Json& arguments)
 	const bool hasExpectedProject = arguments.contains("expectedProjectPath");
 	std::filesystem::path expectedProject;
 	if (hasExpectedProject && !ResolvePath(arguments, "expectedProjectPath", false, expectedProject)) return agentxr::protocol::Error("invalid_arguments", "expectedProjectPath must be a non-empty string");
-	std::filesystem::path manifest;
+	std::filesystem::path sourceManifest;
 	if (arguments.contains("runtimeManifestPath"))
 	{
-		if (!ResolvePath(arguments, "runtimeManifestPath", false, manifest)) return agentxr::protocol::Error("invalid_arguments", "runtimeManifestPath must be a non-empty string");
+		if (!ResolvePath(arguments, "runtimeManifestPath", false, sourceManifest)) return agentxr::protocol::Error("invalid_arguments", "runtimeManifestPath must be a non-empty string");
 	}
 	else
 	{
 		const std::filesystem::path executableDirectory = ExecutableDirectory();
-		if (executableDirectory.empty() || !MakeAbsolute(executableDirectory / L"agent-xr.json", manifest)) return agentxr::protocol::Error("runtime_not_installed", "runtime manifest is unavailable");
+		if (executableDirectory.empty() || !MakeAbsolute(executableDirectory / L"agent-xr.json", sourceManifest)) return agentxr::protocol::Error("runtime_not_installed", "runtime manifest is unavailable");
 	}
 	std::error_code manifestError;
-	if (!std::filesystem::is_regular_file(manifest, manifestError)) return agentxr::protocol::Error("runtime_not_installed", "runtime manifest is unavailable");
+	if (!std::filesystem::is_regular_file(sourceManifest, manifestError)) return agentxr::protocol::Error("runtime_not_installed", "runtime manifest is unavailable");
+	std::ifstream sourceFile(sourceManifest, std::ios::binary);
+	if (!sourceFile) return agentxr::protocol::Error("runtime_manifest_invalid", "runtime manifest cannot be read");
+	Json manifestDocument;
+	try
+	{
+		manifestDocument = Json::parse(sourceFile);
+	}
+	catch (...)
+	{
+		return agentxr::protocol::Error("runtime_manifest_invalid", "runtime manifest is invalid");
+	}
+	if (!manifestDocument.is_object() || !manifestDocument.contains("runtime") || !manifestDocument.at("runtime").is_object() || !manifestDocument.at("runtime").contains("library_path") || !manifestDocument.at("runtime").at("library_path").is_string())
+	{
+		return agentxr::protocol::Error("runtime_manifest_invalid", "runtime manifest is invalid");
+	}
+	const std::wstring libraryValue = agentxr::protocol::WideFromUtf8(manifestDocument.at("runtime").at("library_path").get<std::string>());
+	if (libraryValue.empty()) return agentxr::protocol::Error("runtime_manifest_invalid", "runtime library path is invalid");
+	std::filesystem::path libraryPath;
+	const std::filesystem::path libraryInput(libraryValue);
+	if (!libraryInput.is_absolute())
+	{
+		if (!MakeAbsolute(sourceManifest.parent_path() / libraryInput, libraryPath)) return agentxr::protocol::Error("runtime_manifest_invalid", "runtime library path is invalid");
+	}
+	else if (!MakeAbsolute(libraryInput, libraryPath))
+	{
+		return agentxr::protocol::Error("runtime_manifest_invalid", "runtime library path is invalid");
+	}
+	std::error_code libraryError;
+	if (!std::filesystem::is_regular_file(libraryPath, libraryError)) return agentxr::protocol::Error("runtime_manifest_invalid", "runtime library is unavailable");
+	const std::string resolvedLibrary = agentxr::protocol::Utf8FromWide(libraryPath.wstring());
+	if (resolvedLibrary.empty()) return agentxr::protocol::Error("runtime_manifest_invalid", "runtime library path is invalid");
+	manifestDocument["runtime"]["library_path"] = resolvedLibrary;
+	std::error_code temporaryError;
+	std::filesystem::path temporaryDirectory = std::filesystem::temp_directory_path(temporaryError);
+	if (temporaryError || temporaryDirectory.empty())
+	{
+		return agentxr::protocol::Error("runtime_manifest_invalid", "runtime manifest directory is unavailable");
+	}
+	temporaryDirectory /= L"AgentXR";
+	if (!std::filesystem::create_directories(temporaryDirectory, temporaryError) && temporaryError)
+	{
+		return agentxr::protocol::Error("runtime_manifest_invalid", "runtime manifest directory is unavailable");
+	}
+	std::filesystem::path resolvedManifest;
+	const std::wstring filename = L"agent-xr-" + std::to_wstring(GetCurrentProcessId()) + L".json";
+	if (!MakeAbsolute(temporaryDirectory / filename, resolvedManifest)) return agentxr::protocol::Error("runtime_manifest_invalid", "runtime manifest path is invalid");
+	std::ofstream resolvedFile(resolvedManifest, std::ios::binary | std::ios::trunc);
+	if (!resolvedFile)
+	{
+		return agentxr::protocol::Error("runtime_manifest_invalid", "runtime manifest cannot be written");
+	}
+	resolvedFile << manifestDocument.dump() << '\n';
+	if (!resolvedFile)
+	{
+		return agentxr::protocol::Error("runtime_manifest_invalid", "runtime manifest cannot be written");
+	}
 	const HRESULT init = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
 	const bool uninitialize = SUCCEEDED(init);
-	Json result = LaunchResolvedEditor(shortcut, manifest, expectedProject, hasExpectedProject);
+	Json result = LaunchResolvedEditor(shortcut, resolvedManifest, expectedProject, hasExpectedProject);
 	if (uninitialize) CoUninitialize();
+	if (result.value("ok", false))
+	{
+		result["result"]["manifest"] = agentxr::protocol::Utf8FromWide(resolvedManifest.wstring());
+		result["result"]["sourceManifest"] = agentxr::protocol::Utf8FromWide(sourceManifest.wstring());
+	}
 	return result;
 }
 

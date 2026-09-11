@@ -24,6 +24,23 @@ if ([string]::IsNullOrWhiteSpace($RuntimeManifestPath))
 }
 $RuntimeManifestPath = (Resolve-Path $RuntimeManifestPath).Path
 
+$Manifest = Get-Content -Raw $RuntimeManifestPath | ConvertFrom-Json
+if ([string]::IsNullOrWhiteSpace($Manifest.runtime.library_path))
+{
+	throw "AgentXR runtime manifest has no library_path."
+}
+$RuntimeLibraryPath = $Manifest.runtime.library_path
+if (-not [IO.Path]::IsPathRooted($RuntimeLibraryPath))
+{
+	$RuntimeLibraryPath = Join-Path (Split-Path $RuntimeManifestPath -Parent) $RuntimeLibraryPath
+}
+$RuntimeLibraryPath = (Resolve-Path $RuntimeLibraryPath).Path
+$Manifest.runtime.library_path = $RuntimeLibraryPath
+$ResolvedManifestDirectory = Join-Path ([IO.Path]::GetTempPath()) "AgentXR"
+New-Item -ItemType Directory -Force $ResolvedManifestDirectory | Out-Null
+$ResolvedManifestPath = Join-Path $ResolvedManifestDirectory "agent-xr-runtime-$PID.json"
+$Manifest | ConvertTo-Json -Depth 10 | Set-Content -Encoding UTF8 $ResolvedManifestPath
+
 $Shell = New-Object -ComObject WScript.Shell
 $Shortcut = $Shell.CreateShortcut($ShortcutPath)
 if ([string]::IsNullOrWhiteSpace($Shortcut.TargetPath))
@@ -57,7 +74,7 @@ foreach ($Name in $EnvironmentNames)
 
 try
 {
-	$env:XR_RUNTIME_JSON = $RuntimeManifestPath
+	$env:XR_RUNTIME_JSON = $ResolvedManifestPath
 	Remove-Item Env:XR_ENABLE_API_LAYERS -ErrorAction SilentlyContinue
 	Remove-Item Env:XR_API_LAYER_PATH -ErrorAction SilentlyContinue
 	$env:DISABLE_XR_APILAYER_VIRTUALDESKTOP_OCULUS_COMPATIBILITY = "1"
