@@ -1111,57 +1111,161 @@ public:
 	bool PipelinedFrame()
 	{
 		XrFrameWaitInfo waitInfo{XR_TYPE_FRAME_WAIT_INFO};
-		XrFrameState firstState{XR_TYPE_FRAME_STATE};
-		if (!Check(xrWaitFrame(session, &waitInfo, &firstState), "pipelined-frame wait 1"))
-		{
-			return false;
-		}
-		XrFrameState duplicateWaitState{XR_TYPE_FRAME_STATE};
-		if (!Expect(xrWaitFrame(session, &waitInfo, &duplicateWaitState), XR_ERROR_CALL_ORDER_INVALID, "pipelined-frame duplicate wait"))
-		{
-			return false;
-		}
-
 		XrFrameBeginInfo beginInfo{XR_TYPE_FRAME_BEGIN_INFO};
-		if (!Check(xrBeginFrame(session, &beginInfo), "pipelined-frame begin 1"))
+		const auto waitFrame = [&](XrFrameState& state, std::string_view operation)
+		{
+			state = {XR_TYPE_FRAME_STATE};
+			if (!Check(xrWaitFrame(session, &waitInfo, &state), operation))
+			{
+				return false;
+			}
+			if (state.predictedDisplayTime <= lastDisplayTime)
+			{
+				std::cerr << operation << ": predicted display time did not increase\n";
+				return false;
+			}
+			if (state.predictedDisplayPeriod <= 0)
+			{
+				std::cerr << operation << ": predicted display period is invalid\n";
+				return false;
+			}
+			lastDisplayTime = state.predictedDisplayTime;
+			return true;
+		};
+		const auto locateViews = [&](XrTime displayTime, std::string_view operation)
+		{
+			XrViewState viewState{XR_TYPE_VIEW_STATE};
+			std::array<XrView, 2> views{XrView{XR_TYPE_VIEW}, XrView{XR_TYPE_VIEW}};
+			XrViewLocateInfo locateInfo{XR_TYPE_VIEW_LOCATE_INFO};
+			locateInfo.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+			locateInfo.displayTime = displayTime;
+			locateInfo.space = localSpace;
+			uint32_t viewCount = 0;
+			if (!Check(xrLocateViews(session, &locateInfo, &viewState, static_cast<uint32_t>(views.size()), &viewCount, views.data()), operation))
+			{
+				return false;
+			}
+			if (viewCount != views.size())
+			{
+				std::cerr << operation << ": expected 2 located views, got " << viewCount << '\n';
+				return false;
+			}
+			return true;
+		};
+		const auto beginFrame = [&](std::string_view operation)
+		{
+			return Check(xrBeginFrame(session, &beginInfo), operation);
+		};
+		const auto endFrame = [&](XrTime displayTime, std::string_view operation)
+		{
+			XrFrameEndInfo endInfo{XR_TYPE_FRAME_END_INFO};
+			endInfo.displayTime = displayTime;
+			endInfo.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
+			const XrResult result = xrEndFrame(session, &endInfo);
+			if (result == XR_SUCCESS || result == XR_FRAME_DISCARDED)
+			{
+				return true;
+			}
+			return Check(result, operation);
+		};
+
+		if (!Expect(xrBeginFrame(session, &beginInfo), XR_ERROR_CALL_ORDER_INVALID, "pipelined-frame empty begin"))
 		{
 			return false;
 		}
-		if (!Expect(xrBeginFrame(session, &beginInfo), XR_ERROR_CALL_ORDER_INVALID, "pipelined-frame duplicate begin"))
+		XrFrameEndInfo emptyEndInfo{XR_TYPE_FRAME_END_INFO};
+		emptyEndInfo.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
+		if (!Expect(xrEndFrame(session, &emptyEndInfo), XR_ERROR_CALL_ORDER_INVALID, "pipelined-frame empty end"))
 		{
 			return false;
 		}
 
-		XrFrameState secondState{XR_TYPE_FRAME_STATE};
-		if (!Check(xrWaitFrame(session, &waitInfo, &secondState), "pipelined-frame wait 2"))
+		std::array<XrFrameState, 3> firstStates{};
+		if (!waitFrame(firstStates[0], "pipelined-frame W1") || !waitFrame(firstStates[1], "pipelined-frame W2") || !waitFrame(firstStates[2], "pipelined-frame W3"))
 		{
 			return false;
 		}
-		if (secondState.predictedDisplayTime <= firstState.predictedDisplayTime)
+		if (!locateViews(firstStates[0].predictedDisplayTime, "pipelined-frame locate W1") || !locateViews(firstStates[1].predictedDisplayTime, "pipelined-frame locate W2") || !locateViews(firstStates[2].predictedDisplayTime, "pipelined-frame locate W3"))
 		{
-			std::cerr << "pipelined-frame: second predicted display time did not increase\n";
+			return false;
+		}
+		if (!beginFrame("pipelined-frame B1") || !beginFrame("pipelined-frame B2") || !beginFrame("pipelined-frame B3"))
+		{
+			return false;
+		}
+		if (!endFrame(firstStates[0].predictedDisplayTime, "pipelined-frame E1") || !endFrame(firstStates[1].predictedDisplayTime, "pipelined-frame E2") || !endFrame(firstStates[2].predictedDisplayTime, "pipelined-frame E3"))
+		{
 			return false;
 		}
 
-		XrFrameEndInfo endInfo{XR_TYPE_FRAME_END_INFO};
-		endInfo.displayTime = firstState.predictedDisplayTime;
-		endInfo.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
-		if (!Check(xrEndFrame(session, &endInfo), "pipelined-frame end 1"))
+		std::array<XrFrameState, 3> interleaveStates{};
+		if (!waitFrame(interleaveStates[0], "interleave W1") || !waitFrame(interleaveStates[1], "interleave W2") || !beginFrame("interleave B1") || !waitFrame(interleaveStates[2], "interleave W3") || !beginFrame("interleave B2"))
 		{
 			return false;
 		}
-		if (!Expect(xrEndFrame(session, &endInfo), XR_ERROR_CALL_ORDER_INVALID, "pipelined-frame duplicate end"))
+		if (!locateViews(interleaveStates[0].predictedDisplayTime, "interleave locate W1") || !locateViews(interleaveStates[1].predictedDisplayTime, "interleave locate W2") || !locateViews(interleaveStates[2].predictedDisplayTime, "interleave locate W3"))
 		{
 			return false;
 		}
-		if (!Check(xrBeginFrame(session, &beginInfo), "pipelined-frame begin 2"))
+		if (!endFrame(interleaveStates[0].predictedDisplayTime, "interleave E1") || !beginFrame("interleave B3") || !endFrame(interleaveStates[1].predictedDisplayTime, "interleave E2") || !endFrame(interleaveStates[2].predictedDisplayTime, "interleave E3"))
 		{
 			return false;
 		}
-		endInfo.displayTime = secondState.predictedDisplayTime;
-		if (!Check(xrEndFrame(session, &endInfo), "pipelined-frame end 2"))
+
+		std::array<XrFrameState, 2> invalidEndStates{};
+		if (!waitFrame(invalidEndStates[0], "invalid-end W1") || !waitFrame(invalidEndStates[1], "invalid-end W2") || !beginFrame("invalid-end B1") || !beginFrame("invalid-end B2"))
 		{
 			return false;
+		}
+		if (!locateViews(invalidEndStates[0].predictedDisplayTime, "invalid-end locate W1") || !locateViews(invalidEndStates[1].predictedDisplayTime, "invalid-end locate W2"))
+		{
+			return false;
+		}
+		XrFrameEndInfo outOfOrderEndInfo{XR_TYPE_FRAME_END_INFO};
+		outOfOrderEndInfo.displayTime = invalidEndStates[1].predictedDisplayTime;
+		outOfOrderEndInfo.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
+		if (!Expect(xrEndFrame(session, &outOfOrderEndInfo), XR_ERROR_TIME_INVALID, "invalid-end out-of-order E1"))
+		{
+			return false;
+		}
+		if (!endFrame(invalidEndStates[0].predictedDisplayTime, "invalid-end E1 retry") || !endFrame(invalidEndStates[1].predictedDisplayTime, "invalid-end E2"))
+		{
+			return false;
+		}
+
+		std::array<XrFrameState, 8> depthStates{};
+		for (size_t index = 0; index < depthStates.size(); ++index)
+		{
+			if (!waitFrame(depthStates[index], "depth wait"))
+			{
+				return false;
+			}
+		}
+		XrFrameState ninthState{XR_TYPE_FRAME_STATE};
+		if (!Expect(xrWaitFrame(session, &waitInfo, &ninthState), XR_ERROR_LIMIT_REACHED, "depth ninth outstanding wait"))
+		{
+			return false;
+		}
+		for (const XrFrameState& state : depthStates)
+		{
+			if (!locateViews(state.predictedDisplayTime, "depth locate"))
+			{
+				return false;
+			}
+		}
+		for (size_t index = 0; index < depthStates.size(); ++index)
+		{
+			if (!beginFrame("depth begin"))
+			{
+				return false;
+			}
+		}
+		for (const XrFrameState& state : depthStates)
+		{
+			if (!endFrame(state.predictedDisplayTime, "depth end"))
+			{
+				return false;
+			}
 		}
 		return true;
 	}

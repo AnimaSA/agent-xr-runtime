@@ -57,6 +57,7 @@ inline constexpr uint64_t kSpaceMagic = 0x4158525350414345ULL;
 inline constexpr uint64_t kActionSetMagic = 0x4158524153545345ULL;
 inline constexpr uint64_t kActionMagic = 0x415852414354494FULL;
 inline constexpr uint64_t kSwapchainMagic = 0x4158525357415043ULL;
+inline constexpr size_t kMaxOutstandingFrames = 8;
 
 struct Vec3
 {
@@ -341,6 +342,9 @@ struct Session
 	bool frameBegun = false;
 	uint64_t waitedFrameId = 0;
 	uint64_t begunFrameId = 0;
+	std::deque<uint64_t> waitedFrameIds;
+	std::deque<uint64_t> begunFrameIds;
+	std::mutex frameEndMutex;
 	bool actionSetsAttached = false;
 	bool closing = false;
 	bool requestExit = false;
@@ -375,6 +379,7 @@ struct Session
 	LUID adapterLuid{};
 
 	bool IsFocused() const;
+	void RefreshFrameAliases();
 	void QueueState(XrSessionState newState);
 	XrTime ValidateTime(XrTime time) const;
 	SimState StateAt(XrTime time, std::shared_ptr<const TimelineEpoch>* epoch = nullptr) const;

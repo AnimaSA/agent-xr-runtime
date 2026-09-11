@@ -503,10 +503,9 @@ void Instance::InvalidateChildren()
 		{
 			std::lock_guard lock(sessionState->mutex);
 			sessionState->closing = true;
-			sessionState->frameWaited = false;
-			sessionState->frameBegun = false;
-			sessionState->waitedFrameId = 0;
-			sessionState->begunFrameId = 0;
+			sessionState->waitedFrameIds.clear();
+			sessionState->begunFrameIds.clear();
+			sessionState->RefreshFrameAliases();
 			sessionState->nextDisplayTime = 0;
 			sessionState->nextDeadlineQpc = 0;
 			sessionState->InvalidateChildren();
@@ -552,6 +551,13 @@ void Instance::InvalidateChildren()
 bool Session::IsFocused() const
 {
 	return running && state == XR_SESSION_STATE_FOCUSED && !closing;
+}
+void Session::RefreshFrameAliases()
+{
+	frameWaited = !waitedFrameIds.empty();
+	waitedFrameId = frameWaited ? waitedFrameIds.front() : 0;
+	frameBegun = !begunFrameIds.empty();
+	begunFrameId = frameBegun ? begunFrameIds.front() : 0;
 }
 
 void Session::QueueState(XrSessionState newState)
@@ -1171,10 +1177,9 @@ extern "C" AGENTXR_API XRAPI_ATTR XrResult XRAPI_CALL xrDestroySession(XrSession
 		{
 			std::scoped_lock sessionLocks(owner->mutex, state->mutex, agentxr::gActiveSessionMutex);
 			state->closing = true;
-			state->frameWaited = false;
-			state->frameBegun = false;
-			state->waitedFrameId = 0;
-			state->begunFrameId = 0;
+			state->waitedFrameIds.clear();
+			state->begunFrameIds.clear();
+			state->RefreshFrameAliases();
 			state->nextDisplayTime = 0;
 			state->nextDeadlineQpc = 0;
 			state->InvalidateChildren();
@@ -1224,6 +1229,9 @@ extern "C" AGENTXR_API XRAPI_ATTR XrResult XRAPI_CALL xrBeginSession(XrSession s
 		{
 			return XR_ERROR_INITIALIZATION_FAILED;
 		}
+		state.waitedFrameIds.clear();
+		state.begunFrameIds.clear();
+		state.RefreshFrameAliases();
 		state.viewConfiguration = beginInfo->primaryViewConfigurationType;
 		state.running = true;
 		state.requestExit = false;
@@ -1254,10 +1262,9 @@ extern "C" AGENTXR_API XRAPI_ATTR XrResult XRAPI_CALL xrEndSession(XrSession ses
 				return XR_ERROR_SESSION_NOT_STOPPING;
 			}
 			state.running = false;
-			state.frameWaited = false;
-			state.frameBegun = false;
-			state.waitedFrameId = 0;
-			state.begunFrameId = 0;
+			state.waitedFrameIds.clear();
+			state.begunFrameIds.clear();
+			state.RefreshFrameAliases();
 			state.nextDisplayTime = 0;
 			state.nextDeadlineQpc = 0;
 			state.QueueState(XR_SESSION_STATE_IDLE);
@@ -1336,9 +1343,9 @@ extern "C" AGENTXR_API XRAPI_ATTR XrResult XRAPI_CALL xrWaitFrame(XrSession sess
 		{
 			return XR_ERROR_SESSION_NOT_RUNNING;
 		}
-		if (state.waitedFrameId != 0)
+		if (state.waitedFrameIds.size() >= agentxr::kMaxOutstandingFrames)
 		{
-			return XR_ERROR_CALL_ORDER_INVALID;
+			return XR_ERROR_LIMIT_REACHED;
 		}
 		const int64_t deadline = state.nextDeadlineQpc;
 		lock.unlock();
@@ -1346,13 +1353,15 @@ extern "C" AGENTXR_API XRAPI_ATTR XrResult XRAPI_CALL xrWaitFrame(XrSession sess
 		lock.lock();
 		if (!state.IsFocused())
 		{
-			state.frameWaited = false;
-			state.waitedFrameId = 0;
 			return XR_ERROR_SESSION_NOT_RUNNING;
 		}
 		if (!waited)
 		{
 			return XR_ERROR_RUNTIME_FAILURE;
+		}
+		if (state.waitedFrameIds.size() >= agentxr::kMaxOutstandingFrames)
+		{
+			return XR_ERROR_LIMIT_REACHED;
 		}
 		LARGE_INTEGER now{};
 		QueryPerformanceCounter(&now);
@@ -1376,8 +1385,8 @@ extern "C" AGENTXR_API XRAPI_ATTR XrResult XRAPI_CALL xrWaitFrame(XrSession sess
 		frameRecord.waited = true;
 		frameRecord.late = late;
 		state.frames.push_back(frameRecord);
-		state.waitedFrameId = frameRecord.id;
-		state.frameWaited = true;
+		state.waitedFrameIds.push_back(frameRecord.id);
+		state.RefreshFrameAliases();
 		if (state.frames.size() > agentxr::protocol::kMaxRecordsPerRun)
 		{
 			state.frames.erase(state.frames.begin());
@@ -1432,11 +1441,19 @@ extern "C" AGENTXR_API XRAPI_ATTR XrResult XRAPI_CALL xrBeginFrame(XrSession ses
 		}
 		agentxr::Session& state = *session->object;
 		std::lock_guard lock(state.mutex);
-		if (!state.running || (state.state != XR_SESSION_STATE_FOCUSED && state.state != XR_SESSION_STATE_STOPPING) || state.waitedFrameId == 0 || state.begunFrameId != 0)
+		if (!state.running || (state.state != XR_SESSION_STATE_FOCUSED && state.state != XR_SESSION_STATE_STOPPING))
 		{
 			return XR_ERROR_CALL_ORDER_INVALID;
 		}
-		const uint64_t begunFrameId = state.waitedFrameId;
+		if (state.begunFrameIds.size() >= agentxr::kMaxOutstandingFrames)
+		{
+			return XR_ERROR_LIMIT_REACHED;
+		}
+		if (state.waitedFrameIds.empty())
+		{
+			return XR_ERROR_CALL_ORDER_INVALID;
+		}
+		const uint64_t begunFrameId = state.waitedFrameIds.front();
 		auto frameRecord = std::find_if(state.frames.begin(), state.frames.end(), [begunFrameId](const agentxr::FrameRecord& record)
 		{
 			return record.id == begunFrameId;
@@ -1445,10 +1462,9 @@ extern "C" AGENTXR_API XRAPI_ATTR XrResult XRAPI_CALL xrBeginFrame(XrSession ses
 		{
 			return XR_ERROR_RUNTIME_FAILURE;
 		}
-		state.waitedFrameId = 0;
-		state.frameWaited = false;
-		state.begunFrameId = begunFrameId;
-		state.frameBegun = true;
+		state.waitedFrameIds.pop_front();
+		state.begunFrameIds.push_back(begunFrameId);
+		state.RefreshFrameAliases();
 		frameRecord->begun = true;
 		return XR_SUCCESS;
 	});
@@ -1467,12 +1483,13 @@ extern "C" AGENTXR_API XRAPI_ATTR XrResult XRAPI_CALL xrEndFrame(XrSession sessi
 			return XR_ERROR_VALIDATION_FAILURE;
 		}
 		agentxr::Session& state = *session->object;
+		std::unique_lock endOrderLock(state.frameEndMutex);
 		std::unique_lock lock(state.mutex);
-		if (state.begunFrameId == 0)
+		if (state.begunFrameIds.empty())
 		{
 			return XR_ERROR_CALL_ORDER_INVALID;
 		}
-		const uint64_t frameId = state.begunFrameId;
+		const uint64_t frameId = state.begunFrameIds.front();
 		auto frameRecord = std::find_if(state.frames.begin(), state.frames.end(), [frameId](const agentxr::FrameRecord& record)
 		{
 			return record.id == frameId;
@@ -1501,6 +1518,8 @@ extern "C" AGENTXR_API XRAPI_ATTR XrResult XRAPI_CALL xrEndFrame(XrSession sessi
 			}
 		}
 		const XrTime displayTime = endInfo->displayTime;
+		state.begunFrameIds.pop_front();
+		state.RefreshFrameAliases();
 		lock.unlock();
 		const XrResult composeResult = state.compositor == nullptr ? XR_ERROR_GRAPHICS_DEVICE_INVALID : state.compositor->Compose(*endInfo, frameId);
 		lock.lock();
@@ -1510,8 +1529,6 @@ extern "C" AGENTXR_API XRAPI_ATTR XrResult XRAPI_CALL xrEndFrame(XrSession sessi
 		});
 		if (frameRecord == state.frames.end())
 		{
-			state.begunFrameId = 0;
-			state.frameBegun = false;
 			return XR_ERROR_RUNTIME_FAILURE;
 		}
 		frameRecord->presentResult = static_cast<int32_t>(composeResult);
@@ -1520,8 +1537,6 @@ extern "C" AGENTXR_API XRAPI_ATTR XrResult XRAPI_CALL xrEndFrame(XrSession sessi
 			state.report.error = "compositor failed";
 			state.report.status = "failed";
 			frameRecord->discarded = true;
-			state.begunFrameId = 0;
-			state.frameBegun = false;
 			return composeResult;
 		}
 		frameRecord->ended = true;
@@ -1546,8 +1561,6 @@ extern "C" AGENTXR_API XRAPI_ATTR XrResult XRAPI_CALL xrEndFrame(XrSession sessi
 		{
 			state.report.maxFrameGap = std::max(state.report.maxFrameGap, displayTime - previous->displayTime);
 		}
-		state.begunFrameId = 0;
-		state.frameBegun = false;
 		return XR_SUCCESS;
 	});
 }
