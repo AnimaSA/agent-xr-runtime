@@ -842,6 +842,7 @@ XrResult Compositor::ReleaseSwapchainImage(Swapchain& swapchain)
 	image.acquired = false;
 	image.waited = false;
 	image.released = true;
+	++image.releaseSerial;
 	swapchain.lastReleasedIndex = candidate;
 	return XR_SUCCESS;
 }
@@ -853,21 +854,92 @@ XrResult Compositor::Compose(const XrFrameEndInfo& endInfo, uint64_t frameId)
 	{
 		return XR_ERROR_GRAPHICS_DEVICE_INVALID;
 	}
-	const bool hasContent = endInfo.layerCount != 0;
-	if (hasContent)
+	if (endInfo.layerCount != 0 && endInfo.layers == nullptr)
 	{
-		lastComposeTick.store(GetTickCount64(), std::memory_order_release);
+		return XR_ERROR_LAYER_INVALID;
+	}
+	bool hasFreshContent = false;
+	XrResult preflightResult = XR_SUCCESS;
+	uint32_t preflightSrvIndex = 0;
+	const auto inspect = [&](const XrSwapchainSubImage& subImage) -> bool
+	{
+		if (preflightSrvIndex >= 64 || !IsValidSwapchain(subImage.swapchain) || subImage.swapchain->object->session != &session)
+		{
+			preflightResult = XR_ERROR_LAYER_INVALID;
+			return false;
+		}
+		Swapchain& source = *subImage.swapchain->object;
+		if (source.lastReleasedIndex == UINT32_MAX || source.lastReleasedIndex >= source.images.size() || subImage.imageArrayIndex >= source.info.arraySize || !ValidRect(subImage.imageRect, source.info.width, source.info.height))
+		{
+			preflightResult = XR_ERROR_LAYER_INVALID;
+			return false;
+		}
+		SwapchainImage& image = source.images[source.lastReleasedIndex];
+		if (!image.released)
+		{
+			preflightResult = XR_ERROR_LAYER_INVALID;
+			return false;
+		}
+		hasFreshContent = hasFreshContent || image.releaseSerial != image.lastComposedReleaseSerial;
+		++preflightSrvIndex;
+		return true;
+	};
+	for (uint32_t layerIndex = 0; layerIndex < endInfo.layerCount && preflightResult == XR_SUCCESS; ++layerIndex)
+	{
+		const XrCompositionLayerBaseHeader* base = endInfo.layers[layerIndex];
+		if (base == nullptr)
+		{
+			preflightResult = XR_ERROR_LAYER_INVALID;
+			break;
+		}
+		if (base->type == XR_TYPE_COMPOSITION_LAYER_PROJECTION)
+		{
+			const auto* projection = reinterpret_cast<const XrCompositionLayerProjection*>(base);
+			if (projection->space == XR_NULL_HANDLE || !IsValidSpace(projection->space) || projection->space->object->session != &session || projection->viewCount != 2 || projection->views == nullptr)
+			{
+				preflightResult = XR_ERROR_LAYER_INVALID;
+				break;
+			}
+			for (uint32_t viewIndex = 0; viewIndex < 2; ++viewIndex)
+			{
+				if (!inspect(projection->views[viewIndex].subImage))
+				{
+					break;
+				}
+			}
+		}
+		else if (base->type == XR_TYPE_COMPOSITION_LAYER_QUAD)
+		{
+			const auto* quad = reinterpret_cast<const XrCompositionLayerQuad*>(base);
+			if (quad->space == XR_NULL_HANDLE || !IsValidSpace(quad->space) || quad->space->object->session != &session)
+			{
+				preflightResult = XR_ERROR_LAYER_INVALID;
+				break;
+			}
+			if (quad->eyeVisibility != XR_EYE_VISIBILITY_RIGHT && !inspect(quad->subImage))
+			{
+				break;
+			}
+			if (preflightResult == XR_SUCCESS && quad->eyeVisibility != XR_EYE_VISIBILITY_LEFT && !inspect(quad->subImage))
+			{
+				break;
+			}
+		}
+		else
+		{
+			preflightResult = XR_ERROR_LAYER_INVALID;
+		}
+	}
+	if (preflightResult != XR_SUCCESS)
+	{
+		return preflightResult;
 	}
 	const bool presentationClosed = ConsumePresentationWindowClosed();
 	if (presentationClosed)
 	{
 		DestroyPresentationLocked(true);
 	}
-	if (!hasContent && presentationClosed)
-	{
-		return XR_SUCCESS;
-	}
-	if (!hasContent)
+	if (!hasFreshContent)
 	{
 		if (window == nullptr || hostWindow.load(std::memory_order_acquire) == nullptr || windowSwapchain == nullptr || output == nullptr || rtvHeap == nullptr || windowBufferCount == 0)
 		{
@@ -890,7 +962,7 @@ XrResult Compositor::Compose(const XrFrameEndInfo& endInfo, uint64_t frameId)
 			return XR_ERROR_GRAPHICS_DEVICE_INVALID;
 		}
 	}
-	if (hasContent)
+	if (hasFreshContent)
 	{
 		lastComposeTick.store(GetTickCount64(), std::memory_order_release);
 	}
@@ -1008,6 +1080,7 @@ XrResult Compositor::Compose(const XrFrameEndInfo& endInfo, uint64_t frameId)
 	for (uint32_t touchedIndex = 0; touchedIndex < touchedCount; ++touchedIndex)
 	{
 		touched[touchedIndex]->fenceValue = signal;
+		touched[touchedIndex]->lastComposedReleaseSerial = touched[touchedIndex]->releaseSerial;
 	}
 	const HRESULT present = windowSwapchain->Present(0, DXGI_PRESENT_DO_NOT_WAIT);
 	presentResult = static_cast<int32_t>(present);
@@ -1018,10 +1091,6 @@ XrResult Compositor::Compose(const XrFrameEndInfo& endInfo, uint64_t frameId)
 		return XR_ERROR_RUNTIME_FAILURE;
 	}
 	if (present == S_OK) presentedFrame = frameId;
-	if (hasContent)
-	{
-		lastComposeTick.store(GetTickCount64(), std::memory_order_release);
-	}
 	captureCv.notify_all();
 	return XR_SUCCESS;
 }

@@ -344,6 +344,7 @@ struct Session
 	bool actionSetsAttached = false;
 	bool closing = false;
 	bool requestExit = false;
+	bool pendingIdleExit = false;
 	XrTime nextDisplayTime = 0;
 	int64_t nextDeadlineQpc = 0;
 	uint64_t frameId = 0;
@@ -376,6 +377,7 @@ struct Session
 
 	bool IsFocused() const;
 	void NotifyContentIdle();
+	void ConsumePendingIdleExit();
 	void QueueState(XrSessionState newState);
 	XrTime ValidateTime(XrTime time) const;
 	SimState StateAt(XrTime time, std::shared_ptr<const TimelineEpoch>* epoch = nullptr) const;
@@ -430,6 +432,8 @@ struct SwapchainImage
 {
 	Microsoft::WRL::ComPtr<ID3D12Resource> resource;
 	uint64_t fenceValue = 0;
+	uint64_t releaseSerial = 0;
+	uint64_t lastComposedReleaseSerial = 0;
 	bool acquired = false;
 	bool waited = false;
 	bool released = false;

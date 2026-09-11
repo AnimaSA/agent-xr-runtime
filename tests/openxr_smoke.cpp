@@ -861,6 +861,83 @@ public:
 		return true;
 	}
 
+	bool StaleProjectionFrames(uint32_t& frameCount)
+	{
+		if (swapchain == XR_NULL_HANDLE || localSpace == XR_NULL_HANDLE || images.empty())
+		{
+			return false;
+		}
+
+		XrCompositionLayerProjectionView projectionViews[2]{};
+		for (uint32_t eye = 0; eye < 2; ++eye)
+		{
+			projectionViews[eye] = {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW};
+			projectionViews[eye].pose = {{0.0f, 0.0f, 0.0f, 1.0f}, {0.0f, 0.0f, 0.0f}};
+			projectionViews[eye].fov = {-0.785398163f, 0.785398163f, 0.785398163f, -0.785398163f};
+			projectionViews[eye].subImage = {swapchain, {{0, 0}, {1024, 1024}}, eye};
+		}
+		XrCompositionLayerProjection projection{XR_TYPE_COMPOSITION_LAYER_PROJECTION};
+		projection.space = localSpace;
+		projection.viewCount = 2;
+		projection.views = projectionViews;
+		const XrCompositionLayerBaseHeader* layers[1] = {reinterpret_cast<const XrCompositionLayerBaseHeader*>(&projection)};
+		const ULONGLONG start = GetTickCount64();
+		const auto expectedStop = [&](XrResult result)
+		{
+			return GetTickCount64() - start >= 900 && (result == XR_ERROR_SESSION_NOT_RUNNING || result == XR_ERROR_CALL_ORDER_INVALID);
+		};
+		bool submitted = false;
+		do
+		{
+			XrFrameWaitInfo waitInfo{XR_TYPE_FRAME_WAIT_INFO};
+			XrFrameState frameState{XR_TYPE_FRAME_STATE};
+			const XrResult waitResult = xrWaitFrame(session, &waitInfo, &frameState);
+			if (expectedStop(waitResult))
+			{
+				break;
+			}
+			if (!Check(waitResult, "stale layer wait frame"))
+			{
+				return false;
+			}
+			if (frameState.predictedDisplayTime <= lastDisplayTime || frameState.predictedDisplayPeriod <= 0)
+			{
+				std::cerr << "stale layer frame timing is invalid\n";
+				return false;
+			}
+			lastDisplayTime = frameState.predictedDisplayTime;
+			XrFrameBeginInfo beginInfo{XR_TYPE_FRAME_BEGIN_INFO};
+			const XrResult beginResult = xrBeginFrame(session, &beginInfo);
+			if (expectedStop(beginResult))
+			{
+				break;
+			}
+			if (!Check(beginResult, "stale layer begin frame"))
+			{
+				return false;
+			}
+			XrFrameEndInfo endInfo{XR_TYPE_FRAME_END_INFO};
+			endInfo.displayTime = frameState.predictedDisplayTime;
+			endInfo.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
+			endInfo.layerCount = 1;
+			endInfo.layers = layers;
+			const XrResult endResult = xrEndFrame(session, &endInfo);
+			if (expectedStop(endResult))
+			{
+				break;
+			}
+			if (endResult != XR_SUCCESS && endResult != XR_FRAME_DISCARDED)
+			{
+				return Check(endResult, "stale layer end frame");
+			}
+			submitted = true;
+			++frameCount;
+		}
+		while (GetTickCount64() - start < 1300);
+		return submitted;
+	}
+
+
 	bool Sync(bool& pressed, bool* poseActive = nullptr, bool* triggerValue = nullptr, float* aClickValue = nullptr)
 	{
 		XrActiveActionSet active{actionSet, XR_NULL_PATH};
@@ -2083,6 +2160,10 @@ int RunSessionRestart(const std::wstring& runtimeManifest)
 		return 1;
 	}
 	if (!client.Begin() || !client.Frame(true, frames) || !expectWindowCount(1, "same-session begin"))
+	{
+		return 1;
+	}
+	if (!client.StaleProjectionFrames(frames))
 	{
 		return 1;
 	}
