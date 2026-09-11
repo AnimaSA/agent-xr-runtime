@@ -39,11 +39,13 @@ bool IsSupportedInputPath(const Instance& instance, XrPath path, InputRef& input
 		return false;
 	}
 	input = {};
-	if (value.find(kLeftPath) == 0)
+	const bool left = value.size() > kLeftPath.size() && value.starts_with(kLeftPath) && value[kLeftPath.size()] == '/';
+	const bool right = value.size() > kRightPath.size() && value.starts_with(kRightPath) && value[kRightPath.size()] == '/';
+	if (left)
 	{
 		input.left = true;
 	}
-	else if (value.find(kRightPath) != 0)
+	else if (!right)
 	{
 		return false;
 	}
@@ -396,11 +398,16 @@ extern "C" AGENTXR_API XRAPI_ATTR XrResult XRAPI_CALL xrStringToPath(XrInstance 
 		{
 			return XR_ERROR_VALIDATION_FAILURE;
 		}
-		if (!IsAbsolutePath(pathString) || std::strlen(pathString) >= XR_MAX_PATH_LENGTH)
+		size_t length = 0;
+		while (length < XR_MAX_PATH_LENGTH && pathString[length] != '\0')
+		{
+			++length;
+		}
+		if (length == 0 || length >= XR_MAX_PATH_LENGTH || !IsAbsolutePath(std::string_view(pathString, length)))
 		{
 			return XR_ERROR_PATH_FORMAT_INVALID;
 		}
-		const XrPath result = instance->object->InternPath(pathString);
+		const XrPath result = instance->object->InternPath(std::string_view(pathString, length));
 		if (result == XR_NULL_PATH)
 		{
 			return XR_ERROR_PATH_COUNT_EXCEEDED;
@@ -628,13 +635,13 @@ extern "C" AGENTXR_API XRAPI_ATTR XrResult XRAPI_CALL xrSuggestInteractionProfil
 			}
 		}
 		const std::string profile = instance->object->PathString(suggestedBindings->interactionProfile);
+		if (profile.empty())
+		{
+			return XR_ERROR_PATH_INVALID;
+		}
 		if (profile != kProfilePath)
 		{
-			if (profile.find("/interaction_profiles/") == 0)
-			{
-				return XR_SUCCESS;
-			}
-			return XR_ERROR_PATH_UNSUPPORTED;
+			return XR_SUCCESS;
 		}
 		std::vector<std::pair<XrAction, XrPath>> bindings;
 		bindings.reserve(suggestedBindings->countSuggestedBindings);
@@ -646,7 +653,7 @@ extern "C" AGENTXR_API XRAPI_ATTR XrResult XRAPI_CALL xrSuggestInteractionProfil
 			const bool value = IsSupportedInputPath(*instance->object, binding.binding, input);
 			if (!pose && !value)
 			{
-				return XR_ERROR_PATH_UNSUPPORTED;
+				continue;
 			}
 			if (pose)
 			{

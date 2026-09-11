@@ -361,6 +361,10 @@ bool Clock::SleepUntilQpc(int64_t targetQpc) const
 
 XrPath Instance::InternPath(std::string_view path)
 {
+	if (!IsAbsolutePath(path))
+	{
+		return XR_NULL_PATH;
+	}
 	std::lock_guard lock(mutex);
 	auto found = paths.find(std::string(path));
 	if (found != paths.end())

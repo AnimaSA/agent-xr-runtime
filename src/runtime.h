@@ -469,6 +469,7 @@ public:
 	uint64_t LastCompletedFrame() const;
 	uint64_t LastPresentedFrame() const;
 	bool DeviceLost() const;
+	void MarkPresentationWindowClosed() noexcept;
 
 private:
 	Session& session;
@@ -505,16 +506,17 @@ private:
 	uint64_t completedFence = 0;
 	bool initialized = false;
 	bool deviceLost = false;
+	std::atomic<bool> presentationWindowClosed{false};
 	mutable std::mutex mutex;
 	std::condition_variable captureCv;
 
 	bool CreateWindowResources();
-	void DestroyPresentationLocked();
+	void DestroyPresentationLocked(bool windowAlreadyClosed = false);
+	bool ConsumePresentationWindowClosed() noexcept;
 	bool CreatePipeline();
 	bool WaitFence(uint64_t value, uint32_t timeoutMs);
 	bool SubmitAndSignal(uint64_t frameId);
 	bool EncodePng(std::vector<uint8_t>& png);
-	void HideWindow();
 };
 
 class ControlServer

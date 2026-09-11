@@ -506,6 +506,7 @@ public:
 		LOAD(xrLocateSpace);
 		LOAD(xrLocateViews);
 		LOAD(xrStringToPath);
+		LOAD(xrPathToString);
 		LOAD(xrCreateActionSet);
 		LOAD(xrDestroyActionSet);
 		LOAD(xrCreateAction);
@@ -1175,6 +1176,71 @@ public:
 		return CreateActions(true, true, true) && CreateSwapchain();
 	}
 
+	bool ValidatePathContracts()
+	{
+		const auto roundTrip = [&](const char* source, XrPath& output, std::string_view operation)
+		{
+			if (!Check(xrStringToPath(instance, source, &output), operation))
+			{
+				return false;
+			}
+			std::array<char, XR_MAX_PATH_LENGTH> buffer{};
+			uint32_t count = 0;
+			if (!Check(xrPathToString(instance, output, static_cast<uint32_t>(buffer.size()), &count, buffer.data()), "path to string"))
+			{
+				return false;
+			}
+			if (count != std::strlen(source) + 1 || std::strcmp(buffer.data(), source) != 0)
+			{
+				std::cerr << operation << " did not round-trip exactly\n";
+				return false;
+			}
+			return true;
+		};
+
+		const char* unknownProfileString = "/interaction_profiles/agentxr/unknown_controller";
+		XrPath unknownProfile = XR_NULL_PATH;
+		if (!roundTrip(unknownProfileString, unknownProfile, "unknown profile path"))
+		{
+			return false;
+		}
+		const char* unsupportedComponentString = "/user/hand/right/input/unsupported_component";
+		XrPath unsupportedComponent = XR_NULL_PATH;
+		if (!roundTrip(unsupportedComponentString, unsupportedComponent, "unsupported component path"))
+		{
+			return false;
+		}
+		const XrPath knownBinding = Path("/user/hand/right/input/a/click");
+		const XrPath oculusProfile = Path("/interaction_profiles/oculus/touch_controller");
+		if (knownBinding == XR_NULL_PATH || oculusProfile == XR_NULL_PATH)
+		{
+			return false;
+		}
+
+		const XrActionSuggestedBinding unknownProfileBinding{action, knownBinding};
+		XrInteractionProfileSuggestedBinding unknownProfileSuggestions{XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING};
+		unknownProfileSuggestions.interactionProfile = unknownProfile;
+		unknownProfileSuggestions.countSuggestedBindings = 1;
+		unknownProfileSuggestions.suggestedBindings = &unknownProfileBinding;
+		if (!Check(xrSuggestInteractionProfileBindings(instance, &unknownProfileSuggestions), "suggest unknown profile"))
+		{
+			return false;
+		}
+
+		const XrActionSuggestedBinding unsupportedComponentBinding{action, unsupportedComponent};
+		XrInteractionProfileSuggestedBinding unsupportedComponentSuggestions{XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING};
+		unsupportedComponentSuggestions.interactionProfile = oculusProfile;
+		unsupportedComponentSuggestions.countSuggestedBindings = 1;
+		unsupportedComponentSuggestions.suggestedBindings = &unsupportedComponentBinding;
+		if (!Check(xrSuggestInteractionProfileBindings(instance, &unsupportedComponentSuggestions), "suggest unsupported Oculus component"))
+		{
+			return false;
+		}
+
+		XrPath malformed = XR_NULL_PATH;
+		return Expect(xrStringToPath(instance, "interaction_profiles/agentxr/malformed", &malformed), XR_ERROR_PATH_FORMAT_INVALID, "malformed path");
+	}
+
 	bool DestroyCurrentSession()
 	{
 		DestroySessionOnly();
@@ -1521,6 +1587,7 @@ private:
 	PFN_xrLocateSpace xrLocateSpace = nullptr;
 	PFN_xrLocateViews xrLocateViews = nullptr;
 	PFN_xrStringToPath xrStringToPath = nullptr;
+	PFN_xrPathToString xrPathToString = nullptr;
 	PFN_xrCreateActionSet xrCreateActionSet = nullptr;
 	PFN_xrDestroyActionSet xrDestroyActionSet = nullptr;
 	PFN_xrCreateAction xrCreateAction = nullptr;
@@ -1881,9 +1948,9 @@ int RunUnrealActionSetup(const std::wstring& runtimeManifest)
 		std::cerr << "unreal-action-setup: initialization failed\n";
 		return 1;
 	}
-	if (!client.PrepareUnrealActionSetup())
+	if (!client.PrepareUnrealActionSetup() || !client.ValidatePathContracts())
 	{
-		std::cerr << "unreal-action-setup: action setup failed\n";
+		std::cerr << "unreal-action-setup: action/path setup failed\n";
 		return 1;
 	}
 	if (!client.Begin())
@@ -1926,13 +1993,23 @@ int RunSessionRestart(const std::wstring& runtimeManifest)
 		std::cerr << "session-restart: " << phase << " found " << actual << " AgentXR session windows, expected " << expected << '\n';
 		return false;
 	};
+	const auto pumpCurrentThreadMessages = []()
+	{
+		MSG message{};
+		while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE))
+		{
+			TranslateMessage(&message);
+			DispatchMessageW(&message);
+		}
+	};
 
 	OpenXR client;
 	if (!client.Load(runtimeManifest) || !client.InitializeGraphics() || !client.Begin())
 	{
 		return 1;
 	}
-	if (!expectWindowCount(1, "first begin"))
+	uint32_t frames = 0;
+	if (!client.Frame(false, frames) || !expectWindowCount(1, "first begin"))
 	{
 		return 1;
 	}
@@ -1940,7 +2017,18 @@ int RunSessionRestart(const std::wstring& runtimeManifest)
 	{
 		return 1;
 	}
-	if (!client.Begin() || !expectWindowCount(1, "same-session begin"))
+	if (!client.Begin() || !client.Frame(false, frames) || !expectWindowCount(1, "same-session begin"))
+	{
+		return 1;
+	}
+	const ULONGLONG stallStart = GetTickCount64();
+	while (GetTickCount64() - stallStart <= 1000)
+	{
+		pumpCurrentThreadMessages();
+		Sleep(1);
+	}
+	pumpCurrentThreadMessages();
+	if (!expectWindowCount(0, "frame inactivity"))
 	{
 		return 1;
 	}
@@ -1962,8 +2050,7 @@ int RunSessionRestart(const std::wstring& runtimeManifest)
 		{
 			return 1;
 		}
-		uint32_t frames = 0;
-		if (!client.Frame(false, frames) || !client.End() || !expectWindowCount(0, cycle + 1 == 10 ? "final end" : "cycle end"))
+		if (!client.Frame(false, frames) || (cycle == 0 && !expectWindowCount(1, "frame after inactivity")) || !client.End() || !expectWindowCount(0, cycle + 1 == 10 ? "final end" : "cycle end"))
 		{
 			return 1;
 		}

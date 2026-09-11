@@ -88,12 +88,41 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
 }
 )shader";
 
+constexpr UINT_PTR kPresentationTimerId = 0x41585201u;
+constexpr UINT kPresentationTimerPeriodMs = 1000;
+
+Compositor* WindowCompositor(HWND window)
+{
+	return reinterpret_cast<Compositor*>(GetWindowLongPtrW(window, GWLP_USERDATA));
+}
+
 LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam)
 {
+	if (message == WM_NCCREATE)
+	{
+		const auto* createInfo = reinterpret_cast<const CREATESTRUCTW*>(lParam);
+		SetWindowLongPtrW(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(createInfo->lpCreateParams));
+		return DefWindowProcW(window, message, wParam, lParam);
+	}
+	Compositor* compositor = WindowCompositor(window);
+	if (message == WM_TIMER && wParam == kPresentationTimerId)
+	{
+		KillTimer(window, kPresentationTimerId);
+		DestroyWindow(window);
+		if (compositor != nullptr)
+		{
+			compositor->MarkPresentationWindowClosed();
+		}
+		return 0;
+	}
 	if (message == WM_CLOSE)
 	{
 		ShowWindow(window, SW_HIDE);
 		return 0;
+	}
+	if (message == WM_NCDESTROY)
+	{
+		SetWindowLongPtrW(window, GWLP_USERDATA, 0);
 	}
 	return DefWindowProcW(window, message, wParam, lParam);
 }
@@ -197,6 +226,7 @@ bool Compositor::Initialize(ID3D12Device* deviceValue, ID3D12CommandQueue* queue
 	device = deviceValue;
 	queue = queueValue;
 	deviceLost = false;
+	presentationWindowClosed.store(false, std::memory_order_release);
 	completedFrame = 0;
 	completedFence = 0;
 	presentedFrame = 0;
@@ -232,11 +262,19 @@ bool Compositor::StartPresentation()
 	{
 		return false;
 	}
-	if (window != nullptr)
+	if (ConsumePresentationWindowClosed())
+	{
+		DestroyPresentationLocked(true);
+	}
+	if (window != nullptr && windowSwapchain != nullptr && output != nullptr && rtvHeap != nullptr && windowBufferCount != 0)
 	{
 		ShowWindow(window, SW_SHOWNOACTIVATE);
 		UpdateWindow(window);
 		return true;
+	}
+	if (window != nullptr || windowSwapchain != nullptr || output != nullptr || rtvHeap != nullptr || windowBufferCount != 0)
+	{
+		DestroyPresentationLocked();
 	}
 	if (!CreateWindowResources())
 	{
@@ -252,16 +290,24 @@ void Compositor::StopPresentation()
 	DestroyPresentationLocked();
 }
 
-void Compositor::DestroyPresentationLocked()
+void Compositor::DestroyPresentationLocked(bool windowAlreadyClosed)
 {
+	const bool wasClosed = windowAlreadyClosed || ConsumePresentationWindowClosed();
 	if (fence != nullptr && nextFence > 1)
 	{
 		WaitFence(nextFence - 1, 2000);
 	}
 	if (window != nullptr)
 	{
-		PumpWindowMessages(window);
-		DestroyWindow(window);
+		if (!wasClosed)
+		{
+			KillTimer(window, kPresentationTimerId);
+			PumpWindowMessages(window);
+			if (!presentationWindowClosed.load(std::memory_order_acquire))
+			{
+				DestroyWindow(window);
+			}
+		}
 		window = nullptr;
 	}
 	if (!windowClassName.empty())
@@ -287,6 +333,7 @@ void Compositor::DestroyPresentationLocked()
 	presentedFrame = 0;
 	presentOccluded = false;
 	presentResult = 0;
+	presentationWindowClosed.store(false, std::memory_order_release);
 	captureCv.notify_all();
 }
 void Compositor::Shutdown()
@@ -315,6 +362,7 @@ void Compositor::Shutdown()
 	nextFence = 1;
 	initialized = false;
 	deviceLost = false;
+	presentationWindowClosed.store(false, std::memory_order_release);
 }
 
 
@@ -603,8 +651,39 @@ XrResult Compositor::ReleaseSwapchainImage(Swapchain& swapchain)
 XrResult Compositor::Compose(const XrFrameEndInfo& endInfo, uint64_t frameId)
 {
 	std::lock_guard lock(mutex);
-	if (!initialized || deviceLost || window == nullptr || windowSwapchain == nullptr || output == nullptr || rtvHeap == nullptr || windowBufferCount == 0) return XR_ERROR_GRAPHICS_DEVICE_INVALID;
-	if (FAILED(allocator->Reset()) || FAILED(commandList->Reset(allocator.Get(), pipeline.Get()))) return XR_ERROR_RUNTIME_FAILURE;
+	if (!initialized || deviceLost)
+	{
+		return XR_ERROR_GRAPHICS_DEVICE_INVALID;
+	}
+	if (window != nullptr && !presentationWindowClosed.load(std::memory_order_acquire))
+	{
+		PumpWindowMessages(window);
+	}
+	if (ConsumePresentationWindowClosed())
+	{
+		DestroyPresentationLocked(true);
+	}
+	if (window == nullptr || windowSwapchain == nullptr || output == nullptr || rtvHeap == nullptr || windowBufferCount == 0)
+	{
+		if (window != nullptr || windowSwapchain != nullptr || output != nullptr || rtvHeap != nullptr || windowBufferCount != 0)
+		{
+			DestroyPresentationLocked();
+		}
+		if (!CreateWindowResources())
+		{
+			DestroyPresentationLocked();
+			return XR_ERROR_GRAPHICS_DEVICE_INVALID;
+		}
+	}
+	if (SetTimer(window, kPresentationTimerId, kPresentationTimerPeriodMs, nullptr) == 0)
+	{
+		DestroyPresentationLocked();
+		return XR_ERROR_GRAPHICS_DEVICE_INVALID;
+	}
+	if (FAILED(allocator->Reset()) || FAILED(commandList->Reset(allocator.Get(), pipeline.Get())))
+	{
+		return XR_ERROR_RUNTIME_FAILURE;
+	}
 	commandList->SetGraphicsRootSignature(rootSignature.Get());
 	ID3D12DescriptorHeap* heaps[] = {srvHeap.Get()};
 	commandList->SetDescriptorHeaps(1, heaps);
@@ -804,11 +883,17 @@ XrResult Compositor::Capture(uint64_t afterFrameId, protocol::Json& metadata, st
 	return XR_SUCCESS;
 }
 
-void Compositor::HideWindow()
+
+void Compositor::MarkPresentationWindowClosed() noexcept
 {
-	std::lock_guard lock(mutex);
-	if (window != nullptr) ShowWindow(window, SW_HIDE);
+	presentationWindowClosed.store(true, std::memory_order_release);
 }
+
+bool Compositor::ConsumePresentationWindowClosed() noexcept
+{
+	return presentationWindowClosed.exchange(false, std::memory_order_acq_rel);
+}
+
 
 uint64_t Compositor::LastCompletedFrame() const
 {
