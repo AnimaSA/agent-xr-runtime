@@ -88,14 +88,6 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
 }
 )shader";
 
-constexpr UINT_PTR kPresentationTimerId = 0x41585201u;
-constexpr UINT kPresentationTimerPeriodMs = 1000;
-
-Compositor* WindowCompositor(HWND window)
-{
-	return reinterpret_cast<Compositor*>(GetWindowLongPtrW(window, GWLP_USERDATA));
-}
-
 LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam)
 {
 	if (message == WM_NCCREATE)
@@ -103,17 +95,6 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
 		const auto* createInfo = reinterpret_cast<const CREATESTRUCTW*>(lParam);
 		SetWindowLongPtrW(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(createInfo->lpCreateParams));
 		return DefWindowProcW(window, message, wParam, lParam);
-	}
-	Compositor* compositor = WindowCompositor(window);
-	if (message == WM_TIMER && wParam == kPresentationTimerId)
-	{
-		KillTimer(window, kPresentationTimerId);
-		DestroyWindow(window);
-		if (compositor != nullptr)
-		{
-			compositor->MarkPresentationWindowClosed();
-		}
-		return 0;
 	}
 	if (message == WM_CLOSE)
 	{
@@ -125,16 +106,6 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
 		SetWindowLongPtrW(window, GWLP_USERDATA, 0);
 	}
 	return DefWindowProcW(window, message, wParam, lParam);
-}
-
-void PumpWindowMessages(HWND window)
-{
-	MSG message{};
-	while (PeekMessageW(&message, window, 0, 0, PM_REMOVE))
-	{
-		TranslateMessage(&message);
-		DispatchMessageW(&message);
-	}
 }
 
 bool SupportedFormat(int64_t value)
@@ -206,6 +177,231 @@ Compositor::~Compositor()
 {
 	Shutdown();
 }
+bool Compositor::StartWindowHost()
+{
+	if (hostThread.joinable())
+	{
+		return true;
+	}
+	hostWakeEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+	if (hostWakeEvent == nullptr)
+	{
+		return false;
+	}
+	hostExited.store(false, std::memory_order_release);
+	try
+	{
+		hostThread = std::thread(&Compositor::WindowHostLoop, this);
+	}
+	catch (...)
+	{
+		hostExited.store(true, std::memory_order_release);
+		CloseHandle(hostWakeEvent);
+		hostWakeEvent = nullptr;
+		return false;
+	}
+	return true;
+}
+
+bool Compositor::SendWindowHostCommand(HostCommand command, std::wstring_view className, std::wstring_view title)
+{
+	if (!hostThread.joinable() || hostWakeEvent == nullptr)
+	{
+		return false;
+	}
+	std::unique_lock lock(hostMutex);
+	hostCommandCv.wait(lock, [this]()
+	{
+		return hostPendingCommand == HostCommand::None || hostExited.load(std::memory_order_acquire);
+	});
+	if (hostExited.load(std::memory_order_acquire))
+	{
+		return false;
+	}
+	const uint64_t serial = ++hostNextSerial;
+	hostPendingCommand = command;
+	hostClassName.assign(className);
+	hostTitle.assign(title);
+	if (!SetEvent(hostWakeEvent))
+	{
+		hostPendingCommand = HostCommand::None;
+		return false;
+	}
+	hostCommandCv.wait(lock, [this, serial]()
+	{
+		return hostCompletedSerial >= serial || hostExited.load(std::memory_order_acquire);
+	});
+	return hostCompletedSerial >= serial && hostCommandResult;
+}
+
+void Compositor::StopWindowHost()
+{
+	if (hostThread.joinable())
+	{
+		SendWindowHostCommand(HostCommand::Shutdown);
+		hostThread.join();
+	}
+	if (hostWakeEvent != nullptr)
+	{
+		CloseHandle(hostWakeEvent);
+		hostWakeEvent = nullptr;
+	}
+	hostWindow.store(nullptr, std::memory_order_release);
+	hostExited.store(true, std::memory_order_release);
+}
+
+void Compositor::WindowHostLoop()
+{
+	std::wstring registeredClassName;
+	HWND ownedWindow = nullptr;
+	bool running = true;
+	while (running)
+	{
+		const uint64_t lastCompose = lastComposeTick.load(std::memory_order_acquire);
+		if (ownedWindow != nullptr && lastCompose != 0 && GetTickCount64() - lastCompose >= 1000)
+		{
+			DestroyWindow(ownedWindow);
+			ownedWindow = nullptr;
+			hostWindow.store(nullptr, std::memory_order_release);
+			presentationWindowClosed.store(true, std::memory_order_release);
+		}
+
+		HANDLE wakeEvent = hostWakeEvent;
+		const DWORD waitResult = MsgWaitForMultipleObjectsEx(1, &wakeEvent, 50, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+		if (waitResult == WAIT_OBJECT_0)
+		{
+			HostCommand command = HostCommand::None;
+			uint64_t serial = 0;
+			std::wstring requestedClassName;
+			std::wstring requestedTitle;
+			{
+				std::lock_guard lock(hostMutex);
+				command = hostPendingCommand;
+				if (command != HostCommand::None)
+				{
+					serial = hostNextSerial;
+					requestedClassName = hostClassName;
+					requestedTitle = hostTitle;
+					hostPendingCommand = HostCommand::None;
+				}
+			}
+			if (command != HostCommand::None)
+			{
+				bool result = false;
+				switch (command)
+				{
+				case HostCommand::Create:
+					if (ownedWindow != nullptr && !IsWindow(ownedWindow))
+					{
+						ownedWindow = nullptr;
+						hostWindow.store(nullptr, std::memory_order_release);
+						presentationWindowClosed.store(true, std::memory_order_release);
+					}
+					if (ownedWindow != nullptr)
+					{
+						ShowWindow(ownedWindow, SW_SHOWNOACTIVATE);
+						UpdateWindow(ownedWindow);
+						result = true;
+						break;
+					}
+					if (requestedClassName.empty() || requestedTitle.empty())
+					{
+						break;
+					}
+					if (registeredClassName != requestedClassName)
+					{
+						if (!registeredClassName.empty())
+						{
+							UnregisterClassW(registeredClassName.c_str(), GetModuleHandleW(nullptr));
+							registeredClassName.clear();
+						}
+						WNDCLASSEXW windowClass{};
+						windowClass.cbSize = sizeof(windowClass);
+						windowClass.lpfnWndProc = WindowProc;
+						windowClass.hInstance = GetModuleHandleW(nullptr);
+						windowClass.lpszClassName = requestedClassName.c_str();
+						windowClass.hCursor = LoadCursor(nullptr, IDC_ARROW);
+						const ATOM registered = RegisterClassExW(&windowClass);
+						if (registered == 0 && GetLastError() != ERROR_CLASS_ALREADY_EXISTS)
+						{
+							break;
+						}
+						registeredClassName = requestedClassName;
+					}
+					ownedWindow = CreateWindowExW(0, registeredClassName.c_str(), requestedTitle.c_str(), WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, 1024, 512, nullptr, nullptr, GetModuleHandleW(nullptr), this);
+					if (ownedWindow != nullptr)
+					{
+						hostWindow.store(ownedWindow, std::memory_order_release);
+						ShowWindow(ownedWindow, SW_SHOWNOACTIVATE);
+						UpdateWindow(ownedWindow);
+						result = true;
+					}
+					break;
+				case HostCommand::Show:
+					if (ownedWindow != nullptr)
+					{
+						ShowWindow(ownedWindow, SW_SHOWNOACTIVATE);
+						UpdateWindow(ownedWindow);
+						result = true;
+					}
+					break;
+				case HostCommand::Destroy:
+					if (ownedWindow != nullptr)
+					{
+						DestroyWindow(ownedWindow);
+						ownedWindow = nullptr;
+						hostWindow.store(nullptr, std::memory_order_release);
+					}
+					result = true;
+					break;
+				case HostCommand::Shutdown:
+					if (ownedWindow != nullptr)
+					{
+						DestroyWindow(ownedWindow);
+						ownedWindow = nullptr;
+						hostWindow.store(nullptr, std::memory_order_release);
+					}
+					if (!registeredClassName.empty())
+					{
+						UnregisterClassW(registeredClassName.c_str(), GetModuleHandleW(nullptr));
+						registeredClassName.clear();
+					}
+					result = true;
+					running = false;
+					break;
+				case HostCommand::None:
+					break;
+				}
+				{
+					std::lock_guard lock(hostMutex);
+					hostCommandResult = result;
+					hostCompletedSerial = serial;
+				}
+				hostCommandCv.notify_all();
+			}
+		}
+
+		MSG message{};
+		while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE))
+		{
+			if (message.message == WM_QUIT)
+			{
+				continue;
+			}
+			TranslateMessage(&message);
+			DispatchMessageW(&message);
+		}
+		if (ownedWindow != nullptr && !IsWindow(ownedWindow))
+		{
+			ownedWindow = nullptr;
+			hostWindow.store(nullptr, std::memory_order_release);
+			presentationWindowClosed.store(true, std::memory_order_release);
+		}
+	}
+	hostWindow.store(nullptr, std::memory_order_release);
+	hostExited.store(true, std::memory_order_release);
+	hostCommandCv.notify_all();
+}
 
 bool Compositor::Initialize(ID3D12Device* deviceValue, ID3D12CommandQueue* queueValue)
 {
@@ -252,6 +448,11 @@ bool Compositor::Initialize(ID3D12Device* deviceValue, ID3D12CommandQueue* queue
 		}
 		return false;
 	}
+	lastComposeTick.store(0, std::memory_order_release);
+	if (!StartWindowHost())
+	{
+		return false;
+	}
 	initialized = true;
 	return true;
 }
@@ -266,11 +467,13 @@ bool Compositor::StartPresentation()
 	{
 		DestroyPresentationLocked(true);
 	}
-	if (window != nullptr && windowSwapchain != nullptr && output != nullptr && rtvHeap != nullptr && windowBufferCount != 0)
+	if (window != nullptr && hostWindow.load(std::memory_order_acquire) != nullptr && windowSwapchain != nullptr && output != nullptr && rtvHeap != nullptr && windowBufferCount != 0)
 	{
-		ShowWindow(window, SW_SHOWNOACTIVATE);
-		UpdateWindow(window);
-		return true;
+		if (SendWindowHostCommand(HostCommand::Show))
+		{
+			return true;
+		}
+		DestroyPresentationLocked();
 	}
 	if (window != nullptr || windowSwapchain != nullptr || output != nullptr || rtvHeap != nullptr || windowBufferCount != 0)
 	{
@@ -292,29 +495,22 @@ void Compositor::StopPresentation()
 
 void Compositor::DestroyPresentationLocked(bool windowAlreadyClosed)
 {
-	const bool wasClosed = windowAlreadyClosed || ConsumePresentationWindowClosed();
+	if (windowAlreadyClosed)
+	{
+		presentationWindowClosed.store(false, std::memory_order_release);
+	}
+	else
+	{
+		ConsumePresentationWindowClosed();
+	}
 	if (fence != nullptr && nextFence > 1)
 	{
 		WaitFence(nextFence - 1, 2000);
 	}
-	if (window != nullptr)
+	if (window != nullptr || hostWindow.load(std::memory_order_acquire) != nullptr)
 	{
-		if (!wasClosed)
-		{
-			KillTimer(window, kPresentationTimerId);
-			PumpWindowMessages(window);
-			if (!presentationWindowClosed.load(std::memory_order_acquire))
-			{
-				DestroyWindow(window);
-			}
-		}
+		SendWindowHostCommand(HostCommand::Destroy);
 		window = nullptr;
-	}
-	if (!windowClassName.empty())
-	{
-		const std::wstring className(windowClassName.begin(), windowClassName.end());
-		UnregisterClassW(className.c_str(), GetModuleHandleW(nullptr));
-		windowClassName.clear();
 	}
 	windowSwapchain.Reset();
 	windowBuffers[0].Reset();
@@ -333,6 +529,7 @@ void Compositor::DestroyPresentationLocked(bool windowAlreadyClosed)
 	presentedFrame = 0;
 	presentOccluded = false;
 	presentResult = 0;
+	lastComposeTick.store(0, std::memory_order_release);
 	presentationWindowClosed.store(false, std::memory_order_release);
 	captureCv.notify_all();
 }
@@ -340,6 +537,7 @@ void Compositor::Shutdown()
 {
 	std::lock_guard lock(mutex);
 	DestroyPresentationLocked();
+	StopWindowHost();
 	if (constantData != nullptr && constantBuffer != nullptr)
 	{
 		constantBuffer->Unmap(0, nullptr);
@@ -442,18 +640,17 @@ bool Compositor::CreateWindowResources()
 {
 	Microsoft::WRL::ComPtr<IDXGIFactory6> factory;
 	if (FAILED(CreateDXGIFactory2(0, IID_PPV_ARGS(&factory)))) return false;
-	windowClassName = "AgentXRPreview." + std::to_string(GetCurrentProcessId()) + "." + std::to_string(session.sessionGeneration);
-	const std::wstring className(windowClassName.begin(), windowClassName.end());
-	WNDCLASSEXW windowClass{};
-	windowClass.cbSize = sizeof(windowClass);
-	windowClass.lpfnWndProc = WindowProc;
-	windowClass.hInstance = GetModuleHandleW(nullptr);
-	windowClass.lpszClassName = className.c_str();
-	windowClass.hCursor = LoadCursor(nullptr, IDC_ARROW);
-	RegisterClassExW(&windowClass);
+	const std::wstring className = L"AgentXRPreview." + std::to_wstring(GetCurrentProcessId()) + L"." + std::to_wstring(session.sessionGeneration);
 	const std::wstring title = L"AgentXR PID " + std::to_wstring(GetCurrentProcessId()) + L" Session " + std::to_wstring(session.sessionGeneration);
-	window = CreateWindowExW(0, className.c_str(), title.c_str(), WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, 1024, 512, nullptr, nullptr, GetModuleHandleW(nullptr), this);
-	if (window == nullptr) return false;
+	if (!SendWindowHostCommand(HostCommand::Create, className, title))
+	{
+		return false;
+	}
+	window = hostWindow.load(std::memory_order_acquire);
+	if (window == nullptr)
+	{
+		return false;
+	}
 	DXGI_SWAP_CHAIN_DESC1 description{};
 	description.Width = 2048;
 	description.Height = 1024;
@@ -485,8 +682,6 @@ bool Compositor::CreateWindowResources()
 		device->CreateRenderTargetView(windowBuffers[index].Get(), nullptr, target);
 	}
 	windowBufferCount = 2;
-	ShowWindow(window, SW_SHOWNOACTIVATE);
-	UpdateWindow(window);
 	return true;
 }
 
@@ -655,17 +850,14 @@ XrResult Compositor::Compose(const XrFrameEndInfo& endInfo, uint64_t frameId)
 	{
 		return XR_ERROR_GRAPHICS_DEVICE_INVALID;
 	}
-	if (window != nullptr && !presentationWindowClosed.load(std::memory_order_acquire))
-	{
-		PumpWindowMessages(window);
-	}
+	lastComposeTick.store(GetTickCount64(), std::memory_order_release);
 	if (ConsumePresentationWindowClosed())
 	{
 		DestroyPresentationLocked(true);
 	}
-	if (window == nullptr || windowSwapchain == nullptr || output == nullptr || rtvHeap == nullptr || windowBufferCount == 0)
+	if (window == nullptr || hostWindow.load(std::memory_order_acquire) == nullptr || windowSwapchain == nullptr || output == nullptr || rtvHeap == nullptr || windowBufferCount == 0)
 	{
-		if (window != nullptr || windowSwapchain != nullptr || output != nullptr || rtvHeap != nullptr || windowBufferCount != 0)
+		if (window != nullptr || hostWindow.load(std::memory_order_acquire) != nullptr || windowSwapchain != nullptr || output != nullptr || rtvHeap != nullptr || windowBufferCount != 0)
 		{
 			DestroyPresentationLocked();
 		}
@@ -675,11 +867,7 @@ XrResult Compositor::Compose(const XrFrameEndInfo& endInfo, uint64_t frameId)
 			return XR_ERROR_GRAPHICS_DEVICE_INVALID;
 		}
 	}
-	if (SetTimer(window, kPresentationTimerId, kPresentationTimerPeriodMs, nullptr) == 0)
-	{
-		DestroyPresentationLocked();
-		return XR_ERROR_GRAPHICS_DEVICE_INVALID;
-	}
+	lastComposeTick.store(GetTickCount64(), std::memory_order_release);
 	if (FAILED(allocator->Reset()) || FAILED(commandList->Reset(allocator.Get(), pipeline.Get())))
 	{
 		return XR_ERROR_RUNTIME_FAILURE;
@@ -804,6 +992,7 @@ XrResult Compositor::Compose(const XrFrameEndInfo& endInfo, uint64_t frameId)
 		return XR_ERROR_RUNTIME_FAILURE;
 	}
 	if (present == S_OK) presentedFrame = frameId;
+	lastComposeTick.store(GetTickCount64(), std::memory_order_release);
 	captureCv.notify_all();
 	return XR_SUCCESS;
 }
@@ -850,7 +1039,7 @@ bool Compositor::EncodePng(std::vector<uint8_t>& png)
 XrResult Compositor::Capture(uint64_t afterFrameId, protocol::Json& metadata, std::vector<uint8_t>& png, uint32_t timeoutMs)
 {
 	std::unique_lock lock(mutex);
-	if (!initialized || deviceLost || window == nullptr || windowSwapchain == nullptr || output == nullptr || rtvHeap == nullptr || windowBufferCount == 0) return XR_ERROR_GRAPHICS_DEVICE_INVALID;
+	if (!initialized || deviceLost || window == nullptr || hostWindow.load(std::memory_order_acquire) == nullptr || windowSwapchain == nullptr || output == nullptr || rtvHeap == nullptr || windowBufferCount == 0) return XR_ERROR_GRAPHICS_DEVICE_INVALID;
 	if (completedFrame == 0 || completedFrame <= afterFrameId) return XR_TIMEOUT_EXPIRED;
 	if (!WaitFence(completedFence, timeoutMs)) return XR_TIMEOUT_EXPIRED;
 	const D3D12_RESOURCE_DESC description = output->GetDesc();

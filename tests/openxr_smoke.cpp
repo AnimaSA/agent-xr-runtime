@@ -1993,15 +1993,6 @@ int RunSessionRestart(const std::wstring& runtimeManifest)
 		std::cerr << "session-restart: " << phase << " found " << actual << " AgentXR session windows, expected " << expected << '\n';
 		return false;
 	};
-	const auto pumpCurrentThreadMessages = []()
-	{
-		MSG message{};
-		while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE))
-		{
-			TranslateMessage(&message);
-			DispatchMessageW(&message);
-		}
-	};
 
 	OpenXR client;
 	if (!client.Load(runtimeManifest) || !client.InitializeGraphics() || !client.Begin())
@@ -2021,13 +2012,11 @@ int RunSessionRestart(const std::wstring& runtimeManifest)
 	{
 		return 1;
 	}
-	const ULONGLONG stallStart = GetTickCount64();
-	while (GetTickCount64() - stallStart <= 1000)
+	const ULONGLONG waitStart = GetTickCount64();
+	while (CountAgentXRSessionWindows() != 0 && GetTickCount64() - waitStart < 2500)
 	{
-		pumpCurrentThreadMessages();
-		Sleep(1);
+		Sleep(10);
 	}
-	pumpCurrentThreadMessages();
 	if (!expectWindowCount(0, "frame inactivity"))
 	{
 		return 1;

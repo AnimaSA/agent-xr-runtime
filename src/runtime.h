@@ -32,6 +32,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -473,8 +474,8 @@ public:
 
 private:
 	Session& session;
+	std::atomic<HWND> hostWindow{nullptr};
 	HWND window = nullptr;
-	std::string windowClassName;
 	Microsoft::WRL::ComPtr<ID3D12Device> device;
 	Microsoft::WRL::ComPtr<ID3D12CommandQueue> queue;
 	Microsoft::WRL::ComPtr<ID3D12Fence> fence;
@@ -507,12 +508,36 @@ private:
 	bool initialized = false;
 	bool deviceLost = false;
 	std::atomic<bool> presentationWindowClosed{false};
+	enum class HostCommand : uint8_t
+	{
+		None,
+		Create,
+		Show,
+		Destroy,
+		Shutdown
+	};
+	std::thread hostThread;
+	HANDLE hostWakeEvent = nullptr;
+	std::mutex hostMutex;
+	std::condition_variable hostCommandCv;
+	HostCommand hostPendingCommand = HostCommand::None;
+	uint64_t hostNextSerial = 0;
+	uint64_t hostCompletedSerial = 0;
+	bool hostCommandResult = false;
+	std::wstring hostClassName;
+	std::wstring hostTitle;
+	std::atomic<bool> hostExited{true};
+	std::atomic<uint64_t> lastComposeTick{0};
 	mutable std::mutex mutex;
 	std::condition_variable captureCv;
 
 	bool CreateWindowResources();
 	void DestroyPresentationLocked(bool windowAlreadyClosed = false);
 	bool ConsumePresentationWindowClosed() noexcept;
+	bool StartWindowHost();
+	void WindowHostLoop();
+	bool SendWindowHostCommand(HostCommand command, std::wstring_view className = {}, std::wstring_view title = {});
+	void StopWindowHost();
 	bool CreatePipeline();
 	bool WaitFence(uint64_t value, uint32_t timeoutMs);
 	bool SubmitAndSignal(uint64_t frameId);
