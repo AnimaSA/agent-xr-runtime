@@ -441,7 +441,8 @@ struct Swapchain
 	DXGI_FORMAT viewFormat = DXGI_FORMAT_UNKNOWN;
 	std::vector<SwapchainImage> images;
 	uint32_t nextIndex = 0;
-	uint32_t acquiredIndex = UINT32_MAX;
+	std::deque<uint32_t> acquiredIndices;
+	std::deque<uint32_t> waitedIndices;
 	uint32_t lastReleasedIndex = UINT32_MAX;
 	bool staticImage = false;
 	bool destroyed = false;

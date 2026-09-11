@@ -461,66 +461,93 @@ XrResult Compositor::EnumerateSwapchainImages(Swapchain& swapchain, uint32_t cap
 XrResult Compositor::AcquireSwapchainImage(Swapchain& swapchain, uint32_t* index)
 {
 	std::unique_lock lock(mutex);
-	if (!initialized || index == nullptr) return XR_ERROR_VALIDATION_FAILURE;
-	if (swapchain.acquiredIndex != UINT32_MAX) return XR_ERROR_CALL_ORDER_INVALID;
-	for (uint32_t offset = 0; offset < swapchain.images.size(); ++offset)
+	if (!initialized || index == nullptr || swapchain.images.empty()) return XR_ERROR_VALIDATION_FAILURE;
+	for (;;)
 	{
-		const uint32_t candidate = (swapchain.nextIndex + offset) % static_cast<uint32_t>(swapchain.images.size());
-		SwapchainImage& image = swapchain.images[candidate];
-		if (image.fenceValue == 0 || fence->GetCompletedValue() >= image.fenceValue)
+		if (swapchain.staticImage && swapchain.lastReleasedIndex != UINT32_MAX) return XR_ERROR_CALL_ORDER_INVALID;
+		const uint32_t imageCount = static_cast<uint32_t>(swapchain.images.size());
+		const uint64_t completedValue = fence->GetCompletedValue();
+		uint32_t pendingCandidate = UINT32_MAX;
+		uint64_t pendingFenceValue = 0;
+		for (uint32_t offset = 0; offset < imageCount; ++offset)
 		{
-			swapchain.nextIndex = (candidate + 1) % static_cast<uint32_t>(swapchain.images.size());
-			swapchain.acquiredIndex = candidate;
-			image.acquired = true;
-			image.waited = false;
-			image.released = false;
-			*index = candidate;
-			return XR_SUCCESS;
+			const uint32_t candidate = (swapchain.nextIndex + offset) % imageCount;
+			SwapchainImage& image = swapchain.images[candidate];
+			if (image.acquired || image.waited)
+			{
+				continue;
+			}
+			if (image.fenceValue == 0 || completedValue >= image.fenceValue)
+			{
+				swapchain.nextIndex = (candidate + 1) % imageCount;
+				swapchain.acquiredIndices.push_back(candidate);
+				image.acquired = true;
+				image.waited = false;
+				image.released = false;
+				*index = candidate;
+				return XR_SUCCESS;
+			}
+			if (pendingCandidate == UINT32_MAX)
+			{
+				pendingCandidate = candidate;
+				pendingFenceValue = image.fenceValue;
+			}
 		}
+		if (pendingCandidate == UINT32_MAX)
+		{
+			return XR_ERROR_CALL_ORDER_INVALID;
+		}
+		lock.unlock();
+		if (!WaitFence(pendingFenceValue, 2000))
+		{
+			return XR_TIMEOUT_EXPIRED;
+		}
+		lock.lock();
 	}
-	const uint32_t candidate = swapchain.nextIndex;
-	const uint64_t value = swapchain.images[candidate].fenceValue;
-	lock.unlock();
-	if (!WaitFence(value, 2000)) return XR_TIMEOUT_EXPIRED;
-	lock.lock();
-	swapchain.acquiredIndex = candidate;
-	swapchain.images[candidate].acquired = true;
-	swapchain.images[candidate].waited = false;
-	swapchain.images[candidate].released = false;
-	*index = candidate;
-	return XR_SUCCESS;
 }
 
 XrResult Compositor::WaitSwapchainImage(Swapchain& swapchain, XrDuration timeout)
 {
 	std::unique_lock lock(mutex);
-	if (swapchain.acquiredIndex == UINT32_MAX || swapchain.acquiredIndex >= swapchain.images.size()) return XR_ERROR_CALL_ORDER_INVALID;
-	SwapchainImage& image = swapchain.images[swapchain.acquiredIndex];
+	if (swapchain.acquiredIndices.empty()) return XR_ERROR_CALL_ORDER_INVALID;
+	const uint32_t candidate = swapchain.acquiredIndices.front();
+	if (candidate >= swapchain.images.size()) return XR_ERROR_CALL_ORDER_INVALID;
+	SwapchainImage& image = swapchain.images[candidate];
+	if (!image.acquired || image.waited || image.released) return XR_ERROR_CALL_ORDER_INVALID;
 	const uint32_t timeoutMs = timeout == XR_INFINITE_DURATION ? UINT32_MAX : timeout <= 0 ? 0u : static_cast<uint32_t>(std::min<XrDuration>(timeout / 1000000, UINT32_MAX));
 	const uint64_t value = image.fenceValue;
 	lock.unlock();
 	if (value != 0 && !WaitFence(value, timeoutMs)) return XR_TIMEOUT_EXPIRED;
 	lock.lock();
-	if (image.state != D3D12_RESOURCE_STATE_RENDER_TARGET)
+	if (swapchain.acquiredIndices.empty() || swapchain.acquiredIndices.front() != candidate || candidate >= swapchain.images.size()) return XR_ERROR_CALL_ORDER_INVALID;
+	SwapchainImage& waitedImage = swapchain.images[candidate];
+	if (!waitedImage.acquired || waitedImage.waited || waitedImage.released) return XR_ERROR_CALL_ORDER_INVALID;
+	if (waitedImage.state != D3D12_RESOURCE_STATE_RENDER_TARGET)
 	{
 		if (FAILED(allocator->Reset()) || FAILED(commandList->Reset(allocator.Get(), pipeline.Get()))) return XR_ERROR_RUNTIME_FAILURE;
-		Transition(commandList.Get(), image.resource.Get(), image.state, D3D12_RESOURCE_STATE_RENDER_TARGET);
-		image.state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+		Transition(commandList.Get(), waitedImage.resource.Get(), waitedImage.state, D3D12_RESOURCE_STATE_RENDER_TARGET);
 		if (!SubmitAndSignal(0)) return XR_ERROR_RUNTIME_FAILURE;
+		waitedImage.state = D3D12_RESOURCE_STATE_RENDER_TARGET;
 	}
-	image.waited = true;
+	swapchain.acquiredIndices.pop_front();
+	swapchain.waitedIndices.push_back(candidate);
+	waitedImage.waited = true;
 	return XR_SUCCESS;
 }
 
 XrResult Compositor::ReleaseSwapchainImage(Swapchain& swapchain)
 {
 	std::lock_guard lock(mutex);
-	if (swapchain.acquiredIndex == UINT32_MAX || swapchain.acquiredIndex >= swapchain.images.size()) return XR_ERROR_CALL_ORDER_INVALID;
-	SwapchainImage& image = swapchain.images[swapchain.acquiredIndex];
-	if (!image.waited || image.released) return XR_ERROR_CALL_ORDER_INVALID;
+	if (swapchain.waitedIndices.empty()) return XR_ERROR_CALL_ORDER_INVALID;
+	const uint32_t candidate = swapchain.waitedIndices.front();
+	if (candidate >= swapchain.images.size()) return XR_ERROR_CALL_ORDER_INVALID;
+	SwapchainImage& image = swapchain.images[candidate];
+	if (!image.acquired || !image.waited || image.released) return XR_ERROR_CALL_ORDER_INVALID;
+	swapchain.waitedIndices.pop_front();
+	image.acquired = false;
+	image.waited = false;
 	image.released = true;
-	swapchain.lastReleasedIndex = swapchain.acquiredIndex;
-	swapchain.acquiredIndex = UINT32_MAX;
+	swapchain.lastReleasedIndex = candidate;
 	return XR_SUCCESS;
 }
 
@@ -788,7 +815,7 @@ extern "C" AGENTXR_API XRAPI_ATTR XrResult XRAPI_CALL xrDestroySwapchain(XrSwapc
 	{
 		if (!IsValidSwapchain(swapchain)) return XR_ERROR_HANDLE_INVALID;
 		Swapchain* state = swapchain->object;
-		if (state->acquiredIndex != UINT32_MAX) return XR_ERROR_CALL_ORDER_INVALID;
+		if (!state->acquiredIndices.empty() || !state->waitedIndices.empty()) return XR_ERROR_CALL_ORDER_INVALID;
 		Session* owner = state->session;
 		{
 			std::lock_guard lock(owner->mutex);

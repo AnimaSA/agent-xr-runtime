@@ -884,6 +884,164 @@ public:
 		return Expect(xrBeginFrame(session, &beginInfo), XR_ERROR_CALL_ORDER_INVALID, "begin frame before wait");
 	}
 
+	bool PipelinedSwapchain()
+	{
+		XrSwapchain pipelinedSwapchain = XR_NULL_HANDLE;
+		uint32_t unawaitedCount = 0;
+		uint32_t waitedCount = 0;
+		const auto destroy = [&]() -> bool
+		{
+			if (pipelinedSwapchain == XR_NULL_HANDLE)
+			{
+				return true;
+			}
+			const XrResult result = xrDestroySwapchain(pipelinedSwapchain);
+			pipelinedSwapchain = XR_NULL_HANDLE;
+			return Check(result, "destroy pipelined swapchain");
+		};
+		const auto cleanup = [&]()
+		{
+			XrSwapchainImageReleaseInfo release{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+			while (waitedCount > 0)
+			{
+				if (xrReleaseSwapchainImage(pipelinedSwapchain, &release) != XR_SUCCESS)
+				{
+					break;
+				}
+				--waitedCount;
+			}
+			XrSwapchainImageWaitInfo wait{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
+			wait.timeout = 2000000000LL;
+			while (unawaitedCount > 0)
+			{
+				if (xrWaitSwapchainImage(pipelinedSwapchain, &wait) != XR_SUCCESS)
+				{
+					break;
+				}
+				--unawaitedCount;
+				++waitedCount;
+				if (xrReleaseSwapchainImage(pipelinedSwapchain, &release) != XR_SUCCESS)
+				{
+					break;
+				}
+				--waitedCount;
+			}
+			while (waitedCount > 0)
+			{
+				if (xrReleaseSwapchainImage(pipelinedSwapchain, &release) != XR_SUCCESS)
+				{
+					break;
+				}
+				--waitedCount;
+			}
+			destroy();
+		};
+		XrSwapchainCreateInfo createInfo{XR_TYPE_SWAPCHAIN_CREATE_INFO};
+		createInfo.createFlags = 0;
+		createInfo.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT;
+		createInfo.format = static_cast<int64_t>(selectedFormat);
+		createInfo.sampleCount = 1;
+		createInfo.width = 1;
+		createInfo.height = 1;
+		createInfo.arraySize = 1;
+		createInfo.faceCount = 1;
+		createInfo.mipCount = 1;
+		if (!Check(xrCreateSwapchain(session, &createInfo, &pipelinedSwapchain), "create pipelined swapchain"))
+		{
+			cleanup();
+			return false;
+		}
+		uint32_t imageCount = 0;
+		if (!Check(xrEnumerateSwapchainImages(pipelinedSwapchain, 0, &imageCount, nullptr), "pipelined image count"))
+		{
+			cleanup();
+			return false;
+		}
+		if (imageCount < 3)
+		{
+			std::cerr << "pipelined-swapchain: expected at least 3 images, got " << imageCount << '\n';
+			cleanup();
+			return false;
+		}
+		std::vector<XrSwapchainImageD3D12KHR> pipelinedImages;
+		pipelinedImages.resize(imageCount, {XR_TYPE_SWAPCHAIN_IMAGE_D3D12_KHR});
+		if (!Check(xrEnumerateSwapchainImages(pipelinedSwapchain, imageCount, &imageCount, reinterpret_cast<XrSwapchainImageBaseHeader*>(pipelinedImages.data())), "pipelined images"))
+		{
+			cleanup();
+			return false;
+		}
+		const auto acquire = [&](uint32_t& index, std::string_view operation)
+		{
+			XrSwapchainImageAcquireInfo acquireInfo{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+			if (!Check(xrAcquireSwapchainImage(pipelinedSwapchain, &acquireInfo, &index), operation))
+			{
+				return false;
+			}
+			++unawaitedCount;
+			return true;
+		};
+		const auto waitImage = [&](std::string_view operation)
+		{
+			XrSwapchainImageWaitInfo wait{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
+			wait.timeout = 2000000000LL;
+			if (!Check(xrWaitSwapchainImage(pipelinedSwapchain, &wait), operation))
+			{
+				return false;
+			}
+			--unawaitedCount;
+			++waitedCount;
+			return true;
+		};
+		const auto release = [&](std::string_view operation)
+		{
+			XrSwapchainImageReleaseInfo releaseInfo{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+			if (!Check(xrReleaseSwapchainImage(pipelinedSwapchain, &releaseInfo), operation))
+			{
+				return false;
+			}
+			--waitedCount;
+			return true;
+		};
+		uint32_t firstIndex = 0;
+		uint32_t secondIndex = 0;
+		uint32_t thirdIndex = 0;
+		if (!acquire(firstIndex, "acquire pipelined image 1") || !acquire(secondIndex, "acquire pipelined image 2"))
+		{
+			cleanup();
+			return false;
+		}
+		if (firstIndex == secondIndex)
+		{
+			std::cerr << "pipelined-swapchain: first two acquired images were not distinct\n";
+			cleanup();
+			return false;
+		}
+		if (!waitImage("wait pipelined image 1") || !release("release pipelined image 1"))
+		{
+			cleanup();
+			return false;
+		}
+		if (!acquire(thirdIndex, "acquire pipelined image 3"))
+		{
+			cleanup();
+			return false;
+		}
+		if (thirdIndex == secondIndex)
+		{
+			std::cerr << "pipelined-swapchain: third acquire reused still-outstanding image " << secondIndex << '\n';
+			cleanup();
+			return false;
+		}
+		if (!waitImage("wait pipelined image 2") || !release("release pipelined image 2") || !waitImage("wait pipelined image 3") || !release("release pipelined image 3"))
+		{
+			cleanup();
+			return false;
+		}
+		std::cerr << "pipelined-swapchain: first=" << firstIndex << " second=" << secondIndex << " third=" << thirdIndex << '\n';
+		return destroy();
+	}
+
+
 	bool InvalidHandle()
 	{
 		XrFrameWaitInfo waitInfo{XR_TYPE_FRAME_WAIT_INFO};
@@ -1300,6 +1458,17 @@ int RunScenario(const std::wstring& runtimeManifest, const std::filesystem::path
 		std::cerr << "scenario[" << scenarioName << "]: InvalidCallOrder failed\n";
 		return 1;
 	}
+	if (scenarioName == "pipelined-swapchain")
+	{
+		const bool swapchainPassed = client.PipelinedSwapchain();
+		if (!client.End())
+		{
+			std::cerr << "scenario[" << scenarioName << "]: End failed\n";
+			return 1;
+		}
+		return swapchainPassed ? 0 : 1;
+	}
+
 	if (scenarioName == "invalid-input")
 	{
 		Json invalid;
@@ -1589,7 +1758,14 @@ int RunLifecycle(const std::wstring& runtimeManifest)
 	return 0;
 }
 
+void PrintHelp()
+{
+	std::cerr << "usage: agent-xr-smoke.exe --runtime <manifest> [--scenario <name>]\n";
+	std::cerr << "scenarios: lifecycle session-restart stereo-composition timeline-actions tracking-recovery invalid-input pipelined-swapchain\n";
+}
+
 } // namespace
+
 
 int wmain(int argc, wchar_t** argv)
 {
@@ -1599,15 +1775,22 @@ int wmain(int argc, wchar_t** argv)
 	std::string scenarioName = "lifecycle";
 	for (int index = 1; index < argc; ++index)
 	{
-		if (std::wstring_view(argv[index]) == L"--runtime" && index + 1 < argc)
+		const std::wstring_view argument(argv[index]);
+		if (argument == L"--help" || argument == L"-h")
+		{
+			PrintHelp();
+			return 0;
+		}
+		if (argument == L"--runtime" && index + 1 < argc)
 		{
 			runtimeManifest = argv[++index];
 		}
-		else if (std::wstring_view(argv[index]) == L"--scenario" && index + 1 < argc)
+		else if (argument == L"--scenario" && index + 1 < argc)
 		{
 			scenarioName = agentxr::protocol::Utf8FromWide(argv[++index]);
 		}
 	}
+
 	if (runtimeManifest.empty())
 	{
 		std::wcerr << L"--runtime required\n";
@@ -1621,7 +1804,7 @@ int wmain(int argc, wchar_t** argv)
 	{
 		return RunSessionRestart(runtimeManifest);
 	}
-	if (scenarioName == "stereo-composition" || scenarioName == "timeline-actions" || scenarioName == "tracking-recovery" || scenarioName == "invalid-input")
+	if (scenarioName == "stereo-composition" || scenarioName == "timeline-actions" || scenarioName == "tracking-recovery" || scenarioName == "invalid-input" || scenarioName == "pipelined-swapchain")
 	{
 		return RunScenario(runtimeManifest, std::filesystem::path(argv[0]), scenarioName);
 	}
