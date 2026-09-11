@@ -329,6 +329,7 @@ struct Instance
 	bool PopEvent(XrEventDataBuffer& eventData);
 	XrResult HandleControl(uint64_t connectionId, const protocol::Json& request, protocol::PipeFrame& response);
 	bool AcquireLease(uint64_t connectionId);
+	// Pipe disconnects release the mutation lease; explicit teardown callers request cancellation.
 	void ReleaseLease(uint64_t connectionId, bool cancelRun);
 	void InvalidateChildren();
 };

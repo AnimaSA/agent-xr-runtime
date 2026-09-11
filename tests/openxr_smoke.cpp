@@ -224,14 +224,21 @@ class Control
 public:
 	~Control()
 	{
+		Disconnect();
+	}
+
+	void Disconnect()
+	{
 		if (pipe != INVALID_HANDLE_VALUE)
 		{
 			CloseHandle(pipe);
+			pipe = INVALID_HANDLE_VALUE;
 		}
 	}
 
 	bool Connect(const RuntimeEndpoint& endpoint)
 	{
+		Disconnect();
 		pipe = CreateFileW(endpoint.pipe.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr);
 		processId = endpoint.processId;
 		instanceId = endpoint.instanceId;
@@ -284,6 +291,28 @@ public:
 		}
 		report = response.message.at("result");
 		return report.value("status", std::string{}) != "report_expired";
+	}
+
+	bool CancelTimeline(uint64_t timelineId)
+	{
+		Json request = Identity();
+		request["op"] = "cancel_timeline";
+		request["timelineId"] = timelineId;
+		agentxr::protocol::PipeFrame response;
+		if (!Request(request, response) || !response.message.value("ok", false) || !response.message.contains("result") || !response.message.at("result").is_object())
+		{
+			std::cerr << "cancel_timeline: request failed for timeline " << timelineId << '\n';
+			return false;
+		}
+		const Json result = response.message.at("result");
+		const uint64_t resultId = result.value("timelineId", 0ull);
+		const std::string status = result.value("status", std::string{});
+		if (resultId != timelineId || status != "canceled")
+		{
+			std::cerr << "cancel_timeline: expected id=" << timelineId << " status=canceled, got id=" << resultId << " status=" << status << '\n';
+			return false;
+		}
+		return true;
 	}
 
 	uint32_t processId = 0;
@@ -2314,6 +2343,50 @@ std::filesystem::path ResolveExample(const std::filesystem::path& executable, st
 	return {};
 }
 
+bool CheckNeutralInputs(const Json& snapshot, std::string_view operation)
+{
+	const Json tracking = snapshot.value("tracking", Json::object());
+	const auto isNeutralController = [](const Json& controller)
+	{
+		if (!controller.is_object() || !controller.value("active", false))
+		{
+			return false;
+		}
+		const Json buttons = controller.value("buttons", Json::object());
+		const Json touches = controller.value("touches", Json::object());
+		if (!buttons.is_object() || !touches.is_object())
+		{
+			return false;
+		}
+		for (const auto& entry : buttons.items())
+		{
+			if (!entry.value().is_boolean() || entry.value().get<bool>())
+			{
+				return false;
+			}
+		}
+		for (const auto& entry : touches.items())
+		{
+			if (!entry.value().is_boolean() || entry.value().get<bool>())
+			{
+				return false;
+			}
+		}
+		const Json thumbstick = controller.value("thumbstick", Json::array());
+		if (!thumbstick.is_array() || thumbstick.size() != 2 || !thumbstick[0].is_number() || !thumbstick[1].is_number() || std::fabs(thumbstick[0].get<double>()) > 1.0e-6 || std::fabs(thumbstick[1].get<double>()) > 1.0e-6)
+		{
+			return false;
+		}
+		return controller.contains("trigger") && controller.at("trigger").is_number() && std::fabs(controller.at("trigger").get<double>()) <= 1.0e-6 && controller.contains("squeeze") && controller.at("squeeze").is_number() && std::fabs(controller.at("squeeze").get<double>()) <= 1.0e-6;
+	};
+	if (!tracking.is_object() || !isNeutralController(tracking.value("left", Json::object())) || !isNeutralController(tracking.value("right", Json::object())))
+	{
+		std::cerr << operation << ": final tracking inputs were not neutral\n";
+		return false;
+	}
+	return true;
+}
+
 int RunScenario(const std::wstring& runtimeManifest, const std::filesystem::path& executable, std::string_view scenarioName)
 {
 	OpenXR client;
@@ -2470,6 +2543,36 @@ int RunScenario(const std::wstring& runtimeManifest, const std::filesystem::path
 		std::cerr << "scenario[" << scenarioName << "]: SubmitTimeline failed\n";
 		return 1;
 	}
+
+	if (scenarioName == "timeline-actions")
+	{
+		control.Disconnect();
+		if (!control.Connect(endpoint))
+		{
+			std::cerr << "scenario[" << scenarioName << "]: read-only reconnect failed\n";
+			return 1;
+		}
+		Json reconnectSnapshot;
+		if (!control.Snapshot(reconnectSnapshot))
+		{
+			std::cerr << "scenario[" << scenarioName << "]: read-only reconnect snapshot failed\n";
+			return 1;
+		}
+		const Json reconnectTimeline = reconnectSnapshot.value("timeline", Json::object());
+		const uint64_t reconnectTimelineId = reconnectTimeline.value("id", 0ull);
+		const std::string reconnectStatus = reconnectTimeline.value("status", std::string{});
+		if (reconnectTimelineId != timelineId || reconnectStatus != "running" || reconnectTimeline.value("pending", false))
+		{
+			std::cerr << "scenario[" << scenarioName << "]: disconnect canceled or replaced active timeline; expected id=" << timelineId << " status=running, got id=" << reconnectTimelineId << " status=" << reconnectStatus << '\n';
+			return 1;
+		}
+		Json reconnectReport;
+		if (!control.Report(timelineId, reconnectReport) || reconnectReport.value("status", std::string{}) != "running")
+		{
+			std::cerr << "scenario[" << scenarioName << "]: read-only reconnect report did not remain running\n";
+			return 1;
+		}
+	}
 	const double durationSeconds = timeline.value("durationSeconds", 1.0);
 	const uint32_t frameTarget = std::max<uint32_t>(10u, static_cast<uint32_t>(std::ceil(durationSeconds * 90.0)) + 20u);
 	uint32_t frames = 0;
@@ -2562,6 +2665,50 @@ int RunScenario(const std::wstring& runtimeManifest, const std::filesystem::path
 		std::cerr << "timeline-actions verdict: sawPress=" << (sawPress ? 1 : 0) << " sawRelease=" << (sawRelease ? 1 : 0) << " unobservedDigitalTransitions=" << unobservedDigitalTransitions << '\n';
 		if (!timelineActionsPassed)
 		{
+			return 1;
+		}
+		if (!CheckNeutralInputs(snapshot, "timeline-actions disconnect completion"))
+		{
+			return 1;
+		}
+	}
+
+	if (scenarioName == "timeline-actions")
+	{
+		Json cancelTimeline = timeline;
+		cancelTimeline["initial"]["right"]["buttons"]["a"] = true;
+		uint64_t cancelTimelineId = 0;
+		if (!SubmitTimeline(control, cancelTimeline, cancelTimelineId, true))
+		{
+			std::cerr << "scenario[" << scenarioName << "]: second-connection submit did not acquire released lease\n";
+			return 1;
+		}
+		uint32_t cancelFrames = frames;
+		if (!client.Frame(false, cancelFrames))
+		{
+			std::cerr << "scenario[" << scenarioName << "]: explicit-cancel setup frame failed\n";
+			return 1;
+		}
+		if (!control.CancelTimeline(cancelTimelineId))
+		{
+			std::cerr << "scenario[" << scenarioName << "]: second-connection explicit cancel failed\n";
+			return 1;
+		}
+		bool canceledPressed = true;
+		if (!client.Frame(false, cancelFrames) || !client.Sync(canceledPressed))
+		{
+			std::cerr << "scenario[" << scenarioName << "]: canceled-input neutralization frame failed\n";
+			return 1;
+		}
+		if (canceledPressed)
+		{
+			std::cerr << "scenario[" << scenarioName << "]: explicit cancellation left button input active\n";
+			return 1;
+		}
+		Json canceledReport;
+		if (!control.Report(cancelTimelineId, canceledReport) || canceledReport.value("status", std::string{}) != "canceled")
+		{
+			std::cerr << "scenario[" << scenarioName << "]: explicit cancellation report was not retained as canceled\n";
 			return 1;
 		}
 	}

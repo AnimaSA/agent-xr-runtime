@@ -102,6 +102,7 @@ Server exposes one `xr` tool with actions:
 | `capture` | `processId`, `instanceId`, `sessionGeneration` | Capture fresh composited stereo PNG. Optional `afterFrameId`. |
 
 Always call `list_processes`, then `snapshot`. Carry exact `processId`, `instanceId`, and nonzero `sessionGeneration` into mutating calls. Refresh snapshot after application restarts XR session; stale generations are rejected.
+Submitted timelines are finite and continue after controlling MCP connection disconnects. Disconnect releases mutation lease; reconnect with same target identity to inspect, replace, or cancel run. Session/runtime teardown still neutralizes inputs.
 
 `launch_editor` materializes temporary manifest with absolute runtime DLL path. Prefer it over setting environment manually when MCP owns launch.
 

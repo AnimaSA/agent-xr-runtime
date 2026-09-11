@@ -225,7 +225,7 @@ void ControlServer::ClientLoop(HANDLE pipe, uint64_t connectionId)
 		if (result != XR_SUCCESS && response.message.empty()) response.message = SessionError("runtime_error", "control request failed");
 		if (!protocol::WriteFrame(pipe, response.message, response.binary, 2000)) break;
 	}
-	instance.ReleaseLease(connectionId, true);
+	instance.ReleaseLease(connectionId, false);
 }
 
 XrResult Instance::HandleControl(uint64_t connectionId, const protocol::Json& request, protocol::PipeFrame& response)
