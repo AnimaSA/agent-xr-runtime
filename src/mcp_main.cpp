@@ -6,10 +6,12 @@
 
 #include <algorithm>
 #include <cwchar>
+#include <cwctype>
 #include <filesystem>
 #include <iostream>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <utility>
 
 #pragma comment(lib, "shell32.lib")
@@ -31,16 +33,45 @@ struct Endpoint
 	Json handshake;
 };
 
-std::filesystem::path FindRepositoryRoot()
+std::filesystem::path ExecutableDirectory()
 {
-	std::filesystem::path path = std::filesystem::current_path();
-	for (;;)
+	std::vector<wchar_t> buffer(32768);
+	const DWORD length = GetModuleFileNameW(nullptr, buffer.data(), static_cast<DWORD>(buffer.size()));
+	if (length == 0 || length >= buffer.size()) return {};
+	return std::filesystem::path(std::wstring(buffer.data(), length)).parent_path();
+}
+
+bool MakeAbsolute(const std::filesystem::path& input, std::filesystem::path& output)
+{
+	if (input.empty()) return false;
+	std::error_code error;
+	output = std::filesystem::absolute(input, error);
+	return !error && !output.empty();
+}
+
+bool ResolvePath(const Json& arguments, std::string_view name, bool required, std::filesystem::path& output)
+{
+	if (!arguments.contains(name)) return !required;
+	const Json& value = arguments.at(name);
+	if (!value.is_string()) return false;
+	const std::wstring wideValue = agentxr::protocol::WideFromUtf8(value.get<std::string>());
+	return !wideValue.empty() && MakeAbsolute(std::filesystem::path(wideValue), output);
+}
+
+std::wstring NormalizePath(std::wstring value)
+{
+	for (wchar_t& character : value)
 	{
-		if (std::filesystem::exists(path / "VRRaidGame.uproject") && std::filesystem::exists(path / "Launch VRRaidGame.lnk")) return path;
-		const std::filesystem::path parent = path.parent_path();
-		if (parent == path) return {};
-		path = parent;
+		character = character == L'/' ? L'\\' : static_cast<wchar_t>(std::towlower(character));
 	}
+	return value;
+}
+
+bool ShortcutContainsPath(const std::wstring& arguments, const std::filesystem::path& expected)
+{
+	const std::wstring normalizedArguments = NormalizePath(arguments);
+	const std::wstring normalizedExpected = NormalizePath(expected.wstring());
+	return !normalizedExpected.empty() && normalizedArguments.find(normalizedExpected) != std::wstring::npos;
 }
 
 uint64_t ProcessCreationTime(HANDLE process)
@@ -137,12 +168,27 @@ std::vector<Endpoint> DiscoverEndpoints()
 std::wstring MakeEnvironment(const std::wstring& runtimeManifest)
 {
 	std::wstring environment;
+	static constexpr const wchar_t* excludedVariables[] = {
+		L"XR_RUNTIME_JSON",
+		L"XR_ENABLE_API_LAYERS",
+		L"XR_API_LAYER_PATH",
+		L"DISABLE_XR_APILAYER_VIRTUALDESKTOP_OCULUS_COMPATIBILITY"};
 	LPWCH block = GetEnvironmentStringsW();
 	if (block != nullptr)
 	{
 		for (LPWCH entry = block; *entry != L'\0'; entry += std::wcslen(entry) + 1)
 		{
-			if (_wcsnicmp(entry, L"XR_RUNTIME_JSON=", 16) != 0)
+			bool excluded = false;
+			for (const wchar_t* name : excludedVariables)
+			{
+				const size_t nameLength = std::wcslen(name);
+				if (_wcsnicmp(entry, name, nameLength) == 0 && entry[nameLength] == L'=')
+				{
+					excluded = true;
+					break;
+				}
+			}
+			if (!excluded)
 			{
 				environment.append(entry);
 				environment.push_back(L'\0');
@@ -150,71 +196,124 @@ std::wstring MakeEnvironment(const std::wstring& runtimeManifest)
 		}
 		FreeEnvironmentStringsW(block);
 	}
-	environment.append(L"XR_RUNTIME_JSON=");
-	environment.append(runtimeManifest);
-	environment.push_back(L'\0');
+	const auto appendVariable = [&environment](const wchar_t* name, const wchar_t* value)
+	{
+		environment.append(name);
+		environment.push_back(L'=');
+		environment.append(value);
+		environment.push_back(L'\0');
+	};
+	appendVariable(L"XR_RUNTIME_JSON", runtimeManifest.c_str());
+	appendVariable(L"XR_ENABLE_API_LAYERS", L"");
+	appendVariable(L"XR_API_LAYER_PATH", L"");
+	appendVariable(L"DISABLE_XR_APILAYER_VIRTUALDESKTOP_OCULUS_COMPATIBILITY", L"1");
 	environment.push_back(L'\0');
 	return environment;
 }
 
-Json LaunchEditor(const Json& arguments)
+Json LaunchResolvedEditor(const std::filesystem::path& shortcut, const std::filesystem::path& manifest, const std::filesystem::path& expectedProject, bool hasExpectedProject)
 {
-	const std::filesystem::path root = FindRepositoryRoot();
-	if (root.empty()) return agentxr::protocol::Error("project_not_found", "repository root or canonical shortcut not found");
-	const std::filesystem::path shortcut = root / "Launch VRRaidGame.lnk";
-	const std::filesystem::path manifest = root / "agent-xr" / "dist" / "agent-xr.json";
-	if (!std::filesystem::exists(manifest)) return agentxr::protocol::Error("runtime_not_installed", "agent-xr/dist/agent-xr.json not found");
-	HRESULT init = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
-	const bool uninitialize = SUCCEEDED(init);
 	IShellLinkW* shellLinkRaw = nullptr;
-	HRESULT result = CoCreateInstance(CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&shellLinkRaw));
-	if (FAILED(result))
+	if (FAILED(CoCreateInstance(CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&shellLinkRaw))))
 	{
-		if (uninitialize) CoUninitialize();
-		return agentxr::protocol::Error("shortcut_failed", "cannot create ShellLink");
+		return agentxr::protocol::Error("shortcut_failed", "cannot create shortcut handler");
 	}
 	Microsoft::WRL::ComPtr<IShellLinkW> shellLink;
 	shellLink.Attach(shellLinkRaw);
 	Microsoft::WRL::ComPtr<IPersistFile> persist;
 	if (FAILED(shellLink.As(&persist)) || FAILED(persist->Load(shortcut.c_str(), STGM_READ)))
 	{
-		if (uninitialize) CoUninitialize();
-		return agentxr::protocol::Error("shortcut_failed", "cannot load canonical shortcut");
+		return agentxr::protocol::Error("shortcut_failed", "cannot load shortcut");
 	}
 	WCHAR targetBuffer[32768]{};
 	WIN32_FIND_DATAW findData{};
 	WCHAR argumentsBuffer[32768]{};
-	if (FAILED(shellLink->GetPath(targetBuffer, ARRAYSIZE(targetBuffer), &findData, SLGP_RAWPATH)) || FAILED(shellLink->GetArguments(argumentsBuffer, ARRAYSIZE(argumentsBuffer))))
+	WCHAR workingDirectoryBuffer[32768]{};
+	if (FAILED(shellLink->GetPath(targetBuffer, ARRAYSIZE(targetBuffer), &findData, SLGP_RAWPATH)) || FAILED(shellLink->GetArguments(argumentsBuffer, ARRAYSIZE(argumentsBuffer))) || FAILED(shellLink->GetWorkingDirectory(workingDirectoryBuffer, ARRAYSIZE(workingDirectoryBuffer))))
 	{
-		if (uninitialize) CoUninitialize();
-		return agentxr::protocol::Error("shortcut_failed", "cannot resolve canonical shortcut");
+		return agentxr::protocol::Error("shortcut_failed", "cannot resolve shortcut");
 	}
-	const std::wstring target(targetBuffer);
-	std::wstring shortcutArguments(argumentsBuffer);
-	if (shortcutArguments.find(L"VRRaidGame.uproject") == std::wstring::npos)
+	if (targetBuffer[0] == L'\0')
 	{
-		if (uninitialize) CoUninitialize();
-		return agentxr::protocol::Error("project_mismatch", "canonical shortcut does not target VRRaidGame");
+		return agentxr::protocol::Error("shortcut_failed", "shortcut target is empty");
 	}
-	if (!ProcessIdsByImage(target).empty())
+	std::filesystem::path target;
+	if (!MakeAbsolute(std::filesystem::path(targetBuffer), target))
 	{
-		if (uninitialize) CoUninitialize();
-		return agentxr::protocol::Error("editor_already_running", "matching Unreal editor already running");
+		return agentxr::protocol::Error("shortcut_failed", "cannot resolve shortcut target");
 	}
-	std::wstring command = L"\"" + target + L"\" " + shortcutArguments;
+	const std::wstring shortcutArguments(argumentsBuffer);
+	if (hasExpectedProject && !ShortcutContainsPath(shortcutArguments, expectedProject))
+	{
+		return agentxr::protocol::Error("project_mismatch", "shortcut arguments do not match expected project");
+	}
+	if (!ProcessIdsByImage(target.wstring()).empty())
+	{
+		return agentxr::protocol::Error("editor_already_running", "matching editor already running");
+	}
+	std::filesystem::path workingDirectory;
+	if (workingDirectoryBuffer[0] != L'\0')
+	{
+		if (!MakeAbsolute(std::filesystem::path(workingDirectoryBuffer), workingDirectory))
+		{
+			return agentxr::protocol::Error("shortcut_failed", "cannot resolve shortcut working directory");
+		}
+	}
+	else
+	{
+		workingDirectory = target.parent_path();
+	}
+	if (workingDirectory.empty())
+	{
+		return agentxr::protocol::Error("shortcut_failed", "shortcut working directory is empty");
+	}
+	const std::wstring targetString = target.wstring();
+	const std::wstring workingDirectoryString = workingDirectory.wstring();
+	std::wstring command = L"\"" + targetString + L"\"";
+	if (!shortcutArguments.empty())
+	{
+		command.push_back(L' ');
+		command.append(shortcutArguments);
+	}
 	std::vector<wchar_t> commandLine(command.begin(), command.end());
 	commandLine.push_back(L'\0');
-	const std::wstring environment = MakeEnvironment(std::filesystem::absolute(manifest).wstring());
+	const std::wstring environment = MakeEnvironment(manifest.wstring());
 	STARTUPINFOW startup{};
 	startup.cb = sizeof(startup);
 	PROCESS_INFORMATION processInfo{};
-	const BOOL created = CreateProcessW(nullptr, commandLine.data(), nullptr, nullptr, FALSE, CREATE_UNICODE_ENVIRONMENT, const_cast<wchar_t*>(environment.c_str()), root.c_str(), &startup, &processInfo);
-	if (uninitialize) CoUninitialize();
-	if (!created) return agentxr::protocol::Error("launch_failed", "CreateProcess failed");
+	const BOOL created = CreateProcessW(nullptr, commandLine.data(), nullptr, nullptr, FALSE, CREATE_UNICODE_ENVIRONMENT, const_cast<wchar_t*>(environment.c_str()), workingDirectoryString.c_str(), &startup, &processInfo);
+	if (!created) return agentxr::protocol::Error("launch_failed", "cannot launch editor");
 	const uint32_t processId = processInfo.dwProcessId;
 	CloseHandle(processInfo.hThread);
 	CloseHandle(processInfo.hProcess);
-	return {{"ok", true}, {"result", {{"processId", processId}, {"manifest", std::filesystem::absolute(manifest).string()}}}};
+	return {{"ok", true}, {"result", {{"processId", processId}, {"manifest", agentxr::protocol::Utf8FromWide(manifest.wstring())}}}};
+}
+
+Json LaunchEditor(const Json& arguments)
+{
+	if (!arguments.is_object()) return agentxr::protocol::Error("invalid_arguments", "launch_editor arguments must be an object");
+	std::filesystem::path shortcut;
+	if (!ResolvePath(arguments, "shortcutPath", true, shortcut)) return agentxr::protocol::Error("invalid_arguments", "shortcutPath must be a non-empty string");
+	const bool hasExpectedProject = arguments.contains("expectedProjectPath");
+	std::filesystem::path expectedProject;
+	if (hasExpectedProject && !ResolvePath(arguments, "expectedProjectPath", false, expectedProject)) return agentxr::protocol::Error("invalid_arguments", "expectedProjectPath must be a non-empty string");
+	std::filesystem::path manifest;
+	if (arguments.contains("runtimeManifestPath"))
+	{
+		if (!ResolvePath(arguments, "runtimeManifestPath", false, manifest)) return agentxr::protocol::Error("invalid_arguments", "runtimeManifestPath must be a non-empty string");
+	}
+	else
+	{
+		const std::filesystem::path executableDirectory = ExecutableDirectory();
+		if (executableDirectory.empty() || !MakeAbsolute(executableDirectory / L"agent-xr.json", manifest)) return agentxr::protocol::Error("runtime_not_installed", "runtime manifest is unavailable");
+	}
+	std::error_code manifestError;
+	if (!std::filesystem::is_regular_file(manifest, manifestError)) return agentxr::protocol::Error("runtime_not_installed", "runtime manifest is unavailable");
+	const HRESULT init = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+	const bool uninitialize = SUCCEEDED(init);
+	Json result = LaunchResolvedEditor(shortcut, manifest, expectedProject, hasExpectedProject);
+	if (uninitialize) CoUninitialize();
+	return result;
 }
 
 class RuntimeConnection
@@ -361,6 +460,9 @@ Json HandleRpc(const Json& request, RuntimeConnection& connection, bool& respond
 		properties["cursor"] = Json{{"type", "integer"}};
 		properties["limit"] = Json{{"type", "integer"}};
 		properties["afterFrameId"] = Json{{"type", "integer"}};
+		properties["shortcutPath"] = Json{{"type", "string"}};
+		properties["expectedProjectPath"] = Json{{"type", "string"}};
+		properties["runtimeManifestPath"] = Json{{"type", "string"}};
 		properties["timeline"] = Json{{"type", "object"}};
 		Json inputSchema = Json::object();
 		inputSchema["type"] = "object";
