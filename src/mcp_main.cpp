@@ -390,9 +390,14 @@ public:
 	{
 		Close();
 		pipe = CreateFileW(endpoint.pipe.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr);
-		if (pipe == INVALID_HANDLE_VALUE) return false;
+		if (pipe == INVALID_HANDLE_VALUE)
+		{
+			return false;
+		}
 		processId = endpoint.processId;
+		processCreationTime = endpoint.processCreationTime;
 		instanceId = endpoint.instanceId;
+		pipeName = endpoint.pipe;
 		return true;
 	}
 
@@ -404,7 +409,9 @@ public:
 			pipe = INVALID_HANDLE_VALUE;
 		}
 		processId = 0;
+		processCreationTime = 0;
 		instanceId.clear();
+		pipeName.clear();
 	}
 
 	bool Send(const Json& request, PipeFrame& response)
@@ -413,11 +420,14 @@ public:
 	}
 
 	uint32_t processId = 0;
+	uint64_t processCreationTime = 0;
 	std::string instanceId;
+	std::wstring pipeName;
 
 private:
 	HANDLE pipe = INVALID_HANDLE_VALUE;
 };
+
 
 Json TextResult(const Json& value)
 {
@@ -471,11 +481,42 @@ Json CallXr(const Json& arguments, RuntimeConnection& connection)
 	}
 	Json request = arguments;
 	request["op"] = action;
+	const uint32_t boundProcessId = connection.processId;
+	const uint64_t boundProcessCreationTime = connection.processCreationTime;
+	const std::string boundInstanceId = connection.instanceId;
+	const std::wstring boundPipeName = connection.pipeName;
+	const bool hasValidSessionGeneration = arguments.contains("sessionGeneration") && arguments.at("sessionGeneration").is_number_unsigned() && arguments.at("sessionGeneration").get<uint64_t>() != 0;
+	const uint64_t requestedSessionGeneration = hasValidSessionGeneration ? arguments.at("sessionGeneration").get<uint64_t>() : 0;
 	PipeFrame response;
 	if (!connection.Send(request, response))
 	{
 		connection.Close();
-		return ToolFailure(agentxr::protocol::Error("runtime_closed", "runtime endpoint closed connection"));
+		const Json closedError = agentxr::protocol::Error("runtime_closed", "runtime endpoint closed connection");
+		if (action != "get_report" || !hasValidSessionGeneration)
+		{
+			return ToolFailure(closedError);
+		}
+		Endpoint recovered;
+		const bool sameSession = OpenEndpoint(boundPipeName, recovered) &&
+			recovered.processId == boundProcessId &&
+			recovered.processCreationTime == boundProcessCreationTime &&
+			recovered.instanceId == boundInstanceId &&
+			recovered.handshake.contains("sessionRunning") &&
+			recovered.handshake.at("sessionRunning").is_boolean() &&
+			recovered.handshake.at("sessionRunning").get<bool>() &&
+			recovered.handshake.contains("sessionGeneration") &&
+			recovered.handshake.at("sessionGeneration").is_number_unsigned() &&
+			recovered.handshake.at("sessionGeneration").get<uint64_t>() == requestedSessionGeneration &&
+			recovered.handshake.contains("sessionState");
+		if (!sameSession)
+		{
+			return ToolFailure(closedError);
+		}
+		if (!connection.Connect(recovered) || !connection.Send(request, response))
+		{
+			connection.Close();
+			return ToolFailure(closedError);
+		}
 	}
 	if (!response.message.value("ok", false)) return ToolFailure(response.message);
 	if (action == "capture")

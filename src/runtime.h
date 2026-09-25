@@ -153,8 +153,13 @@ struct FrameRecord
 	bool ended = false;
 	bool discarded = false;
 	bool late = false;
+	uint32_t missedPeriods = 0;
+	bool composed = false;
+	int32_t composeResult = static_cast<int32_t>(XR_SUCCESS);
+	bool presentAttempted = false;
 	bool presented = false;
 	bool presentOccluded = false;
+	bool presentStillDrawing = false;
 	int32_t presentResult = 0;
 	uint32_t authoredSamples = 0;
 	uint32_t appliedSamples = 0;
@@ -317,7 +322,6 @@ struct Instance
 	std::unordered_map<XrPath, std::vector<std::pair<XrAction, XrPath>>> suggestions;
 	std::unique_ptr<ControlServer> control;
 	std::atomic<uint64_t> generationCounter{0};
-	std::atomic<uint64_t> publicGeneration{0};
 	std::atomic<uint64_t> nextConnection{1};
 	std::mutex leaseMutex;
 	uint64_t controllerLease = 0;
@@ -339,6 +343,7 @@ struct Session
 	XrSession_T* handle = nullptr;
 	Instance* instance = nullptr;
 	mutable std::mutex mutex;
+	std::condition_variable captureCv;
 	XrSessionState state = XR_SESSION_STATE_IDLE;
 	XrViewConfigurationType viewConfiguration = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
 	bool running = false;
@@ -356,6 +361,9 @@ struct Session
 	XrTime nextDisplayTime = 0;
 	int64_t nextDeadlineQpc = 0;
 	uint64_t frameId = 0;
+	uint64_t submittedFrameId = 0;
+	uint64_t composedFrameId = 0;
+	uint64_t presentedFrameId = 0;
 	uint64_t nextTimelineId = 1;
 	uint64_t sessionGeneration = 0;
 	XrTime lastSyncTime = 0;
@@ -376,8 +384,6 @@ struct Session
 	std::deque<std::pair<uint64_t, RunReport>> completedReports;
 	std::optional<XrTime> canceledAt;
 	std::vector<FrameRecord> frames;
-	std::vector<ActionSyncRecord> actionSyncs;
-	std::vector<HapticRecord> haptics;
 	std::vector<XrSpace> spaces;
 	std::vector<XrActionSet> actionSets;
 	std::vector<XrSwapchain> swapchains;
@@ -468,6 +474,13 @@ struct Swapchain
 	bool destroyed = false;
 };
 
+struct CompositionResult
+{
+	bool composed = false;
+	bool presentAttempted = false;
+	int32_t presentResult = 0;
+};
+
 class Compositor
 {
 public:
@@ -483,7 +496,7 @@ public:
 	XrResult WaitSwapchainImage(Swapchain& swapchain, XrDuration timeout);
 	XrResult ReleaseSwapchainImage(Swapchain& swapchain);
 	bool PrepareSwapchainDestroy(Swapchain& swapchain, bool forceReset);
-	XrResult Compose(const XrFrameEndInfo& endInfo, uint64_t frameId);
+	XrResult Compose(const XrFrameEndInfo& endInfo, uint64_t frameId, CompositionResult& result);
 	XrResult Capture(uint64_t afterFrameId, protocol::Json& metadata, std::vector<uint8_t>& png, uint32_t timeoutMs);
 	uint64_t LastCompletedFrame() const;
 	uint64_t LastPresentedFrame() const;
@@ -520,8 +533,6 @@ private:
 	uint64_t nextFence = 1;
 	uint64_t completedFrame = 0;
 	uint64_t presentedFrame = 0;
-	bool presentOccluded = false;
-	int32_t presentResult = 0;
 	uint64_t completedFence = 0;
 	bool initialized = false;
 	bool deviceLost = false;
@@ -547,7 +558,6 @@ private:
 	std::atomic<bool> hostExited{true};
 	std::atomic<uint64_t> lastComposeTick{0};
 	mutable std::mutex mutex;
-	std::condition_variable captureCv;
 
 	bool CreateWindowResources();
 	void DestroyPresentationLocked(bool windowAlreadyClosed = false);

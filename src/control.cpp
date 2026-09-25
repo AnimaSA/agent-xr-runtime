@@ -219,7 +219,7 @@ void ControlServer::ClientLoop(HANDLE pipe, uint64_t connectionId)
 	while (!stopping.load(std::memory_order_acquire))
 	{
 		protocol::PipeFrame request;
-		if (!protocol::ReadFrame(pipe, request, UINT32_MAX)) break;
+		if (!protocol::ReadFrame(pipe, request, UINT32_MAX, &stopping)) break;
 		protocol::PipeFrame response;
 		const XrResult result = instance.HandleControl(connectionId, request.message, response);
 		if (result != XR_SUCCESS && response.message.empty()) response.message = SessionError("runtime_error", "control request failed");
@@ -265,16 +265,29 @@ XrResult Instance::HandleControl(uint64_t connectionId, const protocol::Json& re
 		}
 		if (operation == "handshake")
 		{
-			response.message = {{"ok", true}, {"protocolVersion", protocol::kProtocolVersion}, {"mcpProtocolVersion", protocol::kMcpProtocolVersion}, {"processId", GetCurrentProcessId()}, {"processCreationTime", processCreationTime}, {"image", protocol::Utf8FromWide(CurrentModulePath())}, {"runtimeVersion", "AgentXR/1.0"}, {"instanceId", instanceId}, {"pipe", protocol::Utf8FromWide(control->PipePath())}, {"sessionGeneration", publicGeneration.load(std::memory_order_acquire)}};
+			response.message = {{"ok", true}, {"protocolVersion", protocol::kProtocolVersion}, {"mcpProtocolVersion", protocol::kMcpProtocolVersion}, {"processId", GetCurrentProcessId()}, {"processCreationTime", processCreationTime}, {"image", protocol::Utf8FromWide(CurrentModulePath())}, {"runtimeVersion", "AgentXR/1.0"}, {"instanceId", instanceId}, {"pipe", protocol::Utf8FromWide(control->PipePath())}, {"sessionGeneration", uint64_t{0}}, {"sessionRunning", false}, {"sessionState", static_cast<int>(XR_SESSION_STATE_UNKNOWN)}};
+			bool foundInactiveSession = false;
 			std::lock_guard instanceLock(mutex);
 			for (XrSession handle : sessions)
 			{
-				if (IsValidSession(handle))
+				if (!IsValidSession(handle))
 				{
-					std::lock_guard sessionLock(handle->object->mutex);
-					response.message["sessionState"] = static_cast<int>(handle->object->state);
-					response.message["sessionRunning"] = handle->object->running;
+					continue;
+				}
+				std::lock_guard sessionLock(handle->object->mutex);
+				Session* session = handle->object;
+				const int sessionState = static_cast<int>(session->state);
+				if (session->running)
+				{
+					response.message["sessionGeneration"] = session->sessionGeneration;
+					response.message["sessionState"] = sessionState;
+					response.message["sessionRunning"] = true;
 					break;
+				}
+				if (!foundInactiveSession)
+				{
+					response.message["sessionState"] = sessionState;
+					foundInactiveSession = true;
 				}
 			}
 			return XR_SUCCESS;

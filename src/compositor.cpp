@@ -426,8 +426,6 @@ bool Compositor::Initialize(ID3D12Device* deviceValue, ID3D12CommandQueue* queue
 	completedFrame = 0;
 	completedFence = 0;
 	presentedFrame = 0;
-	presentOccluded = false;
-	presentResult = 0;
 	nextFence = 1;
 	outputState = D3D12_RESOURCE_STATE_RENDER_TARGET;
 	if (FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence))) || FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator))) || FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(), nullptr, IID_PPV_ARGS(&commandList))))
@@ -529,11 +527,9 @@ void Compositor::DestroyPresentationLocked(bool windowAlreadyClosed)
 	completedFrame = 0;
 	completedFence = 0;
 	presentedFrame = 0;
-	presentOccluded = false;
-	presentResult = 0;
 	lastComposeTick.store(0, std::memory_order_release);
 	presentationWindowClosed.store(false, std::memory_order_release);
-	captureCv.notify_all();
+	session.captureCv.notify_all();
 }
 void Compositor::Shutdown()
 {
@@ -861,8 +857,9 @@ bool Compositor::PrepareSwapchainDestroy(Swapchain& swapchain, bool forceReset)
 	return swapchain.acquiredIndices.empty() && swapchain.waitedIndices.empty();
 }
 
-XrResult Compositor::Compose(const XrFrameEndInfo& endInfo, uint64_t frameId)
+XrResult Compositor::Compose(const XrFrameEndInfo& endInfo, uint64_t frameId, CompositionResult& result)
 {
+	result = {};
 	std::lock_guard lock(mutex);
 	if (!initialized || deviceLost)
 	{
@@ -1090,6 +1087,7 @@ XrResult Compositor::Compose(const XrFrameEndInfo& endInfo, uint64_t frameId)
 		deviceLost = true;
 		return XR_ERROR_RUNTIME_FAILURE;
 	}
+	result.composed = true;
 	const uint64_t signal = nextFence - 1;
 	for (uint32_t touchedIndex = 0; touchedIndex < touchedCount; ++touchedIndex)
 	{
@@ -1097,23 +1095,28 @@ XrResult Compositor::Compose(const XrFrameEndInfo& endInfo, uint64_t frameId)
 		touched[touchedIndex]->lastComposedReleaseSerial = touched[touchedIndex]->releaseSerial;
 	}
 	const HRESULT present = windowSwapchain->Present(0, DXGI_PRESENT_DO_NOT_WAIT);
-	presentResult = static_cast<int32_t>(present);
-	presentOccluded = present == DXGI_STATUS_OCCLUDED;
+	result.presentAttempted = true;
+	result.presentResult = static_cast<int32_t>(present);
 	if (FAILED(present) && present != DXGI_STATUS_OCCLUDED && present != DXGI_ERROR_WAS_STILL_DRAWING)
 	{
 		deviceLost = true;
 		return XR_ERROR_RUNTIME_FAILURE;
 	}
 	if (present == S_OK) presentedFrame = frameId;
-	captureCv.notify_all();
 	return XR_SUCCESS;
 }
 
 bool Compositor::EncodePng(std::vector<uint8_t>& png)
 {
-	if (readback == nullptr || constantData == nullptr || readbackRowPitch == 0 || readbackHeight == 0) return false;
+	if (readback == nullptr || constantData == nullptr || readbackRowPitch == 0 || readbackHeight == 0)
+	{
+		return false;
+	}
 	void* mapped = nullptr;
-	if (FAILED(readback->Map(0, nullptr, &mapped)) || mapped == nullptr) return false;
+	if (FAILED(readback->Map(0, nullptr, &mapped)) || mapped == nullptr)
+	{
+		return false;
+	}
 	const HRESULT initResult = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
 	const bool uninitialize = SUCCEEDED(initResult);
 	bool success = false;
@@ -1127,7 +1130,26 @@ bool Compositor::EncodePng(std::vector<uint8_t>& png)
 		if (success)
 		{
 			WICPixelFormatGUID format = GUID_WICPixelFormat32bppRGBA;
-			success = SUCCEEDED(frame->SetPixelFormat(&format)) && SUCCEEDED(frame->WritePixels(1024, readbackRowPitch, readbackRowPitch * readbackHeight, reinterpret_cast<BYTE*>(mapped))) && SUCCEEDED(frame->Commit()) && SUCCEEDED(encoder->Commit());
+			success = SUCCEEDED(frame->SetPixelFormat(&format));
+			if (success)
+			{
+				const UINT bufferSize = readbackRowPitch * readbackHeight;
+				if (IsEqualGUID(format, GUID_WICPixelFormat32bppRGBA))
+				{
+					success = SUCCEEDED(frame->WritePixels(readbackHeight, readbackRowPitch, bufferSize, reinterpret_cast<BYTE*>(mapped)));
+				}
+				else
+				{
+					Microsoft::WRL::ComPtr<IWICBitmap> bitmap;
+					Microsoft::WRL::ComPtr<IWICFormatConverter> converter;
+					BOOL canConvert = FALSE;
+					success = SUCCEEDED(factory->CreateBitmapFromMemory(2048, readbackHeight, GUID_WICPixelFormat32bppRGBA, readbackRowPitch, bufferSize, reinterpret_cast<BYTE*>(mapped), &bitmap)) && SUCCEEDED(factory->CreateFormatConverter(&converter)) && SUCCEEDED(converter->CanConvert(GUID_WICPixelFormat32bppRGBA, format, &canConvert)) && canConvert && SUCCEEDED(converter->Initialize(bitmap.Get(), format, WICBitmapDitherTypeNone, nullptr, 0.0, WICBitmapPaletteTypeCustom)) && SUCCEEDED(frame->WriteSource(converter.Get(), nullptr));
+				}
+				if (success)
+				{
+					success = SUCCEEDED(frame->Commit()) && SUCCEEDED(encoder->Commit());
+				}
+			}
 		}
 		if (success)
 		{
@@ -1140,11 +1162,17 @@ bool Compositor::EncodePng(std::vector<uint8_t>& png)
 				ULONG read = 0;
 				success = SUCCEEDED(stream->Read(png.data(), static_cast<ULONG>(png.size()), &read)) && read == png.size();
 			}
-			else success = false;
+			else
+			{
+				success = false;
+			}
 		}
 	}
 	readback->Unmap(0, nullptr);
-	if (uninitialize) CoUninitialize();
+	if (uninitialize)
+	{
+		CoUninitialize();
+	}
 	return success;
 }
 
@@ -1153,6 +1181,14 @@ XrResult Compositor::Capture(uint64_t afterFrameId, protocol::Json& metadata, st
 	std::unique_lock lock(mutex);
 	if (!initialized || deviceLost || window == nullptr || hostWindow.load(std::memory_order_acquire) == nullptr || windowSwapchain == nullptr || output == nullptr || rtvHeap == nullptr || windowBufferCount == 0) return XR_ERROR_GRAPHICS_DEVICE_INVALID;
 	if (completedFrame == 0 || completedFrame <= afterFrameId) return XR_TIMEOUT_EXPIRED;
+	const auto frameRecord = std::find_if(session.frames.begin(), session.frames.end(), [this](const FrameRecord& frame)
+	{
+		return frame.id == completedFrame;
+	});
+	if (frameRecord == session.frames.end() || !frameRecord->ended || !frameRecord->composed || frameRecord->composeResult != static_cast<int32_t>(XR_SUCCESS))
+	{
+		return XR_TIMEOUT_EXPIRED;
+	}
 	if (!WaitFence(completedFence, timeoutMs)) return XR_TIMEOUT_EXPIRED;
 	const D3D12_RESOURCE_DESC description = output->GetDesc();
 	D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
@@ -1180,7 +1216,7 @@ XrResult Compositor::Capture(uint64_t afterFrameId, protocol::Json& metadata, st
 	Transition(commandList.Get(), output.Get(), outputState, D3D12_RESOURCE_STATE_RENDER_TARGET);
 	outputState = D3D12_RESOURCE_STATE_RENDER_TARGET;
 	if (!SubmitAndSignal(0) || !EncodePng(png)) return XR_ERROR_RUNTIME_FAILURE;
-	metadata = {{"frameId", completedFrame}, {"sessionGeneration", session.sessionGeneration}, {"displayTime", session.report.actualLastFrame}, {"layerCount", session.frames.empty() ? 0 : session.frames.back().layerCount}, {"captureTimestamp", session.instance->clock.Now()}, {"width", 2048}, {"height", 1024}, {"binaryLength", png.size()}};
+	metadata = {{"frameId", frameRecord->id}, {"sessionGeneration", session.sessionGeneration}, {"timelineId", frameRecord->timelineId}, {"displayTime", frameRecord->displayTime}, {"layerCount", frameRecord->layerCount}, {"ended", frameRecord->ended}, {"composed", frameRecord->composed}, {"composeResult", frameRecord->composeResult}, {"presentAttempted", frameRecord->presentAttempted}, {"presented", frameRecord->presented}, {"presentResult", frameRecord->presentResult}, {"presentOccluded", frameRecord->presentOccluded}, {"presentStillDrawing", frameRecord->presentStillDrawing}, {"captureTimestamp", session.instance->clock.Now()}, {"width", 2048}, {"height", 1024}, {"binaryLength", png.size()}};
 	return XR_SUCCESS;
 }
 

@@ -903,7 +903,15 @@ extern "C" AGENTXR_API XRAPI_ATTR XrResult XRAPI_CALL xrSyncActions(XrSession se
 				action.aggregate = aggregate;
 			}
 		}
-		if (owner.activeEpoch != nullptr && owner.timelineStart > 0)
+		bool collectEvidence = false;
+		if (owner.activeEpoch != nullptr && owner.report.timelineId == owner.activeEpoch->id && owner.timelineStart > 0 && sampleTime >= owner.timelineStart)
+		{
+			const XrTime timelineEnd = owner.timelineStart + owner.activeEpoch->durationNs;
+			const XrTime cutoff = owner.canceledAt.has_value() ? std::min(timelineEnd, *owner.canceledAt) : timelineEnd;
+			const bool terminalSyncAlreadyRecorded = !owner.report.actionSyncs.empty() && owner.report.actionSyncs.back().time >= cutoff;
+			collectEvidence = owner.lastSyncTime <= cutoff && !terminalSyncAlreadyRecorded;
+		}
+		if (collectEvidence)
 		{
 			const int64_t relative = std::max<int64_t>(0, sampleTime - owner.timelineStart);
 			const int64_t previous = owner.lastSyncTime == 0 ? 0 : std::max<int64_t>(0, owner.lastSyncTime - owner.timelineStart);
@@ -930,14 +938,17 @@ extern "C" AGENTXR_API XRAPI_ATTR XrResult XRAPI_CALL xrSyncActions(XrSession se
 			}
 		}
 		owner.lastSyncTime = sampleTime;
-		owner.actionSyncs.push_back(record);
-		if (owner.actionSyncs.size() > protocol::kMaxRecordsPerRun)
+		if (collectEvidence)
 		{
-			owner.actionSyncs.erase(owner.actionSyncs.begin());
-			owner.report.overflow = true;
+			owner.report.actionSyncs.push_back(record);
+			if (owner.report.actionSyncs.size() > protocol::kMaxRecordsPerRun)
+			{
+				owner.report.actionSyncs.erase(owner.report.actionSyncs.begin());
+				owner.report.overflow = true;
+			}
+			owner.report.observedSamples += record.observedSamples;
+			owner.report.unobservedDigitalTransitions += record.unobservedDigitalTransitions;
 		}
-		owner.report.observedSamples += record.observedSamples;
-		owner.report.unobservedDigitalTransitions += record.unobservedDigitalTransitions;
 		return XR_SUCCESS;
 	});
 }
@@ -1172,11 +1183,19 @@ extern "C" AGENTXR_API XRAPI_ATTR XrResult XRAPI_CALL xrApplyHapticFeedback(XrSe
 		record.amplitude = vibration->amplitude;
 		record.frequency = vibration->frequency;
 		record.duration = vibration->duration;
-		owner.haptics.push_back(record);
-		if (owner.haptics.size() > protocol::kMaxRecordsPerRun)
+		if (owner.activeEpoch != nullptr && owner.report.timelineId == owner.activeEpoch->id && owner.timelineStart > 0)
 		{
-			owner.haptics.erase(owner.haptics.begin());
-			owner.report.overflow = true;
+			const XrTime timelineEnd = owner.timelineStart + owner.activeEpoch->durationNs;
+			const XrTime cutoff = owner.canceledAt.has_value() ? std::min(timelineEnd, *owner.canceledAt) : timelineEnd;
+			if (record.time >= owner.timelineStart && record.time <= cutoff)
+			{
+				owner.report.haptics.push_back(record);
+				if (owner.report.haptics.size() > protocol::kMaxRecordsPerRun)
+				{
+					owner.report.haptics.erase(owner.report.haptics.begin());
+					owner.report.overflow = true;
+				}
+			}
 		}
 		return XR_SUCCESS;
 	});
@@ -1209,11 +1228,19 @@ extern "C" AGENTXR_API XRAPI_ATTR XrResult XRAPI_CALL xrStopHapticFeedback(XrSes
 		record.time = owner.instance->clock.Now();
 		record.left = actionInfo->subactionPath == owner.instance->InternPath(kLeftPath);
 		record.stopped = true;
-		owner.haptics.push_back(record);
-		if (owner.haptics.size() > protocol::kMaxRecordsPerRun)
+		if (owner.activeEpoch != nullptr && owner.report.timelineId == owner.activeEpoch->id && owner.timelineStart > 0)
 		{
-			owner.haptics.erase(owner.haptics.begin());
-			owner.report.overflow = true;
+			const XrTime timelineEnd = owner.timelineStart + owner.activeEpoch->durationNs;
+			const XrTime cutoff = owner.canceledAt.has_value() ? std::min(timelineEnd, *owner.canceledAt) : timelineEnd;
+			if (record.time >= owner.timelineStart && record.time <= cutoff)
+			{
+				owner.report.haptics.push_back(record);
+				if (owner.report.haptics.size() > protocol::kMaxRecordsPerRun)
+				{
+					owner.report.haptics.erase(owner.report.haptics.begin());
+					owner.report.overflow = true;
+				}
+			}
 		}
 		return XR_SUCCESS;
 	});

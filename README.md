@@ -95,14 +95,15 @@ Server exposes one `xr` tool with actions:
 |---|---|---|
 | `list_processes` | none | Discover AgentXR runtime endpoints. |
 | `launch_editor` | `shortcutPath` | Launch shortcut target with AgentXR. Optional `expectedProjectPath`, `runtimeManifestPath`. |
-| `snapshot` | `processId`, `instanceId` | Read coherent runtime/session/frame/action state. |
+| `snapshot` | `processId`, `instanceId`, `sessionGeneration` | Read coherent runtime/session/frame/action state. |
 | `submit_timeline` | `processId`, `instanceId`, `sessionGeneration`, `timeline` | Validate and start complete timeline. |
-| `get_report` | `processId`, `instanceId`, `sessionGeneration` | Read bounded report pages. Optional `timelineId`, `cursor`, `limit`. |
+| `get_report` | `processId`, `instanceId`, `sessionGeneration`, `timelineId` | Read bounded report pages. Optional `cursor`, `limit`. |
 | `cancel_timeline` | `processId`, `instanceId`, `sessionGeneration`, `timelineId` | Cancel named active timeline. |
 | `capture` | `processId`, `instanceId`, `sessionGeneration` | Capture fresh composited stereo PNG. Optional `afterFrameId`. |
 
-Always call `list_processes`, then `snapshot`. Carry exact `processId`, `instanceId`, and nonzero `sessionGeneration` into mutating calls. Refresh snapshot after application restarts XR session; stale generations are rejected.
-Submitted timelines are finite and continue after controlling MCP connection disconnects. Disconnect releases mutation lease; reconnect with same target identity to inspect, replace, or cancel run. Session/runtime teardown still neutralizes inputs.
+`list_processes` returns `sessionGeneration`, `sessionRunning`, and `sessionState` for each runtime. With no running session, `sessionGeneration` is `0` and `sessionRunning` is `false`; `sessionState` remains present. Session-bound actions require a nonzero active generation. Every successful `xrBeginSession` allocates a new generation, including restarts on the same session handle. Bind calls to the exact `processId`, `instanceId`, and active generation. Refresh discovery and snapshot after a restart; stale generations are rejected.
+
+Submitted timelines continue after an MCP disconnect, which releases the mutation lease but does not cancel the run. Only `get_report` retries a transport disconnect, once, with the unchanged request and only after confirming the same bound PID, process creation time, instance ID, and active session generation. Mutating actions and structured runtime errors are not retried. Session/runtime teardown still neutralizes inputs.
 
 `launch_editor` materializes temporary manifest with absolute runtime DLL path. Prefer it over setting environment manually when MCP owns launch.
 
@@ -160,17 +161,35 @@ See `examples/neutral.json`, `examples/motion-and-input.json`, and `examples/tra
 ./dist/agent-xr-smoke.exe --runtime ./dist/agent-xr.json --scenario invalid-input
 ./dist/agent-xr-smoke.exe --runtime ./dist/agent-xr.json --scenario session-restart
 ./dist/agent-xr-smoke.exe --runtime ./dist/agent-xr.json --scenario pipelined-swapchain
+./dist/agent-xr-smoke.exe --runtime ./dist/agent-xr.json --scenario pipelined-frame
+./dist/agent-xr-smoke.exe --runtime ./dist/agent-xr.json --scenario unreal-action-setup
+./dist/agent-xr-smoke.exe --runtime ./dist/agent-xr.json --scenario report-lifetime
+./dist/agent-xr-smoke.exe --runtime ./dist/agent-xr.json --scenario capture-wait
+./dist/agent-xr-smoke.exe --runtime ./dist/agent-xr.json --scenario idle-client-shutdown
 ```
 
 Smoke runner deliberately probes unsupported OpenXR 1.1 instance creation before falling back to 1.0; loader may print expected failed-create diagnostics while scenario still exits `0`.
 
+The smoke scenarios check:
+
+- `stereo-composition` decodes the captured PNG with WIC, checks red left-eye and blue right-eye pixels, and verifies that a capture taken while a newer frame is waited but unended still matches the last completed frame's pixels and metadata.
+- `session-restart` checks inactive discovery (`sessionGeneration: 0`, `sessionRunning: false`, and `sessionState` present) and confirms a prior-generation binding is rejected after restarting the same session handle.
+- `report-lifetime` inserts a 60 ms stall during the run, then checks exact report equality after another 60 ms pause and ten live frames. Snapshot IDs and fresh captures advance; the later capture has `timelineId: 0`.
+- `capture-wait` starts capture after a known frame and confirms it waits for a fresh completed frame's finalized record, then decodes the expected red/blue eye pixels without an early timeout or stale-frame fallback.
+- `idle-client-shutdown` leaves a Control connection idle during session and instance teardown. Server-side control reads observe shutdown cancellation, so `xrDestroyInstance` completes without requiring the client to disconnect.
+- Nine fault-injected cases exercise the installed MCP reconnect path's single `get_report` retry and identity guards.
+
 ## Evidence model
 
-Runtime completion does not prove application behavior. Use all relevant surfaces:
+Runtime completion does not prove application behavior. Pair AgentXR snapshot/report with application state and logs, then capture rendered output after a known frame ID.
 
-- AgentXR snapshot/report for timing, tracking, action sync, haptics, frame IDs, and API/GPU errors
-- application state/logs for behavior
-- fresh `capture` after known frame ID for rendered output
+`capture` waits for a completed frame newer than `afterFrameId` and the finalized record for that exact frame under one timeout deadline. If either remains pending through that deadline, it returns a timeout; it never substitutes an older frame. The PNG and metadata come from the same completed frame: `frameId`, `sessionGeneration`, `timelineId`, `displayTime`, `layerCount`, `ended`, `composed`, `composeResult`, `presentAttempted`, `presented`, `presentResult`, `presentOccluded`, and `presentStillDrawing`. Metadata also includes `captureTimestamp`, `width`, `height`, and `binaryLength`.
+
+`composeResult` is the OpenXR composition status. `presentResult` records the actual signed DXGI HRESULT and is meaningful only when `presentAttempted` is `true`. `composed` marks successful compositor output; `presented` is true only when DXGI `Present` returns `S_OK`. PNG encoding uses the pixel format returned by WIC; AgentXR converts RGBA readback when WIC selects another format.
+
+Each `RunReport` owns bounded per-run `frames`, `actionSyncs`, and `haptics`. The first frame at or beyond the authored end marks the report terminal; the final action observation settles its run records. Later idle frames cannot grow the report, though matching frames already in flight may finish and update the current or retained report. Snapshot frame IDs and capture IDs keep advancing; post-run frames use `timelineId: 0`.
+
+`missedFrameCount` sums periods only for frames assigned to the run, saturates rather than wrapping, and sets `overflow` if the total exceeds its representable range.
 
 Treat runtime error, stale capture, missed required input edge, or graphics-device failure as failed XR run even when application state appears correct.
 

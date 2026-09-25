@@ -8,7 +8,7 @@
 #endif
 #include <windows.h>
 
-#include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -33,7 +33,7 @@ struct PipeFrame
 	std::vector<uint8_t> binary;
 };
 
-inline bool ReadExact(HANDLE pipe, void* destination, size_t bytes, uint32_t timeoutMs)
+inline bool ReadExact(HANDLE pipe, void* destination, size_t bytes, uint32_t timeoutMs, const std::atomic<bool>* stopping = nullptr)
 {
 	if (pipe == nullptr || pipe == INVALID_HANDLE_VALUE || (bytes != 0 && destination == nullptr))
 	{
@@ -44,6 +44,10 @@ inline bool ReadExact(HANDLE pipe, void* destination, size_t bytes, uint32_t tim
 	const ULONGLONG start = GetTickCount64();
 	while (offset < bytes)
 	{
+		if (stopping != nullptr && stopping->load(std::memory_order_acquire))
+		{
+			return false;
+		}
 		if (timeoutMs != UINT32_MAX && GetTickCount64() - start >= timeoutMs)
 		{
 			return false;
@@ -94,17 +98,17 @@ inline bool WriteExact(HANDLE pipe, const void* source, size_t bytes, uint32_t t
 	return true;
 }
 
-inline bool ReadFrame(HANDLE pipe, PipeFrame& frame, uint32_t timeoutMs)
+inline bool ReadFrame(HANDLE pipe, PipeFrame& frame, uint32_t timeoutMs, const std::atomic<bool>* stopping = nullptr)
 {
 	frame.message = Json::object();
 	frame.binary.clear();
 	uint32_t length = 0;
-	if (!ReadExact(pipe, &length, sizeof(length), timeoutMs) || length == 0 || length > kMaxMessageBytes)
+	if (!ReadExact(pipe, &length, sizeof(length), timeoutMs, stopping) || length == 0 || length > kMaxMessageBytes)
 	{
 		return false;
 	}
 	std::string payload(length, '\0');
-	if (!ReadExact(pipe, payload.data(), payload.size(), timeoutMs))
+	if (!ReadExact(pipe, payload.data(), payload.size(), timeoutMs, stopping))
 	{
 		return false;
 	}
@@ -132,7 +136,7 @@ inline bool ReadFrame(HANDLE pipe, PipeFrame& frame, uint32_t timeoutMs)
 		if (binaryLength != 0)
 		{
 			frame.binary.resize(static_cast<size_t>(binaryLength));
-			if (!ReadExact(pipe, frame.binary.data(), frame.binary.size(), timeoutMs))
+			if (!ReadExact(pipe, frame.binary.data(), frame.binary.size(), timeoutMs, stopping))
 			{
 				return false;
 			}

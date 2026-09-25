@@ -490,7 +490,6 @@ void Instance::InvalidateChildren()
 		actionSetCopy = actionSets;
 		sessions.clear();
 		actionSets.clear();
-		publicGeneration.store(0, std::memory_order_release);
 	}
 	for (XrSession sessionHandle : sessionCopy)
 	{
@@ -900,7 +899,6 @@ extern "C" AGENTXR_API XRAPI_ATTR XrResult XRAPI_CALL xrDestroyInstance(XrInstan
 		}
 		agentxr::Instance* state = instance->object;
 		state->closing.store(true, std::memory_order_release);
-		state->publicGeneration.store(0, std::memory_order_release);
 		{
 			std::lock_guard lock(agentxr::gActiveSessionMutex);
 			if (agentxr::gActiveSession != nullptr && agentxr::gActiveSession->instance == state)
@@ -1125,18 +1123,11 @@ extern "C" AGENTXR_API XRAPI_ATTR XrResult XRAPI_CALL xrCreateSession(XrInstance
 		{
 			return XR_ERROR_LIMIT_REACHED;
 		}
-		const uint64_t currentGeneration = instance->object->generationCounter.load(std::memory_order_acquire);
-		if (currentGeneration >= std::numeric_limits<uint64_t>::max() - 1)
-		{
-			return XR_ERROR_LIMIT_REACHED;
-		}
-		const uint64_t nextGeneration = currentGeneration + 1;
 		auto* state = new agentxr::Session;
 		state->instance = instance->object;
 		state->device = binding->device;
 		state->queue = binding->queue;
 		state->adapterLuid = suppliedLuid;
-		state->sessionGeneration = nextGeneration;
 		state->localOrigin = agentxr::ToXrPose(state->fallbackState.head);
 		state->localFloorOrigin = state->localOrigin;
 		state->localFloorOrigin.position.y = 0.0f;
@@ -1154,9 +1145,7 @@ extern "C" AGENTXR_API XRAPI_ATTR XrResult XRAPI_CALL xrCreateSession(XrInstance
 			return XR_ERROR_INITIALIZATION_FAILED;
 		}
 		instance->object->sessions.push_back(handle);
-		instance->object->generationCounter.store(nextGeneration, std::memory_order_release);
 		agentxr::gActiveSession = state;
-		instance->object->publicGeneration.store(state->sessionGeneration, std::memory_order_release);
 		state->QueueState(XR_SESSION_STATE_IDLE);
 		state->QueueState(XR_SESSION_STATE_READY);
 		*session = handle;
@@ -1216,7 +1205,9 @@ extern "C" AGENTXR_API XRAPI_ATTR XrResult XRAPI_CALL xrBeginSession(XrSession s
 			return XR_ERROR_VALIDATION_FAILURE;
 		}
 		agentxr::Session& state = *session->object;
-		std::lock_guard lock(state.mutex);
+		agentxr::Instance& owner = *state.instance;
+		std::unique_lock instanceLock(owner.mutex);
+		std::unique_lock sessionLock(state.mutex);
 		if (beginInfo->primaryViewConfigurationType != XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO)
 		{
 			return XR_ERROR_VIEW_CONFIGURATION_TYPE_UNSUPPORTED;
@@ -1225,16 +1216,29 @@ extern "C" AGENTXR_API XRAPI_ATTR XrResult XRAPI_CALL xrBeginSession(XrSession s
 		{
 			return XR_ERROR_CALL_ORDER_INVALID;
 		}
+		const uint64_t currentGeneration = owner.generationCounter.load(std::memory_order_acquire);
+		if (currentGeneration >= std::numeric_limits<uint64_t>::max() - 1)
+		{
+			return XR_ERROR_LIMIT_REACHED;
+		}
+		const uint64_t candidateGeneration = currentGeneration + 1;
+		const uint64_t previousGeneration = state.sessionGeneration;
+		state.sessionGeneration = candidateGeneration;
 		if (state.compositor == nullptr || !state.compositor->StartPresentation())
 		{
+			state.sessionGeneration = previousGeneration;
 			return XR_ERROR_INITIALIZATION_FAILED;
 		}
+		owner.generationCounter.store(candidateGeneration, std::memory_order_release);
 		state.waitedFrameIds.clear();
 		state.begunFrameIds.clear();
 		state.RefreshFrameAliases();
 		state.frameEpochStartTime = 0;
 		state.viewConfiguration = beginInfo->primaryViewConfigurationType;
 		state.running = true;
+		state.submittedFrameId = 0;
+		state.composedFrameId = 0;
+		state.presentedFrameId = 0;
 		state.requestExit = false;
 		state.nextDisplayTime = state.instance->clock.Now() + 11111111;
 		state.nextDeadlineQpc = state.instance->clock.ToQpc(state.nextDisplayTime);
@@ -1242,7 +1246,10 @@ extern "C" AGENTXR_API XRAPI_ATTR XrResult XRAPI_CALL xrBeginSession(XrSession s
 		state.QueueState(XR_SESSION_STATE_SYNCHRONIZED);
 		state.QueueState(XR_SESSION_STATE_VISIBLE);
 		state.QueueState(XR_SESSION_STATE_FOCUSED);
-		state.report.status = "running";
+		if (state.report.timelineId == 0)
+		{
+			state.report.status = "running";
+		}
 		return XR_SUCCESS;
 	});
 }
@@ -1272,7 +1279,16 @@ extern "C" AGENTXR_API XRAPI_ATTR XrResult XRAPI_CALL xrEndSession(XrSession ses
 			state.nextDeadlineQpc = 0;
 			state.QueueState(XR_SESSION_STATE_IDLE);
 			state.QueueState(XR_SESSION_STATE_READY);
-			state.report.status = "ready";
+			if (state.report.timelineId != 0 && (state.report.status == "armed" || state.report.status == "running"))
+			{
+				state.canceledAt = state.instance->clock.Now();
+				state.report.status = "canceled";
+				state.report.error = "session ended";
+			}
+			else if (state.report.timelineId == 0)
+			{
+				state.report.status = "ready";
+			}
 			compositor = state.compositor;
 		}
 		if (compositor != nullptr)
@@ -1351,7 +1367,16 @@ extern "C" AGENTXR_API XRAPI_ATTR XrResult XRAPI_CALL agentxrRequestExitActiveSe
 		state->nextDisplayTime = 0;
 		state->nextDeadlineQpc = 0;
 		state->frameEpochStartTime = 0;
-		state->report.status = "ready";
+		if (state->report.timelineId != 0 && (state->report.status == "armed" || state->report.status == "running"))
+		{
+			state->canceledAt = state->instance->clock.Now();
+			state->report.status = "canceled";
+			state->report.error = "session ended";
+		}
+		else if (state->report.timelineId == 0)
+		{
+			state->report.status = "ready";
+		}
 		resetSwapchains();
 		agentxr::Compositor* compositor = state->compositor;
 		sessionLock.unlock();
@@ -1413,6 +1438,14 @@ extern "C" AGENTXR_API XRAPI_ATTR XrResult XRAPI_CALL xrWaitFrame(XrSession sess
 		{
 			return XR_ERROR_LIMIT_REACHED;
 		}
+		const bool belongsToRun = state.activeEpoch != nullptr && (state.report.status == "armed" || state.report.status == "running");
+		if (belongsToRun && state.timelineStart == 0)
+		{
+			state.timelineStart = predicted;
+			state.report.authoredStart = predicted;
+			state.report.status = "running";
+			state.lastPublishedState = state.activeEpoch->samples.empty() ? state.fallbackState : state.activeEpoch->samples.front().state;
+		}
 		if (state.frameEpochStartTime == 0)
 		{
 			state.frameEpochStartTime = predicted;
@@ -1423,38 +1456,46 @@ extern "C" AGENTXR_API XRAPI_ATTR XrResult XRAPI_CALL xrWaitFrame(XrSession sess
 		{
 			state.nextDeadlineQpc = now.QuadPart;
 		}
+		const int64_t periodQpc = state.instance->clock.qpcFrequency / 90;
+		uint32_t missedPeriods = 0;
+		if (late && periodQpc > 0)
+		{
+			const uint64_t elapsedQpc = static_cast<uint64_t>(now.QuadPart) - static_cast<uint64_t>(deadline);
+			const uint64_t periodsElapsed = elapsedQpc / static_cast<uint64_t>(periodQpc);
+			missedPeriods = static_cast<uint32_t>(std::min<uint64_t>(periodsElapsed, static_cast<uint64_t>(std::numeric_limits<uint32_t>::max())));
+		}
 		state.frameId++;
 		agentxr::FrameRecord frameRecord;
 		frameRecord.id = state.frameId;
-		frameRecord.timelineId = state.activeEpoch != nullptr ? state.activeEpoch->id : 0;
-		frameRecord.timelineStart = state.activeEpoch != nullptr ? state.timelineStart : 0;
+		frameRecord.timelineId = belongsToRun ? state.activeEpoch->id : 0;
+		frameRecord.timelineStart = belongsToRun ? state.timelineStart : 0;
 		frameRecord.displayTime = predicted;
 		frameRecord.period = 11111111;
 		frameRecord.waited = true;
 		frameRecord.late = late;
+		frameRecord.missedPeriods = missedPeriods;
 		state.frames.push_back(frameRecord);
 		state.waitedFrameIds.push_back(frameRecord.id);
 		state.RefreshFrameAliases();
 		if (state.frames.size() > agentxr::protocol::kMaxRecordsPerRun)
 		{
 			state.frames.erase(state.frames.begin());
-			state.report.overflow = true;
 		}
-		if (late)
+		if (belongsToRun && missedPeriods != 0)
 		{
-			++state.report.missedFrameCount;
-		}
-		if (state.activeEpoch != nullptr && state.timelineStart == 0)
-		{
-			state.timelineStart = predicted;
-			state.report.authoredStart = predicted;
-			state.report.status = "running";
-			state.lastPublishedState = state.activeEpoch->samples.empty() ? state.fallbackState : state.activeEpoch->samples.front().state;
+			const uint32_t remaining = std::numeric_limits<uint32_t>::max() - state.report.missedFrameCount;
+			if (missedPeriods > remaining)
+			{
+				state.report.missedFrameCount = std::numeric_limits<uint32_t>::max();
+				state.report.overflow = true;
+			}
+			else
+			{
+				state.report.missedFrameCount += missedPeriods;
+			}
 		}
 		agentxr::FrameRecord& waitedRecord = state.frames.back();
-		waitedRecord.timelineId = state.activeEpoch != nullptr ? state.activeEpoch->id : 0;
-		waitedRecord.timelineStart = state.activeEpoch != nullptr ? state.timelineStart : 0;
-		if (state.activeEpoch != nullptr && predicted >= state.timelineStart + state.activeEpoch->durationNs)
+		if (belongsToRun && predicted >= state.timelineStart + state.activeEpoch->durationNs)
 		{
 			state.report.status = state.canceledAt.has_value() ? "canceled" : "completed";
 			state.report.authoredEnd = state.timelineStart + state.activeEpoch->durationNs;
@@ -1465,10 +1506,22 @@ extern "C" AGENTXR_API XRAPI_ATTR XrResult XRAPI_CALL xrWaitFrame(XrSession sess
 			const auto sampleEnd = std::upper_bound(state.activeEpoch->samples.begin(), state.activeEpoch->samples.end(), offset, [](int64_t value, const agentxr::TimelineSample& sample) { return value < sample.offsetNs; });
 			const uint32_t applied = static_cast<uint32_t>(sampleEnd - state.activeEpoch->samples.begin());
 			state.lastPublishedState = state.StateAtLocked(predicted);
-			waitedRecord.authoredSamples = static_cast<uint32_t>(state.activeEpoch->samples.size());
-			waitedRecord.appliedSamples = applied;
-			state.report.appliedSamples = std::max(state.report.appliedSamples, applied);
-			state.report.undersampled = state.report.undersampled || (state.activeEpoch->samples.size() > 1 && applied < state.activeEpoch->samples.size() && predicted >= state.timelineStart + state.activeEpoch->durationNs);
+			if (belongsToRun)
+			{
+				waitedRecord.authoredSamples = static_cast<uint32_t>(state.activeEpoch->samples.size());
+				waitedRecord.appliedSamples = applied;
+				state.report.appliedSamples = std::max(state.report.appliedSamples, applied);
+				state.report.undersampled = state.report.undersampled || (state.activeEpoch->samples.size() > 1 && applied < state.activeEpoch->samples.size() && predicted >= state.timelineStart + state.activeEpoch->durationNs);
+			}
+		}
+		if (belongsToRun)
+		{
+			state.report.frames.push_back(waitedRecord);
+			if (state.report.frames.size() > agentxr::protocol::kMaxRecordsPerRun)
+			{
+				state.report.frames.erase(state.report.frames.begin());
+				state.report.overflow = true;
+			}
 		}
 		frameState->predictedDisplayTime = predicted;
 		frameState->predictedDisplayPeriod = 11111111;
@@ -1601,34 +1654,70 @@ extern "C" AGENTXR_API XRAPI_ATTR XrResult XRAPI_CALL xrEndFrame(XrSession sessi
 		}
 		state.RefreshFrameAliases();
 		const XrTime displayTime = endInfo->displayTime;
+		frameRecord->layerCount = endInfo->layerCount;
+		state.submittedFrameId = frameId;
 		lock.unlock();
-		const XrResult composeResult = state.compositor == nullptr ? XR_ERROR_GRAPHICS_DEVICE_INVALID : state.compositor->Compose(*endInfo, frameId);
+		agentxr::CompositionResult compositionResult;
+		const XrResult composeResult = state.compositor == nullptr ? XR_ERROR_GRAPHICS_DEVICE_INVALID : state.compositor->Compose(*endInfo, frameId, compositionResult);
 		lock.lock();
+		if (compositionResult.composed)
+		{
+			state.composedFrameId = frameId;
+		}
+		if (compositionResult.presentAttempted && compositionResult.presentResult == static_cast<int32_t>(S_OK))
+		{
+			state.presentedFrameId = frameId;
+		}
 		frameRecord = std::find_if(state.frames.begin(), state.frames.end(), [frameId](const agentxr::FrameRecord& record)
 		{
 			return record.id == frameId;
 		});
 		if (frameRecord == state.frames.end())
 		{
+			state.captureCv.notify_all();
 			return XR_ERROR_RUNTIME_FAILURE;
 		}
-		frameRecord->presentResult = static_cast<int32_t>(composeResult);
-		agentxr::RunReport* frameReport = &state.report;
-		if (frameRecord->timelineId != state.report.timelineId)
+		frameRecord->composed = compositionResult.composed;
+		frameRecord->composeResult = static_cast<int32_t>(composeResult);
+		frameRecord->presentAttempted = compositionResult.presentAttempted;
+		frameRecord->presentResult = compositionResult.presentResult;
+		frameRecord->presentOccluded = compositionResult.presentAttempted && compositionResult.presentResult == static_cast<int32_t>(DXGI_STATUS_OCCLUDED);
+		frameRecord->presentStillDrawing = compositionResult.presentAttempted && compositionResult.presentResult == static_cast<int32_t>(DXGI_ERROR_WAS_STILL_DRAWING);
+		frameRecord->presented = compositionResult.presentAttempted && compositionResult.presentResult == static_cast<int32_t>(S_OK);
+		agentxr::RunReport* frameReport = nullptr;
+		if (frameRecord->timelineId != 0)
 		{
-			frameReport = nullptr;
-			for (auto& [reportId, completed] : state.completedReports)
+			if (frameRecord->timelineId == state.report.timelineId)
 			{
-				if (reportId == frameRecord->timelineId)
+				frameReport = &state.report;
+			}
+			else
+			{
+				for (auto& [reportId, completed] : state.completedReports)
 				{
-					frameReport = &completed;
-					break;
+					if (reportId == frameRecord->timelineId)
+					{
+						frameReport = &completed;
+						break;
+					}
 				}
+			}
+		}
+		if (frameReport != nullptr)
+		{
+			frameReport->submittedFrameId = frameId;
+			if (frameRecord->composed)
+			{
+				frameReport->composedFrameId = frameId;
+			}
+			if (frameRecord->presented)
+			{
+				frameReport->presentedFrameId = frameId;
 			}
 		}
 		auto syncCompletedFrame = [&]()
 		{
-			if (frameReport == nullptr || frameReport == &state.report)
+			if (frameReport == nullptr)
 			{
 				return;
 			}
@@ -1651,19 +1740,13 @@ extern "C" AGENTXR_API XRAPI_ATTR XrResult XRAPI_CALL xrEndFrame(XrSession sessi
 			frameRecord->discarded = true;
 			syncCompletedFrame();
 			state.PruneRetainedEpochs();
+			state.captureCv.notify_all();
 			return composeResult;
 		}
 		frameRecord->ended = true;
 		frameRecord->layerCount = endInfo->layerCount;
-		frameRecord->presented = state.compositor != nullptr && state.compositor->LastPresentedFrame() == frameId;
 		if (frameReport != nullptr)
 		{
-			frameReport->submittedFrameId = frameId;
-			frameReport->composedFrameId = frameId;
-			if (frameRecord->presented)
-			{
-				frameReport->presentedFrameId = frameId;
-			}
 			if (frameReport->actualFirstFrame == 0)
 			{
 				frameReport->actualFirstFrame = displayTime;
@@ -1680,6 +1763,7 @@ extern "C" AGENTXR_API XRAPI_ATTR XrResult XRAPI_CALL xrEndFrame(XrSession sessi
 		}
 		syncCompletedFrame();
 		state.PruneRetainedEpochs();
+		state.captureCv.notify_all();
 		return XR_SUCCESS;
 	});
 }

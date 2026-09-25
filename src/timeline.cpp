@@ -749,7 +749,7 @@ Json StateJson(const SimState& state)
 
 Json FrameJson(const FrameRecord& frame)
 {
-	return {{"frameId", frame.id}, {"timelineId", frame.timelineId}, {"timelineStart", frame.timelineStart}, {"displayTime", frame.displayTime}, {"period", frame.period}, {"layerCount", frame.layerCount}, {"waited", frame.waited}, {"begun", frame.begun}, {"ended", frame.ended}, {"discarded", frame.discarded}, {"presented", frame.presented}, {"presentOccluded", frame.presentOccluded}, {"presentResult", frame.presentResult}, {"late", frame.late}, {"authoredSamples", frame.authoredSamples}, {"appliedSamples", frame.appliedSamples}, {"observedSamples", frame.observedSamples}};
+	return {{"frameId", frame.id}, {"timelineId", frame.timelineId}, {"timelineStart", frame.timelineStart}, {"displayTime", frame.displayTime}, {"period", frame.period}, {"layerCount", frame.layerCount}, {"waited", frame.waited}, {"begun", frame.begun}, {"ended", frame.ended}, {"composed", frame.composed}, {"composeResult", frame.composeResult}, {"discarded", frame.discarded}, {"presentAttempted", frame.presentAttempted}, {"presented", frame.presented}, {"presentOccluded", frame.presentOccluded}, {"presentStillDrawing", frame.presentStillDrawing}, {"presentResult", frame.presentResult}, {"late", frame.late}, {"missedPeriods", frame.missedPeriods}, {"authoredSamples", frame.authoredSamples}, {"appliedSamples", frame.appliedSamples}, {"observedSamples", frame.observedSamples}};
 }
 
 Json ActionSyncJson(const ActionSyncRecord& record)
@@ -917,17 +917,7 @@ bool Session::ActivatePendingTimeline(XrTime startTime)
 	pendingTimelineId = 0;
 	if (activeEpoch != nullptr)
 	{
-		report.frames.clear();
-		for (const FrameRecord& frame : frames)
-		{
-			if (frame.timelineId == activeEpoch->id)
-			{
-				report.frames.push_back(frame);
-			}
-		}
-		report.actionSyncs = actionSyncs;
-		report.haptics = haptics;
-		completedReports.emplace_back(activeEpoch->id, report);
+		completedReports.emplace_back(activeEpoch->id, std::move(report));
 		if (completedReports.size() > 4)
 		{
 			completedReports.pop_front();
@@ -949,8 +939,6 @@ bool Session::ActivatePendingTimeline(XrTime startTime)
 	fallbackState = activeEpoch->samples.front().state;
 	lastPublishedState = fallbackState;
 	lastSyncTime = 0;
-	actionSyncs.clear();
-	haptics.clear();
 	report = {};
 	report.timelineId = activeEpoch->id;
 	report.status = "running";
@@ -1003,17 +991,7 @@ XrResult Session::SubmitTimeline(const Json& timeline, uint64_t& timelineId, std
 	}
 	if (activeEpoch != nullptr)
 	{
-		report.frames.clear();
-		for (const FrameRecord& frame : frames)
-		{
-			if (frame.timelineId == activeEpoch->id)
-			{
-				report.frames.push_back(frame);
-			}
-		}
-		report.actionSyncs = actionSyncs;
-		report.haptics = haptics;
-		completedReports.emplace_back(activeEpoch->id, report);
+		completedReports.emplace_back(activeEpoch->id, std::move(report));
 		if (completedReports.size() > 4)
 		{
 			completedReports.pop_front();
@@ -1032,9 +1010,6 @@ XrResult Session::SubmitTimeline(const Json& timeline, uint64_t& timelineId, std
 	fallbackState = activeEpoch->samples.front().state;
 	lastPublishedState = fallbackState;
 	lastSyncTime = 0;
-	frames.clear();
-	actionSyncs.clear();
-	haptics.clear();
 	report = {};
 	report.timelineId = activeEpoch->id;
 	report.status = "armed";
@@ -1083,7 +1058,7 @@ void Session::NeutralizeInputs()
 protocol::Json Session::Snapshot() const
 {
 	std::lock_guard lock(mutex);
-	Json result = {{"sessionState", static_cast<int>(state)}, {"running", running}, {"focused", IsFocused()}, {"sessionGeneration", sessionGeneration}, {"frameId", frameId}, {"frameWaited", frameWaited}, {"frameBegun", frameBegun}, {"graphics", {{"d3d12", device != nullptr}, {"adapterLuidLow", adapterLuid.LowPart}, {"adapterLuidHigh", adapterLuid.HighPart}, {"deviceLost", compositor != nullptr && compositor->DeviceLost()}}}, {"tracking", StateJson(lastPublishedState)}, {"frame", {{"submitted", report.submittedFrameId}, {"composed", report.composedFrameId}, {"presented", report.presentedFrameId}}}, {"timeline", {{"id", report.timelineId}, {"status", report.status}, {"start", report.authoredStart}, {"end", report.authoredEnd}, {"plannedSamples", report.plannedSamples}, {"appliedSamples", report.appliedSamples}, {"observedSamples", report.observedSamples}, {"unobservedDigitalTransitions", report.unobservedDigitalTransitions}}}};
+	Json result = {{"sessionState", static_cast<int>(state)}, {"running", running}, {"focused", IsFocused()}, {"sessionGeneration", sessionGeneration}, {"frameId", frameId}, {"frameWaited", frameWaited}, {"frameBegun", frameBegun}, {"graphics", {{"d3d12", device != nullptr}, {"adapterLuidLow", adapterLuid.LowPart}, {"adapterLuidHigh", adapterLuid.HighPart}, {"deviceLost", compositor != nullptr && compositor->DeviceLost()}}}, {"tracking", StateJson(lastPublishedState)}, {"frame", {{"submitted", submittedFrameId}, {"composed", composedFrameId}, {"presented", presentedFrameId}}}, {"timeline", {{"id", report.timelineId}, {"status", report.status}, {"start", report.authoredStart}, {"end", report.authoredEnd}, {"plannedSamples", report.plannedSamples}, {"appliedSamples", report.appliedSamples}, {"observedSamples", report.observedSamples}, {"unobservedDigitalTransitions", report.unobservedDigitalTransitions}}}};
 	result["timeline"]["pendingId"] = pendingTimelineId;
 	result["timeline"]["pending"] = pendingEpoch != nullptr;
 	if (compositor != nullptr)
@@ -1108,18 +1083,7 @@ protocol::Json Session::ReportPage(uint64_t timelineId, size_t cursor, size_t li
 	}
 	if (report.timelineId == timelineId)
 	{
-		RunReport current = report;
-		current.frames.clear();
-		for (const FrameRecord& frame : frames)
-		{
-			if (frame.timelineId == report.timelineId)
-			{
-				current.frames.push_back(frame);
-			}
-		}
-		current.actionSyncs = actionSyncs;
-		current.haptics = haptics;
-		return ReportJson(current, cursor, limit);
+		return ReportJson(report, cursor, limit);
 	}
 	for (const auto& [id, completed] : completedReports)
 	{
@@ -1133,12 +1097,77 @@ protocol::Json Session::ReportPage(uint64_t timelineId, size_t cursor, size_t li
 
 XrResult Session::Capture(uint64_t afterFrameId, Json& metadata, std::vector<uint8_t>& png, uint32_t timeoutMs)
 {
-	std::lock_guard lock(mutex);
-	if (compositor == nullptr || compositor->DeviceLost())
+	using Clock = std::chrono::steady_clock;
+	std::unique_lock lock(mutex);
+	const bool unbounded = timeoutMs == UINT32_MAX;
+	const auto startedAt = Clock::now();
+	Clock::time_point deadline = Clock::time_point::max();
+	if (!unbounded)
 	{
-		return XR_ERROR_GRAPHICS_DEVICE_INVALID;
+		const auto timeout = std::chrono::milliseconds(timeoutMs);
+		const auto maxDelay = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::time_point::max() - startedAt);
+		if (timeout < maxDelay)
+		{
+			deadline = startedAt + std::chrono::duration_cast<Clock::duration>(timeout);
+		}
 	}
-	return compositor->Capture(afterFrameId, metadata, png, timeoutMs);
+	while (true)
+	{
+		if (compositor == nullptr || compositor->DeviceLost())
+		{
+			return XR_ERROR_GRAPHICS_DEVICE_INVALID;
+		}
+		uint32_t remainingMs = UINT32_MAX;
+		if (!unbounded)
+		{
+			if (timeoutMs == 0)
+			{
+				remainingMs = 0;
+			}
+			else
+			{
+				const auto remaining = deadline - Clock::now();
+				if (remaining <= Clock::duration::zero())
+				{
+					return XR_TIMEOUT_EXPIRED;
+				}
+				auto remainingMsDuration = std::chrono::duration_cast<std::chrono::milliseconds>(remaining);
+				if (std::chrono::duration_cast<Clock::duration>(remainingMsDuration) < remaining)
+				{
+					remainingMsDuration += std::chrono::milliseconds(1);
+				}
+				const auto maxFiniteWait = std::chrono::milliseconds(UINT32_MAX - 1);
+				if (remainingMsDuration > maxFiniteWait)
+				{
+					remainingMsDuration = maxFiniteWait;
+				}
+				remainingMs = static_cast<uint32_t>(remainingMsDuration.count());
+			}
+		}
+		const XrResult result = compositor->Capture(afterFrameId, metadata, png, remainingMs);
+		if (result != XR_TIMEOUT_EXPIRED)
+		{
+			return result;
+		}
+		if (timeoutMs == 0)
+		{
+			return XR_TIMEOUT_EXPIRED;
+		}
+		if (unbounded)
+		{
+			captureCv.wait(lock);
+			continue;
+		}
+		if (Clock::now() >= deadline)
+		{
+			return XR_TIMEOUT_EXPIRED;
+		}
+		captureCv.wait_until(lock, deadline);
+		if (Clock::now() >= deadline)
+		{
+			return XR_TIMEOUT_EXPIRED;
+		}
+	}
 }
 
 void Session::InvalidateChildren()
