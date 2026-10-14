@@ -96,6 +96,7 @@ struct ControllerState
 
 struct SimState
 {
+	bool focused = true;
 	TrackedPose head;
 	TrackedPose leftGrip;
 	TrackedPose leftAim;
@@ -153,6 +154,7 @@ struct FrameRecord
 	bool ended = false;
 	bool discarded = false;
 	bool late = false;
+	bool focused = true;
 	uint32_t missedPeriods = 0;
 	bool composed = false;
 	int32_t composeResult = static_cast<int32_t>(XR_SUCCESS);
@@ -170,6 +172,8 @@ struct FrameRecord
 struct ActionSyncRecord
 {
 	XrTime time = 0;
+	bool focused = true;
+	XrResult result = XR_SUCCESS;
 	bool leftActive = true;
 	bool rightActive = true;
 	float leftTrigger = 0.0f;
@@ -213,6 +217,7 @@ struct RunReport
 	uint32_t missedFrameCount = 0;
 	uint32_t validityTransitions = 0;
 	uint32_t trackingTransitions = 0;
+	uint32_t focusTransitions = 0;
 	bool overflow = false;
 	bool undersampled = false;
 	uint64_t submittedFrameId = 0;
@@ -276,7 +281,6 @@ enum class InputKind : uint8_t
 struct InputRef
 {
 	bool left = false;
-	bool head = false;
 	InputKind kind = InputKind::Button;
 	uint8_t channel = 0;
 };
@@ -367,6 +371,7 @@ struct Session
 	uint64_t nextTimelineId = 1;
 	uint64_t sessionGeneration = 0;
 	XrTime lastSyncTime = 0;
+	bool lastSyncFocused = false;
 	XrPosef localOrigin{{0.0f, 0.0f, 0.0f, 1.0f}, {0.0f, 0.0f, 0.0f}};
 	XrPosef localFloorOrigin{{0.0f, 0.0f, 0.0f, 1.0f}, {0.0f, 0.0f, 0.0f}};
 	XrPosef stageOrigin{{0.0f, 0.0f, 0.0f, 1.0f}, {0.0f, 0.0f, 0.0f}};
@@ -428,6 +433,7 @@ struct ActionSet
 	std::string localizedName;
 	uint32_t priority = 0;
 	bool destroyed = false;
+	bool everAttached = false;
 	std::vector<XrAction> actions;
 };
 

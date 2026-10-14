@@ -456,7 +456,68 @@ public:
 		{
 			return false;
 		}
-		return CreateInstance() && LoadFunctions();
+		if (!CreateInstance() || !LoadFunctions())
+		{
+			return false;
+		}
+		std::filesystem::path expectedModule;
+		std::filesystem::path actualModule;
+		const auto moduleFailure = [&](const std::string& context)
+		{
+			std::cerr << "runtime module identity failed: expected=" << expectedModule << " actual=" << actualModule << " " << context << '\n';
+			return false;
+		};
+		try
+		{
+			Json manifestJson;
+			if (!ReadJsonFile(manifest, manifestJson))
+			{
+				return moduleFailure("ReadJsonFile failed for manifest=" + std::filesystem::path(manifest).string());
+			}
+			const auto runtime = manifestJson.find("runtime");
+			if (runtime == manifestJson.end() || !runtime->is_object())
+			{
+				return moduleFailure("manifest runtime must be an object");
+			}
+			const auto libraryPath = runtime->find("library_path");
+			if (libraryPath == runtime->end() || !libraryPath->is_string())
+			{
+				return moduleFailure("manifest runtime.library_path must be a string");
+			}
+			expectedModule = std::filesystem::u8path(libraryPath->get_ref<const std::string&>());
+			if (expectedModule.is_relative())
+			{
+				expectedModule = std::filesystem::path(manifest).parent_path() / expectedModule;
+			}
+			SetLastError(ERROR_SUCCESS);
+			HMODULE module = GetModuleHandleW(L"AgentXRRuntime.dll");
+			if (module == nullptr)
+			{
+				const DWORD error = GetLastError();
+				return moduleFailure("GetModuleHandleW(AgentXRRuntime.dll) GetLastError=" + std::to_string(error));
+			}
+			std::array<wchar_t, 32768> modulePath{};
+			SetLastError(ERROR_SUCCESS);
+			const DWORD length = GetModuleFileNameW(module, modulePath.data(), static_cast<DWORD>(modulePath.size()));
+			const DWORD moduleError = GetLastError();
+			actualModule = std::wstring(modulePath.data(), length);
+			if (length == 0 || length >= modulePath.size())
+			{
+				return moduleFailure("GetModuleFileNameW(AgentXRRuntime.dll) length=" + std::to_string(length) + " GetLastError=" + std::to_string(moduleError));
+			}
+			std::error_code error;
+			const bool sameModule = std::filesystem::equivalent(expectedModule, actualModule, error);
+			if (error || !sameModule)
+			{
+				return moduleFailure("filesystem::equivalent error=" + std::to_string(error.value()) + " message=" + error.message());
+			}
+		}
+		catch (const std::exception& error)
+		{
+			return moduleFailure(error.what());
+		}
+		std::cerr << "smoke: loaded runtime module=" << actualModule << '\n';
+		return true;
 	}
 
 	bool CreateInstance()
@@ -551,6 +612,9 @@ public:
 		LOAD(xrGetActionStateBoolean);
 		LOAD(xrGetActionStateFloat);
 		LOAD(xrGetActionStatePose);
+		LOAD(xrGetActionStateVector2f);
+		LOAD(xrGetCurrentInteractionProfile);
+		LOAD(xrApplyHapticFeedback);
 		LOAD(xrEnumerateSwapchainFormats);
 		LOAD(xrCreateSwapchain);
 		LOAD(xrDestroySwapchain);
@@ -1530,79 +1594,365 @@ public:
 		return CreateActions(true, true, true) && CreateSwapchain();
 	}
 
+	bool PrepareSimpleControllerActions()
+	{
+		return CreateActions(false, true, false) && CreateSwapchain();
+	}
+
 	bool ValidatePathContracts()
 	{
-		const auto roundTrip = [&](const char* source, XrPath& output, std::string_view operation)
+		const auto suggest = [&](const char* profile, const char* path, XrResult expected)
 		{
-			if (!Check(xrStringToPath(instance, source, &output), operation))
-			{
-				return false;
-			}
-			std::array<char, XR_MAX_PATH_LENGTH> buffer{};
-			uint32_t count = 0;
-			if (!Check(xrPathToString(instance, output, static_cast<uint32_t>(buffer.size()), &count, buffer.data()), "path to string"))
-			{
-				return false;
-			}
-			if (count != std::strlen(source) + 1 || std::strcmp(buffer.data(), source) != 0)
-			{
-				std::cerr << operation << " did not round-trip exactly\n";
-				return false;
-			}
-			return true;
+			const XrActionSuggestedBinding binding{action, Path(path)};
+			XrInteractionProfileSuggestedBinding info{XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING};
+			info.interactionProfile = Path(profile);
+			info.countSuggestedBindings = 1;
+			info.suggestedBindings = &binding;
+			return Expect(xrSuggestInteractionProfileBindings(instance, &info), expected, path);
 		};
-
-		const char* unknownProfileString = "/interaction_profiles/agentxr/unknown_controller";
-		XrPath unknownProfile = XR_NULL_PATH;
-		if (!roundTrip(unknownProfileString, unknownProfile, "unknown profile path"))
+		const char* touch = "/interaction_profiles/oculus/touch_controller";
+		if (!suggest("/interaction_profiles/agentxr/unknown_controller", "/user/hand/right/input/a/click", XR_ERROR_PATH_UNSUPPORTED))
 		{
 			return false;
 		}
-		const char* unsupportedComponentString = "/user/hand/right/input/unsupported_component";
-		XrPath unsupportedComponent = XR_NULL_PATH;
-		if (!roundTrip(unsupportedComponentString, unsupportedComponent, "unsupported component path"))
+		const char* invalid[] = {
+			"/user/hand/right/input/unsupported_component",
+			"/user/hand/right/input/x/click",
+			"/user/hand/left/input/a/click",
+			"/user/hand/right/input/grip/palm_ext/pose",
+			"/user/hand/right/input/pinch_ext/value",
+			"/user/hand/right/input/poke_ext/pose",
+			"/user/hand/right/input/extra/a/click",
+			"/user/hand/right/input/a/click/extra",
+			"/user/hand/right/input",
+			"/user/head"};
+		for (const char* path : invalid)
+		{
+			if (!suggest(touch, path, XR_ERROR_PATH_UNSUPPORTED))
+			{
+				return false;
+			}
+		}
+		const std::array<XrActionSuggestedBinding, 2> mixed = {{{action, Path("/user/hand/right/input/b/click")}, {action, Path("/user/hand/right/input/nope/click")}}};
+		XrInteractionProfileSuggestedBinding info{XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING};
+		info.interactionProfile = Path(touch);
+		info.countSuggestedBindings = static_cast<uint32_t>(mixed.size());
+		info.suggestedBindings = mixed.data();
+		if (!Expect(xrSuggestInteractionProfileBindings(instance, &info), XR_ERROR_PATH_UNSUPPORTED, "atomic invalid replacement"))
 		{
 			return false;
 		}
-		const XrPath knownBinding = Path("/user/hand/right/input/a/click");
-		const XrPath oculusProfile = Path("/interaction_profiles/oculus/touch_controller");
-		if (knownBinding == XR_NULL_PATH || oculusProfile == XR_NULL_PATH)
+		XrActionSuggestedBinding invalidHandle{action, std::numeric_limits<XrPath>::max()};
+		info.countSuggestedBindings = 1;
+		info.suggestedBindings = &invalidHandle;
+		if (!Expect(xrSuggestInteractionProfileBindings(instance, &info), XR_ERROR_PATH_INVALID, "uninterned binding path"))
 		{
 			return false;
 		}
-
-		const XrActionSuggestedBinding unknownProfileBinding{action, knownBinding};
-		XrInteractionProfileSuggestedBinding unknownProfileSuggestions{XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING};
-		unknownProfileSuggestions.interactionProfile = unknownProfile;
-		unknownProfileSuggestions.countSuggestedBindings = 1;
-		unknownProfileSuggestions.suggestedBindings = &unknownProfileBinding;
-		if (!Check(xrSuggestInteractionProfileBindings(instance, &unknownProfileSuggestions), "suggest unknown profile"))
+		info.interactionProfile = std::numeric_limits<XrPath>::max();
+		if (!Expect(xrSuggestInteractionProfileBindings(instance, &info), XR_ERROR_PATH_INVALID, "uninterned profile path"))
 		{
 			return false;
 		}
-
-		const std::array<XrActionSuggestedBinding, 2> duplicateBindings = {unknownProfileBinding, unknownProfileBinding};
-		XrInteractionProfileSuggestedBinding duplicateSuggestions{XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING};
-		duplicateSuggestions.interactionProfile = oculusProfile;
-		duplicateSuggestions.countSuggestedBindings = static_cast<uint32_t>(duplicateBindings.size());
-		duplicateSuggestions.suggestedBindings = duplicateBindings.data();
-		if (!Check(xrSuggestInteractionProfileBindings(instance, &duplicateSuggestions), "suggest duplicate identical bindings"))
-		{
-			return false;
-		}
-
-		const XrActionSuggestedBinding unsupportedComponentBinding{action, unsupportedComponent};
-		XrInteractionProfileSuggestedBinding unsupportedComponentSuggestions{XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING};
-		unsupportedComponentSuggestions.interactionProfile = oculusProfile;
-		unsupportedComponentSuggestions.countSuggestedBindings = 1;
-		unsupportedComponentSuggestions.suggestedBindings = &unsupportedComponentBinding;
-		if (!Check(xrSuggestInteractionProfileBindings(instance, &unsupportedComponentSuggestions), "suggest unsupported Oculus component"))
-		{
-			return false;
-		}
-
 		XrPath malformed = XR_NULL_PATH;
 		return Expect(xrStringToPath(instance, "interaction_profiles/agentxr/malformed", &malformed), XR_ERROR_PATH_FORMAT_INVALID, "malformed path");
+	}
+
+	struct FidelityState
+	{
+		XrActionStateBoolean button{XR_TYPE_ACTION_STATE_BOOLEAN};
+		XrActionStateFloat trigger{XR_TYPE_ACTION_STATE_FLOAT};
+		XrActionStateFloat squeeze{XR_TYPE_ACTION_STATE_FLOAT};
+		XrActionStateVector2f stick{XR_TYPE_ACTION_STATE_VECTOR2F};
+		XrActionStatePose pose{XR_TYPE_ACTION_STATE_POSE};
+		XrActionStateBoolean ignored{XR_TYPE_ACTION_STATE_BOOLEAN};
+		XrActionStateBoolean replacement{XR_TYPE_ACTION_STATE_BOOLEAN};
+		XrActionStateBoolean triggerButton{XR_TYPE_ACTION_STATE_BOOLEAN};
+		XrActionStateFloat clickFloat{XR_TYPE_ACTION_STATE_FLOAT};
+		XrActionStateBoolean aggregate{XR_TYPE_ACTION_STATE_BOOLEAN};
+	};
+
+	bool PrepareFidelityActions(bool bindingContracts)
+	{
+		XrActionSetCreateInfo setInfo{XR_TYPE_ACTION_SET_CREATE_INFO};
+		std::strcpy(setInfo.actionSetName, "fidelity");
+		std::strcpy(setInfo.localizedActionSetName, "Fidelity");
+		if (!Check(xrCreateActionSet(instance, &setInfo, &actionSet), "create fidelity set"))
+		{
+			return false;
+		}
+		rightPath = Path("/user/hand/right");
+		const XrPath bothHands[] = {Path("/user/hand/left"), rightPath};
+		const auto create = [&](const char* name, XrActionType type, XrAction& output)
+		{
+			XrActionCreateInfo info{XR_TYPE_ACTION_CREATE_INFO};
+			std::strcpy(info.actionName, name);
+			std::strcpy(info.localizedActionName, name);
+			info.actionType = type;
+			const bool both = bindingContracts && std::strcmp(name, "button") == 0;
+			info.countSubactionPaths = both ? 2 : 1;
+			info.subactionPaths = both ? bothHands : &rightPath;
+			return Check(xrCreateAction(actionSet, &info, &output), name);
+		};
+		if (!create("button", XR_ACTION_TYPE_BOOLEAN_INPUT, action) ||
+			!create("pose", XR_ACTION_TYPE_POSE_INPUT, poseAction) ||
+			!create("trigger", XR_ACTION_TYPE_FLOAT_INPUT, fidelityTrigger) ||
+			!create("squeeze", XR_ACTION_TYPE_FLOAT_INPUT, fidelitySqueeze) ||
+			!create("stick", XR_ACTION_TYPE_VECTOR2F_INPUT, fidelityStick) ||
+			!create("ignored", XR_ACTION_TYPE_BOOLEAN_INPUT, fidelityIgnored) ||
+			!create("replacement", XR_ACTION_TYPE_BOOLEAN_INPUT, fidelityReplacement) ||
+			!create("trigger_button", XR_ACTION_TYPE_BOOLEAN_INPUT, triggerValueAction) ||
+			!create("click_float", XR_ACTION_TYPE_FLOAT_INPUT, aClickFloatAction) ||
+			!create("haptic", XR_ACTION_TYPE_VIBRATION_OUTPUT, fidelityHaptic))
+		{
+			return false;
+		}
+		const auto suggest = [&](XrPath profile, const XrActionSuggestedBinding* bindings, uint32_t count)
+		{
+			XrInteractionProfileSuggestedBinding info{XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING};
+			info.interactionProfile = profile;
+			info.countSuggestedBindings = count;
+			info.suggestedBindings = bindings;
+			return Check(xrSuggestInteractionProfileBindings(instance, &info), "fidelity suggestions");
+		};
+		const std::pair<const char*, const char*> profiles[] = {
+			{"/interaction_profiles/khr/simple_controller", "/user/hand/right/input/select/click"},
+			{"/interaction_profiles/google/daydream_controller", "/user/hand/right/input/select/click"},
+			{"/interaction_profiles/htc/vive_controller", "/user/hand/right/input/trigger/click"},
+			{"/interaction_profiles/htc/vive_pro", "/user/head/input/system/click"},
+			{"/interaction_profiles/microsoft/motion_controller", "/user/hand/right/input/trigger/value"},
+			{"/interaction_profiles/microsoft/xbox_controller", "/user/gamepad/input/a/click"},
+			{"/interaction_profiles/oculus/go_controller", "/user/hand/right/input/trigger/click"},
+			{"/interaction_profiles/valve/index_controller", "/user/hand/right/input/a/click"}};
+		if (bindingContracts)
+		{
+			for (const auto& [profile, path] : profiles)
+			{
+				const XrActionSuggestedBinding binding{fidelityIgnored, Path(path)};
+				if (!suggest(Path(profile), &binding, 1))
+				{
+					return false;
+				}
+			}
+		}
+		const XrPath touch = Path("/interaction_profiles/oculus/touch_controller");
+		const XrActionSuggestedBinding oldBinding{fidelityReplacement, Path("/user/hand/right/input/a/click")};
+		if (!suggest(touch, &oldBinding, 1))
+		{
+			return false;
+		}
+		std::vector<XrActionSuggestedBinding> bindings = {
+			{action, Path(bindingContracts ? "/user/hand/right/input/a" : "/user/hand/right/input/a/click")},
+			{action, Path(bindingContracts ? "/user/hand/right/input/a" : "/user/hand/right/input/a/click")},
+			{poseAction, Path(bindingContracts ? "/user/hand/right/input/grip" : "/user/hand/right/input/grip/pose")},
+			{fidelityTrigger, Path(bindingContracts ? "/user/hand/right/input/trigger" : "/user/hand/right/input/trigger/value")},
+			{fidelitySqueeze, Path(bindingContracts ? "/user/hand/right/input/squeeze" : "/user/hand/right/input/squeeze/value")},
+			{fidelityStick, Path("/user/hand/right/input/thumbstick")},
+			{fidelityReplacement, Path("/user/hand/right/input/b/click")},
+			{triggerValueAction, Path(bindingContracts ? "/user/hand/right/input/trigger" : "/user/hand/right/input/trigger/value")},
+			{aClickFloatAction, Path(bindingContracts ? "/user/hand/right/input/a" : "/user/hand/right/input/a/click")},
+			{fidelityHaptic, Path("/user/hand/right/output/haptic")}};
+		if (bindingContracts)
+		{
+			bindings.push_back({fidelityIgnored, Path("/user/hand/right/input/grip/pose")});
+			bindings.push_back({action, Path("/user/hand/left/input/x/click")});
+		}
+		if (!suggest(touch, bindings.data(), static_cast<uint32_t>(bindings.size())) ||
+			(bindingContracts && (!ValidatePathContracts() || !FidelityProfile(false, true))))
+		{
+			return false;
+		}
+		XrSessionActionSetsAttachInfo attach{XR_TYPE_SESSION_ACTION_SETS_ATTACH_INFO};
+		attach.countActionSets = 1;
+		attach.actionSets = &actionSet;
+		if (!Check(xrAttachSessionActionSets(session, &attach), "attach fidelity set"))
+		{
+			return false;
+		}
+		XrActionSpaceCreateInfo space{XR_TYPE_ACTION_SPACE_CREATE_INFO};
+		space.action = poseAction;
+		space.subactionPath = rightPath;
+		space.poseInActionSpace = {{0.0f, 0.0f, 0.0f, 1.0f}, {0.0f, 0.0f, 0.0f}};
+		return Check(xrCreateActionSpace(session, &space, &rightGripSpace), "fidelity grip space") && CreateSwapchain();
+	}
+
+	bool ReadFidelity(FidelityState& output)
+	{
+		XrActionStateGetInfo info{XR_TYPE_ACTION_STATE_GET_INFO};
+		info.subactionPath = rightPath;
+		info.action = action;
+		if (!Check(xrGetActionStateBoolean(session, &info, &output.button), "fidelity Boolean"))
+		{
+			return false;
+		}
+		info.action = fidelityTrigger;
+		if (!Check(xrGetActionStateFloat(session, &info, &output.trigger), "fidelity trigger"))
+		{
+			return false;
+		}
+		info.action = fidelitySqueeze;
+		if (!Check(xrGetActionStateFloat(session, &info, &output.squeeze), "fidelity squeeze"))
+		{
+			return false;
+		}
+		info.action = fidelityStick;
+		if (!Check(xrGetActionStateVector2f(session, &info, &output.stick), "fidelity vector"))
+		{
+			return false;
+		}
+		info.action = poseAction;
+		if (!Check(xrGetActionStatePose(session, &info, &output.pose), "fidelity pose"))
+		{
+			return false;
+		}
+		info.action = fidelityIgnored;
+		if (!Check(xrGetActionStateBoolean(session, &info, &output.ignored), "ignored binding"))
+		{
+			return false;
+		}
+		info.action = triggerValueAction;
+		if (!Check(xrGetActionStateBoolean(session, &info, &output.triggerButton), "parent trigger Boolean"))
+		{
+			return false;
+		}
+		info.action = aClickFloatAction;
+		if (!Check(xrGetActionStateFloat(session, &info, &output.clickFloat), "parent click float"))
+		{
+			return false;
+		}
+		info.action = action;
+		info.subactionPath = XR_NULL_PATH;
+		if (!Check(xrGetActionStateBoolean(session, &info, &output.aggregate), "aggregate Boolean"))
+		{
+			return false;
+		}
+		info.subactionPath = rightPath;
+		info.action = fidelityReplacement;
+		return Check(xrGetActionStateBoolean(session, &info, &output.replacement), "replacement binding");
+	}
+
+	bool SyncFidelity(XrResult expected)
+	{
+		const XrActiveActionSet active{actionSet, XR_NULL_PATH};
+		XrActionsSyncInfo info{XR_TYPE_ACTIONS_SYNC_INFO};
+		info.countActiveActionSets = 1;
+		info.activeActionSets = &active;
+		return Expect(xrSyncActions(session, &info), expected, "fidelity sync");
+	}
+
+	bool FidelityHaptic(XrResult expected, bool invalidAmplitude = false)
+	{
+		XrHapticActionInfo info{XR_TYPE_HAPTIC_ACTION_INFO};
+		info.action = fidelityHaptic;
+		info.subactionPath = rightPath;
+		XrHapticVibration vibration{XR_TYPE_HAPTIC_VIBRATION};
+		vibration.amplitude = invalidAmplitude ? 2.0f : 0.5f;
+		vibration.duration = 10000000;
+		return Expect(xrApplyHapticFeedback(session, &info, reinterpret_cast<const XrHapticBaseHeader*>(&vibration)), expected, "fidelity haptic");
+	}
+
+	bool ValidateAttachedContracts(bool destroySession = false)
+	{
+		const XrActionSuggestedBinding binding{action, Path("/user/hand/right/input/a/click")};
+		XrInteractionProfileSuggestedBinding suggestions{XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING};
+		suggestions.interactionProfile = Path("/interaction_profiles/oculus/touch_controller");
+		suggestions.countSuggestedBindings = 1;
+		suggestions.suggestedBindings = &binding;
+		if (destroySession)
+		{
+			if (!End() || !Check(xrDestroySession(session), "destroy attached session"))
+			{
+				return false;
+			}
+			session = XR_NULL_HANDLE;
+		}
+		if (!Expect(xrSuggestInteractionProfileBindings(instance, &suggestions), XR_ERROR_ACTIONSETS_ALREADY_ATTACHED, "sticky attachment suggestions"))
+		{
+			return false;
+		}
+		if (destroySession)
+		{
+			return true;
+		}
+		XrActionSet loose = XR_NULL_HANDLE;
+		XrActionSetCreateInfo setInfo{XR_TYPE_ACTION_SET_CREATE_INFO};
+		std::strcpy(setInfo.actionSetName, "unattached");
+		std::strcpy(setInfo.localizedActionSetName, "Unattached");
+		if (!Check(xrCreateActionSet(instance, &setInfo, &loose), "create unattached set"))
+		{
+			return false;
+		}
+		XrAction looseAction = XR_NULL_HANDLE;
+		XrActionCreateInfo actionInfo{XR_TYPE_ACTION_CREATE_INFO};
+		std::strcpy(actionInfo.actionName, "unattached");
+		std::strcpy(actionInfo.localizedActionName, "Unattached");
+		actionInfo.actionType = XR_ACTION_TYPE_BOOLEAN_INPUT;
+		bool passed = Check(xrCreateAction(loose, &actionInfo, &looseAction), "create unattached action");
+		const XrActionSuggestedBinding looseBinding{looseAction, binding.binding};
+		suggestions.suggestedBindings = &looseBinding;
+		passed = passed && Check(xrSuggestInteractionProfileBindings(instance, &suggestions), "unrelated unattached suggestions");
+		XrActiveActionSet active{loose, XR_NULL_PATH};
+		XrActionsSyncInfo sync{XR_TYPE_ACTIONS_SYNC_INFO};
+		sync.countActiveActionSets = 1;
+		sync.activeActionSets = &active;
+		passed = passed && Expect(xrSyncActions(session, &sync), XR_ERROR_ACTIONSET_NOT_ATTACHED, "valid unattached sync");
+		active.actionSet = XR_NULL_HANDLE;
+		passed = passed && Expect(xrSyncActions(session, &sync), XR_ERROR_HANDLE_INVALID, "invalid sync handle");
+		XrActionStateGetInfo get{XR_TYPE_ACTION_STATE_GET_INFO};
+		get.action = action;
+		XrActionStateFloat wrong{XR_TYPE_ACTION_STATE_FLOAT};
+		passed = passed && Expect(xrGetActionStateFloat(session, &get, &wrong), XR_ERROR_ACTION_TYPE_MISMATCH, "wrong getter type");
+		xrDestroyActionSet(loose);
+		return passed;
+	}
+
+	bool FidelityGripFlags(XrTime time, XrSpaceLocationFlags& flags)
+	{
+		XrSpaceLocation location{XR_TYPE_SPACE_LOCATION};
+		if (!Check(xrLocateSpace(rightGripSpace, localSpace, time, &location), "fidelity locate grip"))
+		{
+			return false;
+		}
+		flags = location.locationFlags;
+		return true;
+	}
+
+	bool FidelityProfile(bool attached, bool suggested)
+	{
+		const char* users[] = {"/user/hand/left", "/user/hand/right", "/user/head", "/user/gamepad", "/user/treadmill"};
+		for (size_t index = 0; index < std::size(users); ++index)
+		{
+			XrInteractionProfileState profile{XR_TYPE_INTERACTION_PROFILE_STATE};
+			if (!Check(xrGetCurrentInteractionProfile(session, Path(users[index]), &profile), "current profile"))
+			{
+				return false;
+			}
+			const XrPath expected = index < 2 && attached && suggested ? Path("/interaction_profiles/oculus/touch_controller") : XR_NULL_PATH;
+			if (profile.interactionProfile != expected)
+			{
+				std::cerr << "current profile mismatch for " << users[index] << '\n';
+				return false;
+			}
+		}
+		XrInteractionProfileState profile{XR_TYPE_INTERACTION_PROFILE_STATE};
+		return Expect(xrGetCurrentInteractionProfile(session, std::numeric_limits<XrPath>::max(), &profile), XR_ERROR_PATH_INVALID, "invalid current profile path") &&
+			Expect(xrGetCurrentInteractionProfile(session, Path("/user/unknown"), &profile), XR_ERROR_PATH_UNSUPPORTED, "unsupported current profile user");
+	}
+
+	bool ReadFocusEvents(std::vector<XrSessionState>& states)
+	{
+		XrEventDataBuffer event{XR_TYPE_EVENT_DATA_BUFFER};
+		XrResult result = XR_EVENT_UNAVAILABLE;
+		while ((result = xrPollEvent(instance, &event)) == XR_SUCCESS)
+		{
+			if (event.type == XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED)
+			{
+				const auto* changed = reinterpret_cast<const XrEventDataSessionStateChanged*>(&event);
+				states.push_back(changed->state);
+			}
+			event = {XR_TYPE_EVENT_DATA_BUFFER};
+		}
+		return Expect(result, XR_EVENT_UNAVAILABLE, "focus event poll");
 	}
 
 	bool RestartAfterForcedReady()
@@ -1951,6 +2301,10 @@ private:
 				return false;
 			}
 		}
+		if (!ValidatePathContracts())
+		{
+			return false;
+		}
 		const auto createPoseSpace = [&]()
 		{
 			XrActionSpaceCreateInfo spaceInfo{XR_TYPE_ACTION_SPACE_CREATE_INFO};
@@ -2049,6 +2403,12 @@ private:
 	XrAction poseAction = XR_NULL_HANDLE;
 	XrAction triggerValueAction = XR_NULL_HANDLE;
 	XrAction aClickFloatAction = XR_NULL_HANDLE;
+	XrAction fidelityTrigger = XR_NULL_HANDLE;
+	XrAction fidelitySqueeze = XR_NULL_HANDLE;
+	XrAction fidelityStick = XR_NULL_HANDLE;
+	XrAction fidelityIgnored = XR_NULL_HANDLE;
+	XrAction fidelityReplacement = XR_NULL_HANDLE;
+	XrAction fidelityHaptic = XR_NULL_HANDLE;
 	XrPath rightPath = XR_NULL_PATH;
 	XrSwapchain swapchain = XR_NULL_HANDLE;
 	std::vector<XrSwapchainImageD3D12KHR> images;
@@ -2092,6 +2452,9 @@ private:
 	PFN_xrGetActionStateBoolean xrGetActionStateBoolean = nullptr;
 	PFN_xrGetActionStateFloat xrGetActionStateFloat = nullptr;
 	PFN_xrGetActionStatePose xrGetActionStatePose = nullptr;
+	PFN_xrGetActionStateVector2f xrGetActionStateVector2f = nullptr;
+	PFN_xrGetCurrentInteractionProfile xrGetCurrentInteractionProfile = nullptr;
+	PFN_xrApplyHapticFeedback xrApplyHapticFeedback = nullptr;
 	PFN_xrEnumerateSwapchainFormats xrEnumerateSwapchainFormats = nullptr;
 	PFN_xrCreateSwapchain xrCreateSwapchain = nullptr;
 	PFN_xrDestroySwapchain xrDestroySwapchain = nullptr;
@@ -2741,6 +3104,559 @@ bool RequireSameReport(const Json& expected, const Json& actual, std::string_vie
 	return false;
 }
 
+
+bool FidelityNeutral(const OpenXR::FidelityState& state)
+{
+	const auto neutral = [](const auto& value)
+	{
+		return value.isActive == XR_FALSE && value.currentState == 0 && value.changedSinceLastSync == XR_FALSE && value.lastChangeTime == 0;
+	};
+	return neutral(state.button) && neutral(state.trigger) && neutral(state.squeeze) && neutral(state.triggerButton) && neutral(state.clickFloat) && neutral(state.replacement) && neutral(state.ignored) && neutral(state.aggregate) &&
+		state.stick.isActive == XR_FALSE && state.stick.currentState.x == 0.0f && state.stick.currentState.y == 0.0f &&
+		state.stick.changedSinceLastSync == XR_FALSE && state.stick.lastChangeTime == 0 && state.pose.isActive == XR_FALSE;
+}
+
+bool FidelityStable(const OpenXR::FidelityState& before, const OpenXR::FidelityState& after)
+{
+	const auto equal = [](const auto& a, const auto& b)
+	{
+		return a.isActive == b.isActive && a.currentState == b.currentState &&
+			a.changedSinceLastSync == b.changedSinceLastSync && a.lastChangeTime == b.lastChangeTime;
+	};
+	return equal(before.button, after.button) && equal(before.trigger, after.trigger) && equal(before.squeeze, after.squeeze) &&
+		equal(before.triggerButton, after.triggerButton) && equal(before.clickFloat, after.clickFloat) &&
+		equal(before.aggregate, after.aggregate) && equal(before.replacement, after.replacement) && equal(before.ignored, after.ignored) &&
+		before.stick.isActive == after.stick.isActive && before.stick.currentState.x == after.stick.currentState.x &&
+		before.stick.currentState.y == after.stick.currentState.y && before.stick.changedSinceLastSync == after.stick.changedSinceLastSync &&
+		before.stick.lastChangeTime == after.stick.lastChangeTime && before.pose.isActive == after.pose.isActive;
+}
+
+int RunFidelityScenario(const std::wstring& runtimeManifest, const std::filesystem::path& executable, std::string_view name)
+{
+	const bool bindingRun = name == "binding-contract";
+	{
+		OpenXR client;
+		if (!client.Load(runtimeManifest) || !client.InitializeGraphics(false) ||
+			(bindingRun && !client.FidelityProfile(false, false)) || !client.PrepareFidelityActions(bindingRun) ||
+			(bindingRun && !client.FidelityProfile(true, true)) || !client.Begin() || (bindingRun && !client.ValidateAttachedContracts()))
+		{
+			std::cerr << name << ": fidelity setup failed\n";
+			return 1;
+		}
+		RuntimeEndpoint endpoint;
+		Control control;
+		if (!FindEndpoint(endpoint) || !control.Connect(endpoint))
+		{
+			return 1;
+		}
+		Json fixture;
+		if (!ReadJsonFile(ResolveExample(executable, "focus-recovery"), fixture))
+		{
+			return 1;
+		}
+		const bool focusRun = name == "focus-recovery";
+		const bool inactiveRun = name == "inactive-controller";
+		const int runs = focusRun ? 2 : 1;
+		for (int run = 0; run < runs; ++run)
+		{
+			Json timeline = fixture;
+			if (inactiveRun)
+			{
+				timeline["keyframes"] = Json::array({
+					{{"timeSeconds", 0.2}, {"state", fixture.at("keyframes").at(0).at("state")}},
+					{{"timeSeconds", 0.3}, {"state", {{"right", {{"grip", {{"positionTracked", false}, {"orientationTracked", false}}}}}}}},
+					{{"timeSeconds", 0.4}, {"state", {{"right", {{"active", false}}}}}},
+					{{"timeSeconds", 0.5}, {"state", {{"right", {{"buttons", {{"a", false}}}}}}}},
+					{{"timeSeconds", 0.55}, {"state", {{"right", {{"grip", {{"positionValid", false}, {"orientationValid", false}}}}}}}},
+					{{"timeSeconds", 0.65}, {"state", {{"right", {{"buttons", {{"a", true}}}}}}}},
+					{{"timeSeconds", 0.75}, {"state", {{"right", {{"grip", {{"positionValid", true}, {"orientationValid", true}, {"positionTracked", true}, {"orientationTracked", true}}}}}}}},
+					{{"timeSeconds", 0.9}, {"state", {{"right", {{"active", true}}}}}},
+					fixture.at("keyframes").at(3),
+					fixture.at("keyframes").at(4),
+					fixture.at("keyframes").at(5),
+					fixture.at("keyframes").at(6)});
+				timeline["initial"].erase("focused");
+				timeline["keyframes"].back()["state"].erase("focused");
+			}
+			else if (!focusRun)
+			{
+				timeline["keyframes"][1]["state"] = Json::object();
+				timeline["keyframes"][2]["state"] = Json::object();
+				timeline["keyframes"].insert(timeline["keyframes"].begin() + 1, Json{{"timeSeconds", 0.3}, {"state", {{"left", {{"buttons", {{"x", true}}}}}}}});
+				timeline["keyframes"][6]["state"]["right"]["buttons"]["b"] = true;
+				timeline["keyframes"][6]["state"]["left"] = {{"buttons", {{"x", false}}}};
+				timeline["keyframes"][7]["state"]["right"] = {{"buttons", {{"b", false}}}};
+			}
+			else if (run == 1)
+			{
+				timeline["keyframes"].insert(timeline["keyframes"].begin() + 2, Json{{"timeSeconds", 0.6}, {"state", {{"right", {{"buttons", {{"a", false}}}}}}}});
+			}
+			uint64_t timelineId = 0;
+			if (!SubmitTimeline(control, timeline, timelineId, true))
+			{
+				return 1;
+			}
+			Json malformed = timeline;
+			malformed["initial"]["focused"] = 1;
+			uint64_t ignoredId = 0;
+			if (!SubmitTimeline(control, malformed, ignoredId, false))
+			{
+				return 1;
+			}
+			malformed = timeline;
+			malformed["keyframes"][0]["state"]["focused"] = "false";
+			if (!SubmitTimeline(control, malformed, ignoredId, false))
+			{
+				return 1;
+			}
+			uint32_t frames = 0;
+			uint64_t priorFrameId = 0;
+			bool sawHeld = false;
+			bool sawUnavailable = false;
+			bool sawRecovery = false;
+			bool sawReleased = false;
+			bool sawFreshEdge = false;
+			bool sawValidUntracked = false;
+			bool sawInvalid = false;
+			bool sawReplacement = false;
+			bool sawAggregateHold = false;
+			XrTime aggregateHeldTime = 0;
+			bool completed = false;
+			bool previousDelivery = true;
+			bool haveLastSynced = false;
+			OpenXR::FidelityState lastSynced;
+			bool hapticChecked = false;
+			std::vector<XrSessionState> events;
+			bool focused = false;
+			bool controllerActive = false;
+			double seconds = 0.0;
+			XrSpaceLocationFlags gripFlags = 0;
+			XrSpaceLocationFlags expectedGripFlags = 0;
+			OpenXR::FidelityState state;
+			const auto observationFailure = [&]()
+			{
+				std::cerr << name << ": run=" << run << " frame=" << priorFrameId << " predictedSeconds=" << seconds
+					<< " completed=" << completed << " held=" << sawHeld << " unavailable=" << sawUnavailable
+					<< " recovery=" << sawRecovery << " released=" << sawReleased << " freshEdge=" << sawFreshEdge
+					<< " validUntracked=" << sawValidUntracked << " invalid=" << sawInvalid
+					<< " replacement=" << sawReplacement << " aggregateHold=" << sawAggregateHold
+					<< " focused=" << focused << " controllerActive=" << controllerActive
+					<< " buttonActive=" << state.button.isActive << " poseActive=" << state.pose.isActive
+					<< " button=" << state.button.currentState << " buttonChanged=" << state.button.changedSinceLastSync
+					<< " buttonTime=" << state.button.lastChangeTime
+					<< " trigger=" << state.trigger.currentState << " triggerChanged=" << state.trigger.changedSinceLastSync << " triggerTime=" << state.trigger.lastChangeTime
+					<< " squeeze=" << state.squeeze.currentState << " squeezeChanged=" << state.squeeze.changedSinceLastSync << " squeezeTime=" << state.squeeze.lastChangeTime
+					<< " stick=" << state.stick.currentState.x << ',' << state.stick.currentState.y
+					<< " stickChanged=" << state.stick.changedSinceLastSync << " stickTime=" << state.stick.lastChangeTime
+					<< " aggregate=" << state.aggregate.currentState << " aggregateChanged=" << state.aggregate.changedSinceLastSync << " aggregateTime=" << state.aggregate.lastChangeTime
+					<< " aggregateHeldTime=" << aggregateHeldTime
+					<< " gripFlags=" << gripFlags << " expectedGripFlags=" << expectedGripFlags
+					<< " gripPositionValid=" << ((gripFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT) != 0)
+					<< " gripOrientationValid=" << ((gripFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT) != 0)
+					<< " gripPositionTracked=" << ((gripFlags & XR_SPACE_LOCATION_POSITION_TRACKED_BIT) != 0)
+					<< " gripOrientationTracked=" << ((gripFlags & XR_SPACE_LOCATION_ORIENTATION_TRACKED_BIT) != 0)
+					<< " haveLastSynced=" << haveLastSynced << " lastSyncedButton=" << lastSynced.button.currentState
+					<< " lastSyncedButtonTime=" << lastSynced.button.lastChangeTime
+					<< " lastSyncedTriggerTime=" << lastSynced.trigger.lastChangeTime
+					<< " lastSyncedSqueezeTime=" << lastSynced.squeeze.lastChangeTime
+					<< " lastSyncedStickTime=" << lastSynced.stick.lastChangeTime << '\n';
+			};
+			for (uint32_t attempt = 0; attempt < 600 && !completed; ++attempt)
+			{
+				XrViewState view{XR_TYPE_VIEW_STATE};
+				XrTime displayTime = 0;
+				Json snapshot;
+				if (!client.Frame(true, frames, &view, &displayTime) || !control.Snapshot(snapshot) || !client.ReadFocusEvents(events))
+				{
+					return 1;
+				}
+				const uint64_t frameId = snapshot.value("frameId", 0ull);
+				if (frameId <= priorFrameId || !snapshot.value("running", false) ||
+					snapshot.value("sessionGeneration", 0ull) != endpoint.sessionGeneration ||
+					snapshot.at("timeline").value("id", 0ull) != timelineId)
+				{
+					std::cerr << name << ": frame clock, generation, or timeline changed\n";
+					return 1;
+				}
+				priorFrameId = frameId;
+				seconds = static_cast<double>(displayTime - snapshot.at("timeline").value("start", static_cast<XrTime>(0))) / 1000000000.0;
+				focused = snapshot.value("focused", false);
+				const Json& tracking = snapshot.at("tracking");
+				controllerActive = tracking.at("right").value("active", false);
+				const Json& rawGrip = tracking.at("rightGrip");
+				const bool positionValid = rawGrip.at("positionValid").get<bool>();
+				const bool orientationValid = rawGrip.at("orientationValid").get<bool>();
+				const bool positionTracked = rawGrip.at("positionTracked").get<bool>();
+				const bool orientationTracked = rawGrip.at("orientationTracked").get<bool>();
+				expectedGripFlags = controllerActive ?
+					(positionValid ? XR_SPACE_LOCATION_POSITION_VALID_BIT : 0) |
+					(orientationValid ? XR_SPACE_LOCATION_ORIENTATION_VALID_BIT : 0) |
+					(positionTracked ? XR_SPACE_LOCATION_POSITION_TRACKED_BIT : 0) |
+					(orientationTracked ? XR_SPACE_LOCATION_ORIENTATION_TRACKED_BIT : 0) : 0;
+				if (focusRun && tracking.value("focused", !focused) != focused)
+				{
+					std::cerr << name << ": sampled and lifecycle focus disagree\n";
+					return 1;
+				}
+				const bool skipSync = focusRun && run == 1 && !focused;
+				if (!skipSync && !client.SyncFidelity(focused ? XR_SUCCESS : XR_SESSION_NOT_FOCUSED))
+				{
+					return 1;
+				}
+				OpenXR::FidelityState repeated;
+				if (!client.ReadFidelity(state) || !client.ReadFidelity(repeated) || !FidelityStable(state, repeated))
+				{
+					std::cerr << name << ": getters did not hold snapshot stable\n";
+					observationFailure();
+					return 1;
+				}
+				if (!client.FidelityGripFlags(displayTime, gripFlags))
+				{
+					observationFailure();
+					return 1;
+				}
+				if (state.pose.isActive != state.button.isActive)
+				{
+					std::cerr << name << ": synchronized pose and Boolean source activity disagree\n";
+					observationFailure();
+					return 1;
+				}
+				if (state.ignored.isActive || state.ignored.currentState || state.ignored.changedSinceLastSync || state.ignored.lastChangeTime)
+				{
+					std::cerr << name << ": unconvertible or nonemulated binding delivered input\n";
+					observationFailure();
+					return 1;
+				}
+				if (!sawHeld && !sawUnavailable && state.button.isActive && state.button.currentState &&
+					(state.trigger.currentState != 0.0f || state.squeeze.currentState != 0.0f ||
+						state.stick.currentState.x != 0.0f || state.stick.currentState.y != 0.0f))
+				{
+					if (!state.button.isActive || !state.button.currentState || !state.trigger.isActive || state.trigger.currentState != 0.8f ||
+						!state.squeeze.isActive || state.squeeze.currentState != 0.7f || !state.stick.isActive ||
+						state.stick.currentState.x != 0.4f || state.stick.currentState.y != -0.6f || !state.pose.isActive ||
+						!state.triggerButton.isActive || !state.triggerButton.currentState || !state.clickFloat.isActive || state.clickFloat.currentState != 1.0f ||
+						state.replacement.currentState)
+					{
+						std::cerr << name << ": parent conversions or atomic binding replacement failed\n";
+						observationFailure();
+						return 1;
+					}
+					sawHeld = true;
+					aggregateHeldTime = state.aggregate.lastChangeTime;
+				}
+				if (!focused || (inactiveRun && !state.button.isActive))
+				{
+					if (!FidelityNeutral(state))
+					{
+						std::cerr << name << ": unavailable action fields not neutral\n";
+						observationFailure();
+						return 1;
+					}
+					if (!sawHeld)
+					{
+						std::cerr << name << ": unavailable phase preceded held observation\n";
+						observationFailure();
+						return 1;
+					}
+					sawUnavailable = true;
+				}
+				if (!focused && !hapticChecked)
+				{
+					if (!client.FidelityHaptic(XR_ERROR_VALIDATION_FAILURE, true) || !client.FidelityHaptic(XR_SESSION_NOT_FOCUSED))
+					{
+						observationFailure();
+						return 1;
+					}
+					hapticChecked = true;
+				}
+				if (sawUnavailable && !sawRecovery && !previousDelivery && state.button.isActive)
+				{
+					bool recoveryValid = false;
+					if (focusRun && run == 1)
+					{
+						const auto scalarRecovery = [](const auto& before, const auto& after)
+						{
+							if (!before.isActive || !after.isActive)
+							{
+								return false;
+							}
+							const bool changed = before.currentState != after.currentState;
+							return (after.changedSinceLastSync != XR_FALSE) == changed &&
+								(changed ? after.lastChangeTime > 0 && after.lastChangeTime >= before.lastChangeTime :
+									after.lastChangeTime == before.lastChangeTime);
+						};
+						const bool stickChanged = lastSynced.stick.currentState.x != state.stick.currentState.x ||
+							lastSynced.stick.currentState.y != state.stick.currentState.y;
+						recoveryValid = haveLastSynced && scalarRecovery(lastSynced.button, state.button) &&
+							!(state.button.currentState && state.button.changedSinceLastSync) &&
+							scalarRecovery(lastSynced.trigger, state.trigger) && scalarRecovery(lastSynced.squeeze, state.squeeze) &&
+							scalarRecovery(lastSynced.triggerButton, state.triggerButton) && scalarRecovery(lastSynced.clickFloat, state.clickFloat) &&
+							scalarRecovery(lastSynced.replacement, state.replacement) && scalarRecovery(lastSynced.aggregate, state.aggregate) &&
+							lastSynced.stick.isActive && state.stick.isActive &&
+							(state.stick.changedSinceLastSync != XR_FALSE) == stickChanged &&
+							(stickChanged ? state.stick.lastChangeTime > 0 && state.stick.lastChangeTime >= lastSynced.stick.lastChangeTime :
+								state.stick.lastChangeTime == lastSynced.stick.lastChangeTime);
+					}
+					else
+					{
+						recoveryValid = !state.button.changedSinceLastSync && state.button.lastChangeTime == 0 &&
+							!state.trigger.changedSinceLastSync && state.trigger.lastChangeTime == 0 &&
+							!state.squeeze.changedSinceLastSync && state.squeeze.lastChangeTime == 0 &&
+							!state.stick.changedSinceLastSync && state.stick.lastChangeTime == 0;
+					}
+					if (!recoveryValid)
+					{
+						std::cerr << name << ": recovery invented or lost action edge\n";
+						observationFailure();
+						return 1;
+					}
+					sawRecovery = true;
+				}
+				if ((bindingRun ? sawHeld : sawRecovery) && state.button.isActive && !state.button.currentState)
+				{
+					sawReleased = true;
+				}
+				if (sawReleased && previousDelivery && haveLastSynced && lastSynced.button.isActive && !lastSynced.button.currentState &&
+					state.button.isActive && state.button.currentState && state.button.changedSinceLastSync)
+				{
+					sawFreshEdge = true;
+				}
+				if (bindingRun && sawReleased && state.replacement.isActive && state.replacement.currentState)
+				{
+					if (state.button.currentState || !state.replacement.isActive || !state.replacement.currentState)
+					{
+						std::cerr << name << ": valid replacement did not remove old A source\n";
+						observationFailure();
+						return 1;
+					}
+					sawReplacement = true;
+				}
+				if (bindingRun && sawHeld && !sawAggregateHold && state.button.isActive && !state.button.currentState &&
+					state.aggregate.isActive && state.aggregate.currentState)
+				{
+					if (!state.aggregate.isActive || !state.aggregate.currentState || state.aggregate.changedSinceLastSync ||
+						aggregateHeldTime == 0 || state.aggregate.lastChangeTime != aggregateHeldTime)
+					{
+						std::cerr << name << ": subaction edge changed held aggregate\n";
+						observationFailure();
+						return 1;
+					}
+					sawAggregateHold = true;
+				}
+				const XrSpaceLocationFlags valid = XR_SPACE_LOCATION_POSITION_VALID_BIT | XR_SPACE_LOCATION_ORIENTATION_VALID_BIT;
+				const XrSpaceLocationFlags tracked = XR_SPACE_LOCATION_POSITION_TRACKED_BIT | XR_SPACE_LOCATION_ORIENTATION_TRACKED_BIT;
+				if (focusRun)
+				{
+					const XrViewStateFlags headFlags = XR_VIEW_STATE_POSITION_VALID_BIT | XR_VIEW_STATE_ORIENTATION_VALID_BIT | XR_VIEW_STATE_POSITION_TRACKED_BIT | XR_VIEW_STATE_ORIENTATION_TRACKED_BIT;
+					if ((gripFlags & (valid | tracked)) != (valid | tracked) || (view.viewStateFlags & headFlags) != headFlags)
+					{
+						std::cerr << name << ": focus changed tracking flags\n";
+						observationFailure();
+						return 1;
+					}
+					const char* poses[] = {"head", "leftGrip", "leftAim", "rightGrip", "rightAim"};
+					for (const char* pose : poses)
+					{
+						const Json& raw = tracking.at(pose);
+						if (!raw.at("positionValid").get<bool>() || !raw.at("orientationValid").get<bool>() ||
+							!raw.at("positionTracked").get<bool>() || !raw.at("orientationTracked").get<bool>())
+						{
+							std::cerr << name << ": focus changed published tracking flags for " << pose << '\n';
+							observationFailure();
+							return 1;
+						}
+					}
+				}
+				if (inactiveRun)
+				{
+					if (gripFlags != expectedGripFlags)
+					{
+						std::cerr << name << ": predicted grip flags disagree with published pose/controller flags\n";
+						observationFailure();
+						return 1;
+					}
+					if (controllerActive && positionValid && orientationValid && !positionTracked && !orientationTracked)
+					{
+						if ((gripFlags & valid) != valid || (gripFlags & tracked) != 0)
+						{
+							std::cerr << name << ": valid untracked grip flags lost\n";
+							observationFailure();
+							return 1;
+						}
+						sawValidUntracked = true;
+					}
+					if (!positionValid && !orientationValid)
+					{
+						if (gripFlags != 0)
+						{
+							std::cerr << name << ": invalid pose retained grip flags\n";
+							observationFailure();
+							return 1;
+						}
+						sawInvalid = true;
+					}
+					if (!controllerActive && gripFlags != 0)
+					{
+						std::cerr << name << ": disconnected controller retained valid grip\n";
+						observationFailure();
+						return 1;
+					}
+				}
+				previousDelivery = state.button.isActive != XR_FALSE;
+				if (!skipSync && focused)
+				{
+					lastSynced = state;
+					haveLastSynced = true;
+				}
+				completed = snapshot.at("timeline").value("status", std::string{}) == "completed";
+			}
+			Json report;
+			if (!completed || !sawHeld || !sawReleased || !sawFreshEdge || !control.Report(timelineId, report))
+			{
+				std::cerr << name << ": required held/fresh action observations missing\n";
+				observationFailure();
+				return 1;
+			}
+			if (focusRun && (!sawUnavailable || !sawRecovery || !hapticChecked || events != std::vector<XrSessionState>{XR_SESSION_STATE_VISIBLE, XR_SESSION_STATE_FOCUSED} ||
+				report.value("focusTransitions", 0u) != 2 || report.value("validityTransitions", 1u) != 0 || report.value("trackingTransitions", 1u) != 0 || !report.at("haptics").empty()))
+			{
+				std::cerr << name << ": focus lifecycle/report contract failed\n";
+				observationFailure();
+				return 1;
+			}
+			if (inactiveRun && (!sawUnavailable || !sawRecovery || !sawValidUntracked || !sawInvalid ||
+				report.value("validityTransitions", 0u) != 4 || report.value("trackingTransitions", 0u) != 4 ||
+				report.value("unobservedDigitalTransitions", 0u) < 2))
+			{
+				std::cerr << name << ": inactive/tracking report contract failed\n";
+				observationFailure();
+				return 1;
+			}
+			if (bindingRun && (!sawReplacement || !sawAggregateHold))
+			{
+				std::cerr << name << ": replacement/aggregate observations missing\n";
+				observationFailure();
+				return 1;
+			}
+			if (focusRun && run == 1 && report.value("unobservedDigitalTransitions", 0u) < 1)
+			{
+				std::cerr << name << ": unfocused authored edge counted as delivered\n";
+				observationFailure();
+				return 1;
+			}
+			bool reportedVisible = false;
+			bool reportedUnfocusedSync = false;
+			for (const Json& frame : report.at("frames"))
+			{
+				if (!frame.value("focused", true))
+				{
+					if (!frame.value("ended", false) || !frame.value("composed", false) || frame.value("layerCount", 0u) != 1)
+					{
+						std::cerr << name << ": VISIBLE frame did not compose\n";
+						observationFailure();
+						return 1;
+					}
+					reportedVisible = true;
+				}
+			}
+			for (const Json& sync : report.at("actionSyncs"))
+			{
+				if (!sync.value("focused", true))
+				{
+					if (sync.value("result", static_cast<int32_t>(XR_SUCCESS)) != static_cast<int32_t>(XR_SESSION_NOT_FOCUSED))
+					{
+						std::cerr << name << ": reported unfocused sync returned wrong result\n";
+						observationFailure();
+						return 1;
+					}
+					reportedUnfocusedSync = true;
+				}
+			}
+			if (focusRun && (!reportedVisible || reportedUnfocusedSync != (run == 0)))
+			{
+				std::cerr << name << ": applied focus evidence missing or fabricated sync\n";
+				observationFailure();
+				return 1;
+			}
+			for (int idle = 0; idle < 5; ++idle)
+			{
+				if (!client.Frame(true, frames))
+				{
+					return 1;
+				}
+			}
+			Json later;
+			if (!control.Report(timelineId, later) || !RequireSameReport(report, later, "fidelity terminal report stability"))
+			{
+				return 1;
+			}
+		}
+		if (focusRun)
+		{
+			for (int escape = 0; escape < 2; ++escape)
+			{
+				Json unfocused = fixture;
+				unfocused["initial"]["focused"] = false;
+				unfocused["durationSeconds"] = 1.0;
+				unfocused["keyframes"] = Json::array({{{"timeSeconds", 1.0}, {"state", Json::object()}}});
+				uint64_t unfocusedId = 0;
+				uint32_t frames = 0;
+				Json snapshot;
+				if (!SubmitTimeline(control, unfocused, unfocusedId, true) || !client.Frame(true, frames) ||
+					!control.Snapshot(snapshot) || snapshot.value("focused", true))
+				{
+					return 1;
+				}
+				uint64_t recoveryId = unfocusedId;
+				if (escape == 0)
+				{
+					if (!control.CancelTimeline(unfocusedId))
+					{
+						return 1;
+					}
+				}
+				else
+				{
+					Json replacement = unfocused;
+					replacement["initial"]["focused"] = true;
+					replacement["durationSeconds"] = 0.1;
+					replacement["keyframes"] = Json::array({{{"timeSeconds", 0.1}, {"state", Json::object()}}});
+					if (!SubmitTimeline(control, replacement, recoveryId, true))
+					{
+						std::cerr << name << ": VISIBLE rejected replacement timeline\n";
+						return 1;
+					}
+				}
+				if (!client.Frame(true, frames) || !control.Snapshot(snapshot) || !snapshot.value("focused", false) ||
+					snapshot.value("sessionGeneration", 0ull) != endpoint.sessionGeneration ||
+					snapshot.at("timeline").value("id", 0ull) != recoveryId || !client.SyncFidelity(XR_SUCCESS))
+				{
+					std::cerr << name << ": cancel or replacement did not restore frame-driven focus\n";
+					return 1;
+				}
+			}
+		}
+		if (!client.ValidateAttachedContracts(true))
+		{
+			return 1;
+		}
+	}
+	if (name == "binding-contract")
+	{
+		OpenXR nonTouch;
+		bool pressed = true;
+		bool poseActive = true;
+		if (!nonTouch.Load(runtimeManifest) || !nonTouch.InitializeGraphics(false) || !nonTouch.PrepareSimpleControllerActions() ||
+			!nonTouch.FidelityProfile(true, false) || !nonTouch.Begin() || !nonTouch.Sync(pressed, &poseActive) ||
+			pressed || poseActive || !nonTouch.End())
+		{
+			std::cerr << name << ": non-Touch attachment claimed profile or emulated input\n";
+			return 1;
+		}
+	}
+	std::cerr << name << ": API contract observations passed\n";
+	return 0;
+}
 
 int RunScenario(const std::wstring& runtimeManifest, const std::filesystem::path& executable, std::string_view scenarioName)
 {
@@ -3668,7 +4584,7 @@ int RunUnrealActionSetup(const std::wstring& runtimeManifest)
 		std::cerr << "unreal-action-setup: initialization failed\n";
 		return 1;
 	}
-	if (!client.PrepareUnrealActionSetup() || !client.ValidatePathContracts())
+	if (!client.PrepareUnrealActionSetup())
 	{
 		std::cerr << "unreal-action-setup: action/path setup failed\n";
 		return 1;
@@ -4075,7 +4991,7 @@ int RunLifecycle(const std::wstring& runtimeManifest)
 void PrintHelp()
 {
 	std::cerr << "usage: agent-xr-smoke.exe --runtime <manifest> [--scenario <name>]\n";
-	std::cerr << "scenarios: lifecycle session-restart stereo-composition capture-wait idle-client-shutdown timeline-actions report-lifetime tracking-recovery invalid-input pipelined-swapchain pipelined-frame unreal-action-setup\n";
+	std::cerr << "scenarios: lifecycle session-restart stereo-composition capture-wait idle-client-shutdown timeline-actions report-lifetime tracking-recovery invalid-input pipelined-swapchain pipelined-frame unreal-action-setup binding-contract focus-recovery inactive-controller\n";
 }
 
 } // namespace
@@ -4125,6 +5041,10 @@ int wmain(int argc, wchar_t** argv)
 	if (scenarioName == "unreal-action-setup")
 	{
 		return RunUnrealActionSetup(runtimeManifest);
+	}
+	if (scenarioName == "binding-contract" || scenarioName == "focus-recovery" || scenarioName == "inactive-controller")
+	{
+		return RunFidelityScenario(runtimeManifest, std::filesystem::path(argv[0]), scenarioName);
 	}
 	if (scenarioName == "stereo-composition" || scenarioName == "capture-wait" || scenarioName == "timeline-actions" || scenarioName == "report-lifetime" || scenarioName == "tracking-recovery" || scenarioName == "invalid-input" || scenarioName == "pipelined-swapchain" || scenarioName == "pipelined-frame")
 	{

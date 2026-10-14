@@ -2,6 +2,6 @@
   "file_format_version": "1.0.0",
   "runtime": {
     "name": "AgentXR",
-    "library_path": "AgentXRRuntime.dll"
+    "library_path": "./AgentXRRuntime.dll"
   }
 }

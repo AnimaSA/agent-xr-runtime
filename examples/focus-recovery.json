@@ -1,0 +1,42 @@
+{
+  "schemaVersion": 1,
+  "durationSeconds": 1.5,
+  "sampleRateHz": 90,
+  "interpolation": "step",
+  "initial": {
+    "focused": true,
+    "head": {
+      "position": [0.0, 1.65, 0.0],
+      "orientation": [0.0, 0.0, 0.0, 1.0]
+    },
+    "left": {
+      "grip": {"position": [-0.25, 1.2, -0.35], "orientation": [0.0, 0.0, 0.0, 1.0]},
+      "aim": {"position": [-0.25, 1.2, -0.35], "orientation": [0.0, 0.0, 0.0, 1.0]},
+      "active": true,
+      "buttons": {"x": false, "y": false, "menu": false, "thumbstick": false},
+      "touches": {"x": false, "y": false, "thumbstick": false, "trigger": false},
+      "trigger": 0.0,
+      "squeeze": 0.0,
+      "thumbstick": [0.0, 0.0]
+    },
+    "right": {
+      "grip": {"position": [0.25, 1.2, -0.35], "orientation": [0.0, 0.0, 0.0, 1.0]},
+      "aim": {"position": [0.25, 1.2, -0.35], "orientation": [0.0, 0.0, 0.0, 1.0]},
+      "active": true,
+      "buttons": {"a": false, "b": false, "thumbstick": false},
+      "touches": {"a": false, "b": false, "thumbstick": false, "trigger": false},
+      "trigger": 0.0,
+      "squeeze": 0.0,
+      "thumbstick": [0.0, 0.0]
+    }
+  },
+  "keyframes": [
+    {"timeSeconds": 0.2, "state": {"right": {"buttons": {"a": true}, "trigger": 0.8, "squeeze": 0.7, "thumbstick": [0.4, -0.6]}}},
+    {"timeSeconds": 0.4, "state": {"focused": false}},
+    {"timeSeconds": 0.9, "state": {"focused": true}},
+    {"timeSeconds": 0.95, "state": {"right": {"buttons": {"a": false}, "trigger": 0.0, "squeeze": 0.0, "thumbstick": [0.0, 0.0]}}},
+    {"timeSeconds": 1.1, "state": {"right": {"buttons": {"a": true}}}},
+    {"timeSeconds": 1.25, "state": {"right": {"buttons": {"a": false}}}},
+    {"timeSeconds": 1.5, "state": {"focused": true}}
+  ]
+}

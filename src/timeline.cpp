@@ -36,6 +36,7 @@ struct ControllerPatch
 
 struct StatePatch
 {
+	std::optional<bool> focused;
 	std::optional<PosePatch> head;
 	std::optional<PosePatch> leftGrip;
 	std::optional<PosePatch> leftAim;
@@ -283,9 +284,19 @@ bool ParseControllerPatch(const Json& value, ControllerPatch& result, std::strin
 
 bool ParseStatePatch(const Json& value, StatePatch& result, std::string& error, bool requireComplete)
 {
-	if (!HasOnly(value, {"head", "left", "right"}, error))
+	if (!HasOnly(value, {"head", "left", "right", "focused"}, error))
 	{
 		return false;
+	}
+	if (value.contains("focused"))
+	{
+		bool focused = true;
+		if (!Bool(value.at("focused"), focused))
+		{
+			error = "focused must be Boolean";
+			return false;
+		}
+		result.focused = focused;
 	}
 	if (value.contains("head"))
 	{
@@ -472,6 +483,10 @@ bool ApplyController(ControllerState& destination, const ControllerPatch& patch,
 
 bool ApplyPatch(SimState& destination, const StatePatch& patch, std::string& error)
 {
+	if (patch.focused.has_value())
+	{
+		destination.focused = *patch.focused;
+	}
 	if (patch.head.has_value()) ApplyPose(destination.head, *patch.head);
 	if (patch.leftGrip.has_value()) ApplyPose(destination.leftGrip, *patch.leftGrip);
 	if (patch.leftAim.has_value()) ApplyPose(destination.leftAim, *patch.leftAim);
@@ -744,17 +759,17 @@ Json ControllerJson(const ControllerState& state, bool left)
 
 Json StateJson(const SimState& state)
 {
-	return {{"head", PoseJson(state.head)}, {"leftGrip", PoseJson(state.leftGrip)}, {"leftAim", PoseJson(state.leftAim)}, {"rightGrip", PoseJson(state.rightGrip)}, {"rightAim", PoseJson(state.rightAim)}, {"left", ControllerJson(state.left, true)}, {"right", ControllerJson(state.right, false)}};
+	return {{"focused", state.focused}, {"head", PoseJson(state.head)}, {"leftGrip", PoseJson(state.leftGrip)}, {"leftAim", PoseJson(state.leftAim)}, {"rightGrip", PoseJson(state.rightGrip)}, {"rightAim", PoseJson(state.rightAim)}, {"left", ControllerJson(state.left, true)}, {"right", ControllerJson(state.right, false)}};
 }
 
 Json FrameJson(const FrameRecord& frame)
 {
-	return {{"frameId", frame.id}, {"timelineId", frame.timelineId}, {"timelineStart", frame.timelineStart}, {"displayTime", frame.displayTime}, {"period", frame.period}, {"layerCount", frame.layerCount}, {"waited", frame.waited}, {"begun", frame.begun}, {"ended", frame.ended}, {"composed", frame.composed}, {"composeResult", frame.composeResult}, {"discarded", frame.discarded}, {"presentAttempted", frame.presentAttempted}, {"presented", frame.presented}, {"presentOccluded", frame.presentOccluded}, {"presentStillDrawing", frame.presentStillDrawing}, {"presentResult", frame.presentResult}, {"late", frame.late}, {"missedPeriods", frame.missedPeriods}, {"authoredSamples", frame.authoredSamples}, {"appliedSamples", frame.appliedSamples}, {"observedSamples", frame.observedSamples}};
+	return {{"frameId", frame.id}, {"timelineId", frame.timelineId}, {"timelineStart", frame.timelineStart}, {"displayTime", frame.displayTime}, {"period", frame.period}, {"focused", frame.focused}, {"layerCount", frame.layerCount}, {"waited", frame.waited}, {"begun", frame.begun}, {"ended", frame.ended}, {"composed", frame.composed}, {"composeResult", frame.composeResult}, {"discarded", frame.discarded}, {"presentAttempted", frame.presentAttempted}, {"presented", frame.presented}, {"presentOccluded", frame.presentOccluded}, {"presentStillDrawing", frame.presentStillDrawing}, {"presentResult", frame.presentResult}, {"late", frame.late}, {"missedPeriods", frame.missedPeriods}, {"authoredSamples", frame.authoredSamples}, {"appliedSamples", frame.appliedSamples}, {"observedSamples", frame.observedSamples}};
 }
 
 Json ActionSyncJson(const ActionSyncRecord& record)
 {
-	return {{"time", record.time}, {"leftActive", record.leftActive}, {"rightActive", record.rightActive}, {"leftTrigger", record.leftTrigger}, {"rightTrigger", record.rightTrigger}, {"leftSqueeze", record.leftSqueeze}, {"rightSqueeze", record.rightSqueeze}, {"leftThumbstick", {record.leftThumbstick.x, record.leftThumbstick.y}}, {"rightThumbstick", {record.rightThumbstick.x, record.rightThumbstick.y}}, {"observedSamples", record.observedSamples}, {"unobservedDigitalTransitions", record.unobservedDigitalTransitions}};
+	return {{"time", record.time}, {"focused", record.focused}, {"result", static_cast<int32_t>(record.result)}, {"leftActive", record.leftActive}, {"rightActive", record.rightActive}, {"leftTrigger", record.leftTrigger}, {"rightTrigger", record.rightTrigger}, {"leftSqueeze", record.leftSqueeze}, {"rightSqueeze", record.rightSqueeze}, {"leftThumbstick", {record.leftThumbstick.x, record.leftThumbstick.y}}, {"rightThumbstick", {record.rightThumbstick.x, record.rightThumbstick.y}}, {"leftButtons", record.leftButtons}, {"rightButtons", record.rightButtons}, {"observedSamples", record.observedSamples}, {"unobservedDigitalTransitions", record.unobservedDigitalTransitions}};
 }
 
 Json HapticJson(const HapticRecord& record)
@@ -764,7 +779,7 @@ Json HapticJson(const HapticRecord& record)
 
 Json ReportJson(const RunReport& report, size_t cursor, size_t limit)
 {
-	Json result = {{"timelineId", report.timelineId}, {"status", report.status}, {"error", report.error}, {"authoredStart", report.authoredStart}, {"authoredEnd", report.authoredEnd}, {"actualFirstFrame", report.actualFirstFrame}, {"actualLastFrame", report.actualLastFrame}, {"framePeriod", report.framePeriod}, {"maxFrameGap", report.maxFrameGap}, {"plannedSamples", report.plannedSamples}, {"appliedSamples", report.appliedSamples}, {"observedSamples", report.observedSamples}, {"unobservedDigitalTransitions", report.unobservedDigitalTransitions}, {"lateSampleCount", report.lateSampleCount}, {"missedFrameCount", report.missedFrameCount}, {"validityTransitions", report.validityTransitions}, {"trackingTransitions", report.trackingTransitions}, {"overflow", report.overflow}, {"undersampled", report.undersampled}, {"submittedFrameId", report.submittedFrameId}, {"composedFrameId", report.composedFrameId}, {"presentedFrameId", report.presentedFrameId}};
+	Json result = {{"timelineId", report.timelineId}, {"status", report.status}, {"error", report.error}, {"authoredStart", report.authoredStart}, {"authoredEnd", report.authoredEnd}, {"actualFirstFrame", report.actualFirstFrame}, {"actualLastFrame", report.actualLastFrame}, {"framePeriod", report.framePeriod}, {"maxFrameGap", report.maxFrameGap}, {"plannedSamples", report.plannedSamples}, {"appliedSamples", report.appliedSamples}, {"observedSamples", report.observedSamples}, {"unobservedDigitalTransitions", report.unobservedDigitalTransitions}, {"lateSampleCount", report.lateSampleCount}, {"missedFrameCount", report.missedFrameCount}, {"validityTransitions", report.validityTransitions}, {"trackingTransitions", report.trackingTransitions}, {"focusTransitions", report.focusTransitions}, {"overflow", report.overflow}, {"undersampled", report.undersampled}, {"submittedFrameId", report.submittedFrameId}, {"composedFrameId", report.composedFrameId}, {"presentedFrameId", report.presentedFrameId}};
 	const size_t end = std::min(cursor + limit, report.frames.size());
 	result["cursor"] = cursor;
 	result["nextCursor"] = end < report.frames.size() ? Json(end) : Json(nullptr);
@@ -795,6 +810,7 @@ SimState Session::StateAtLocked(XrTime time, std::shared_ptr<const TimelineEpoch
 {
 	const auto neutralize = [](SimState& result)
 	{
+		result.focused = true;
 		result.left.buttons.fill(false);
 		result.right.buttons.fill(false);
 		result.left.touches.fill(false);
@@ -956,10 +972,10 @@ XrResult Session::SubmitTimeline(const Json& timeline, uint64_t& timelineId, std
 		return XR_ERROR_VALIDATION_FAILURE;
 	}
 	std::lock_guard lock(mutex);
-	if (!IsFocused())
+	if (!running || closing || (state != XR_SESSION_STATE_VISIBLE && state != XR_SESSION_STATE_FOCUSED))
 	{
-		error = "session must be focused";
-		return XR_SESSION_NOT_FOCUSED;
+		error = "session must be running and visible";
+		return XR_ERROR_SESSION_NOT_RUNNING;
 	}
 	if (pendingEpoch != nullptr)
 	{

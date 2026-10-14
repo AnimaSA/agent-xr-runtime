@@ -11,7 +11,7 @@ AgentXR does not replace the machine-wide OpenXR runtime. Launch helpers set `XR
 - `XR_KHR_D3D12_enable`
 - Primary stereo view configuration
 - `LOCAL`, `STAGE`, `VIEW`, and `LOCAL_FLOOR_EXT` spaces
-- Core `/interaction_profiles/oculus/touch_controller` bindings
+- Binding validation for nine OpenXR 1.0 core interaction profiles; input emulation for `/interaction_profiles/oculus/touch_controller`
 - Boolean, float, vector2, pose, and haptic actions
 - Deterministic schema-version-1 timelines
 - Local named-pipe control, MCP orchestration, frame reports, and PNG capture
@@ -46,6 +46,8 @@ Installed files:
 - `dist/launch-agentxr-editor.ps1` — process-scoped shortcut launcher
 - `dist/examples/*.json` — generic timeline examples
 
+Manifest uses `runtime.library_path: "./AgentXRRuntime.dll"` so vendored loader resolves DLL beside manifest. Bare DLL names use DLL search order. Use absolute `library_path` when comparing separate runtime builds; launch helpers already generate absolute paths.
+
 ## Launch application with AgentXR
 
 Use launcher with shortcut whose target starts XR application:
@@ -71,6 +73,18 @@ No registry writes or machine-wide runtime changes occur.
 AgentXR creates its compositor preview window when an XR session begins. Explicit session end disposes it immediately. One second without newly released swapchain content disposes the window; resubmitting stale layers does not keep a preview alive.
 
 Editor integrations that stop presentation without continuing to poll OpenXR events can resolve `agentxrRequestExitActiveSession` from already-loaded runtime DLL. Calling this optional C ABI export stops presentation immediately and returns active session to restartable `XR_SESSION_STATE_READY`; standard `xrRequestExitSession` keeps normal `XR_SESSION_STATE_STOPPING`/`xrEndSession` semantics.
+
+## Action contracts
+
+`xrSuggestInteractionProfileBindings` validates profile, component, and hand. Uninterned path handles return `XR_ERROR_PATH_INVALID`; unsupported profile/component paths return `XR_ERROR_PATH_UNSUPPORTED`. Failed suggestions leave previous bindings intact. Valid componentless paths resolve to compatible components; valid but incompatible bindings are ignored.
+
+ponytail: Non-Touch core profiles validate but have no emulated input, add emulation when a test requires another controller profile.
+
+Current interaction profile remains `XR_NULL_PATH` without attached Touch bindings for that user path. Once an action set has been attached, later binding suggestions for it return `XR_ERROR_ACTIONSETS_ALREADY_ATTACHED`, even after session destruction.
+
+Inactive Boolean, float, and vector2 actions return neutral values, `isActive: false`, `changedSinceLastSync: false`, and `lastChangeTime: 0`. Activity changes alone do not create input edges. Boolean aggregates compare combined hand state, so one hand releasing while another holds does not create a false release.
+
+Unfocused `xrSyncActions` returns positive `XR_SESSION_NOT_FOCUSED`. Getters mask input while unfocused even without a sync; haptic requests produce no feedback record. Focus loss preserves previous synchronized snapshots. Recovery after an actual unfocused sync has inactive history; recovery without that sync compares against previous active values and can report a genuine falling edge. Unchanged values retain previous timestamps. See [OpenXR action state](https://registry.khronos.org/OpenXR/specs/1.0-khr/html/xrspec.html#_action_state).
 
 ## Configure MCP
 
@@ -141,6 +155,10 @@ Supported interpolation modes:
 
 Pose validity and tracking default to `true`. Tracked state requires corresponding valid state. Digital input and tracking changes occur discretely at keyframe time.
 
+`initial.focused` and `keyframes[].state.focused` accept optional Boolean values, defaulting to `true`. Focus changes are discrete under every interpolation mode. `false` changes session from `FOCUSED` to `VISIBLE` during `xrWaitFrame`; frames and composition continue. `true` restores `FOCUSED` without changing session generation. No `xrSyncActions` call is needed to apply focus transitions. Cancellation or replacement resets focus and neutralizes input before the next timeline applies.
+
+`left.active` and `right.active` default to `true`. Setting either to `false` makes that hand's input actions inactive even when authored values are nonzero. Pose validity/tracking flags are separate; tracking loss does not deactivate buttons.
+
 Controller inputs follow core Oculus Touch profile:
 
 - Left buttons: `x`, `y`, `menu`, `thumbstick`
@@ -149,11 +167,14 @@ Controller inputs follow core Oculus Touch profile:
 - Analog: `trigger`, `squeeze`, `thumbstick`
 - Poses: `grip`, `aim`
 
-See `examples/neutral.json`, `examples/motion-and-input.json`, and `examples/tracking-recovery.json`.
+See `examples/neutral.json`, `examples/motion-and-input.json`, `examples/tracking-recovery.json`, and `examples/focus-recovery.json`.
 
 ## Native smoke checks
 
 ```powershell
+./dist/agent-xr-smoke.exe --runtime ./dist/agent-xr.json --scenario focus-recovery
+./dist/agent-xr-smoke.exe --runtime ./dist/agent-xr.json --scenario binding-contract
+./dist/agent-xr-smoke.exe --runtime ./dist/agent-xr.json --scenario inactive-controller
 ./dist/agent-xr-smoke.exe --runtime ./dist/agent-xr.json --scenario lifecycle
 ./dist/agent-xr-smoke.exe --runtime ./dist/agent-xr.json --scenario stereo-composition
 ./dist/agent-xr-smoke.exe --runtime ./dist/agent-xr.json --scenario timeline-actions
@@ -170,8 +191,13 @@ See `examples/neutral.json`, `examples/motion-and-input.json`, and `examples/tra
 
 Smoke runner deliberately probes unsupported OpenXR 1.1 instance creation before falling back to 1.0; loader may print expected failed-create diagnostics while scenario still exits `0`.
 
+Smoke runner prints actual loaded runtime DLL and rejects a module that differs from manifest selection. Use absolute executable and manifest paths when comparing builds.
+
 The smoke scenarios check:
 
+- `focus-recovery` checks VISIBLE rendering, unfocused input/haptic suppression, event-driven recovery with and without action sync, exact edge/timestamp semantics, cancellation, and replacement.
+- `binding-contract` checks strict paths, atomic suggestions, componentless conversion, ignored incompatible bindings, current profiles, ever-attached errors, and combined-hand Boolean edges.
+- `inactive-controller` checks neutral inactive values, recovery, and native pose validity/tracking independent from input activity.
 - `stereo-composition` decodes the captured PNG with WIC, checks red left-eye and blue right-eye pixels, and verifies that a capture taken while a newer frame is waited but unended still matches the last completed frame's pixels and metadata.
 - `session-restart` checks inactive discovery (`sessionGeneration: 0`, `sessionRunning: false`, and `sessionState` present) and confirms a prior-generation binding is rejected after restarting the same session handle.
 - `report-lifetime` inserts a 60 ms stall during the run, then checks exact report equality after another 60 ms pause and ten live frames. Snapshot IDs and fresh captures advance; the later capture has `timelineId: 0`.
@@ -191,7 +217,11 @@ Each `RunReport` owns bounded per-run `frames`, `actionSyncs`, and `haptics`. Th
 
 `missedFrameCount` sums periods only for frames assigned to the run, saturates rather than wrapping, and sets `overflow` if the total exceeds its representable range.
 
+`focusTransitions`, `validityTransitions`, and `trackingTransitions` count applied frame-state changes, not authored keyframes that never reach a frame. Validity and tracking counters compare position/orientation flags across head and both hands' grip/aim poses. Digital edges occurring while unfocused or on an inactive controller remain unobserved rather than falsely delivered.
+
 Treat runtime error, stale capture, missed required input edge, or graphics-device failure as failed XR run even when application state appears correct.
+
+Native smoke proves AgentXR runtime contracts, not physical Quest tracking, OS focus/API-layer behavior, or Unreal input and gameplay integration. Haptics are feedback records, not hardware vibration. Pair native evidence with application-specific checks before attributing a hardware failure to gameplay.
 
 ## Licenses
 

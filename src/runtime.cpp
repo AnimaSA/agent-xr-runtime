@@ -1402,7 +1402,7 @@ extern "C" AGENTXR_API XRAPI_ATTR XrResult XRAPI_CALL xrWaitFrame(XrSession sess
 		}
 		agentxr::Session& state = *session->object;
 		std::unique_lock lock(state.mutex);
-		if (!state.IsFocused())
+		if (!state.running || state.closing || (state.state != XR_SESSION_STATE_SYNCHRONIZED && state.state != XR_SESSION_STATE_VISIBLE && state.state != XR_SESSION_STATE_FOCUSED && state.state != XR_SESSION_STATE_STOPPING))
 		{
 			return XR_ERROR_SESSION_NOT_RUNNING;
 		}
@@ -1411,10 +1411,11 @@ extern "C" AGENTXR_API XRAPI_ATTR XrResult XRAPI_CALL xrWaitFrame(XrSession sess
 			return XR_ERROR_LIMIT_REACHED;
 		}
 		const int64_t deadline = state.nextDeadlineQpc;
+		const uint64_t generation = state.sessionGeneration;
 		lock.unlock();
 		const bool waited = state.instance->clock.SleepUntilQpc(deadline);
 		lock.lock();
-		if (!state.IsFocused())
+		if (!state.running || state.closing || state.sessionGeneration != generation || (state.state != XR_SESSION_STATE_SYNCHRONIZED && state.state != XR_SESSION_STATE_VISIBLE && state.state != XR_SESSION_STATE_FOCUSED && state.state != XR_SESSION_STATE_STOPPING))
 		{
 			return XR_ERROR_SESSION_NOT_RUNNING;
 		}
@@ -1446,6 +1447,64 @@ extern "C" AGENTXR_API XRAPI_ATTR XrResult XRAPI_CALL xrWaitFrame(XrSession sess
 			state.report.status = "running";
 			state.lastPublishedState = state.activeEpoch->samples.empty() ? state.fallbackState : state.activeEpoch->samples.front().state;
 		}
+		if (state.neutralizePending)
+		{
+			state.inputsNeutralized = true;
+			state.neutralizePending = false;
+		}
+		const agentxr::SimState sampled = state.StateAtLocked(predicted);
+		const bool focusChanged = (state.state == XR_SESSION_STATE_FOCUSED && !sampled.focused) || (state.state == XR_SESSION_STATE_VISIBLE && sampled.focused);
+		if (focusChanged)
+		{
+			state.QueueState(sampled.focused ? XR_SESSION_STATE_FOCUSED : XR_SESSION_STATE_VISIBLE);
+			if (!sampled.focused)
+			{
+				state.lastSyncFocused = false;
+			}
+		}
+		if (belongsToRun)
+		{
+			const auto increment = [&](uint32_t& counter)
+			{
+				if (counter == std::numeric_limits<uint32_t>::max())
+				{
+					state.report.overflow = true;
+				}
+				else
+				{
+					++counter;
+				}
+			};
+			if (focusChanged)
+			{
+				increment(state.report.focusTransitions);
+			}
+			if (!state.report.frames.empty())
+			{
+				const agentxr::TrackedPose* before[] = {&state.lastPublishedState.head, &state.lastPublishedState.leftGrip, &state.lastPublishedState.leftAim, &state.lastPublishedState.rightGrip, &state.lastPublishedState.rightAim};
+				const agentxr::TrackedPose* after[] = {&sampled.head, &sampled.leftGrip, &sampled.leftAim, &sampled.rightGrip, &sampled.rightAim};
+				for (size_t index = 0; index < std::size(before); ++index)
+				{
+					if (before[index]->positionValid != after[index]->positionValid)
+					{
+						increment(state.report.validityTransitions);
+					}
+					if (before[index]->orientationValid != after[index]->orientationValid)
+					{
+						increment(state.report.validityTransitions);
+					}
+					if (before[index]->positionTracked != after[index]->positionTracked)
+					{
+						increment(state.report.trackingTransitions);
+					}
+					if (before[index]->orientationTracked != after[index]->orientationTracked)
+					{
+						increment(state.report.trackingTransitions);
+					}
+				}
+			}
+		}
+		state.lastPublishedState = sampled;
 		if (state.frameEpochStartTime == 0)
 		{
 			state.frameEpochStartTime = predicted;
@@ -1474,6 +1533,7 @@ extern "C" AGENTXR_API XRAPI_ATTR XrResult XRAPI_CALL xrWaitFrame(XrSession sess
 		frameRecord.waited = true;
 		frameRecord.late = late;
 		frameRecord.missedPeriods = missedPeriods;
+		frameRecord.focused = state.IsFocused();
 		state.frames.push_back(frameRecord);
 		state.waitedFrameIds.push_back(frameRecord.id);
 		state.RefreshFrameAliases();
@@ -1505,7 +1565,6 @@ extern "C" AGENTXR_API XRAPI_ATTR XrResult XRAPI_CALL xrWaitFrame(XrSession sess
 			const int64_t offset = std::clamp<int64_t>(predicted - state.timelineStart, 0, state.activeEpoch->durationNs);
 			const auto sampleEnd = std::upper_bound(state.activeEpoch->samples.begin(), state.activeEpoch->samples.end(), offset, [](int64_t value, const agentxr::TimelineSample& sample) { return value < sample.offsetNs; });
 			const uint32_t applied = static_cast<uint32_t>(sampleEnd - state.activeEpoch->samples.begin());
-			state.lastPublishedState = state.StateAtLocked(predicted);
 			if (belongsToRun)
 			{
 				waitedRecord.authoredSamples = static_cast<uint32_t>(state.activeEpoch->samples.size());
@@ -1544,7 +1603,7 @@ extern "C" AGENTXR_API XRAPI_ATTR XrResult XRAPI_CALL xrBeginFrame(XrSession ses
 		}
 		agentxr::Session& state = *session->object;
 		std::lock_guard lock(state.mutex);
-		if (!state.running || (state.state != XR_SESSION_STATE_FOCUSED && state.state != XR_SESSION_STATE_STOPPING))
+		if (!state.running || state.closing || (state.state != XR_SESSION_STATE_SYNCHRONIZED && state.state != XR_SESSION_STATE_VISIBLE && state.state != XR_SESSION_STATE_FOCUSED && state.state != XR_SESSION_STATE_STOPPING))
 		{
 			return XR_ERROR_CALL_ORDER_INVALID;
 		}

@@ -25,145 +25,223 @@ bool ReadName(const char (&value)[Size], std::string& result)
 	return true;
 }
 
-bool IsKnownTopLevel(const Instance& instance, XrPath path)
+struct CoreProfile
 {
-	const std::string value = instance.PathString(path);
-	return value == kLeftPath || value == kRightPath || value == kHeadPath;
+	std::string_view name;
+	std::string_view user;
+	std::string_view components;
+	std::string_view leftOnly;
+	std::string_view rightOnly;
+};
+
+constexpr CoreProfile kCoreProfiles[] = {
+	{"/interaction_profiles/khr/simple_controller", "", "/input/select/click /input/menu/click /input/grip/pose /input/aim/pose /output/haptic", "", ""},
+	{"/interaction_profiles/google/daydream_controller", "", "/input/select/click /input/trackpad/x /input/trackpad/y /input/trackpad/click /input/trackpad/touch /input/grip/pose /input/aim/pose", "", ""},
+	{"/interaction_profiles/htc/vive_controller", "", "/input/system/click /input/squeeze/click /input/menu/click /input/trigger/click /input/trigger/value /input/trackpad/x /input/trackpad/y /input/trackpad/click /input/trackpad/touch /input/grip/pose /input/aim/pose /output/haptic", "", ""},
+	{"/interaction_profiles/htc/vive_pro", "/user/head", "/input/system/click /input/volume_up/click /input/volume_down/click /input/mute_mic/click", "", ""},
+	{"/interaction_profiles/microsoft/motion_controller", "", "/input/menu/click /input/squeeze/click /input/trigger/value /input/thumbstick/x /input/thumbstick/y /input/thumbstick/click /input/trackpad/x /input/trackpad/y /input/trackpad/click /input/trackpad/touch /input/grip/pose /input/aim/pose /output/haptic", "", ""},
+	{"/interaction_profiles/microsoft/xbox_controller", "/user/gamepad", "/input/menu/click /input/view/click /input/a/click /input/b/click /input/x/click /input/y/click /input/dpad_down/click /input/dpad_right/click /input/dpad_up/click /input/dpad_left/click /input/shoulder_left/click /input/shoulder_right/click /input/thumbstick_left/click /input/thumbstick_right/click /input/trigger_left/value /input/trigger_right/value /input/thumbstick_left/x /input/thumbstick_left/y /input/thumbstick_right/x /input/thumbstick_right/y /output/haptic_left /output/haptic_right /output/haptic_left_trigger /output/haptic_right_trigger", "", ""},
+	{"/interaction_profiles/oculus/go_controller", "", "/input/system/click /input/trigger/click /input/back/click /input/trackpad/x /input/trackpad/y /input/trackpad/click /input/trackpad/touch /input/grip/pose /input/aim/pose", "", ""},
+	{kProfilePath, "", "/input/squeeze/value /input/trigger/value /input/trigger/touch /input/thumbstick/x /input/thumbstick/y /input/thumbstick/click /input/thumbstick/touch /input/thumbrest/touch /input/grip/pose /input/aim/pose /output/haptic", "/input/x/click /input/x/touch /input/y/click /input/y/touch /input/menu/click", "/input/a/click /input/a/touch /input/b/click /input/b/touch /input/system/click"},
+	{"/interaction_profiles/valve/index_controller", "", "/input/system/click /input/system/touch /input/a/click /input/a/touch /input/b/click /input/b/touch /input/squeeze/value /input/squeeze/force /input/trigger/click /input/trigger/value /input/trigger/touch /input/thumbstick/x /input/thumbstick/y /input/thumbstick/click /input/thumbstick/touch /input/trackpad/x /input/trackpad/y /input/trackpad/force /input/trackpad/touch /input/grip/pose /input/aim/pose /output/haptic", "", ""}
+};
+
+const CoreProfile* FindProfile(std::string_view name)
+{
+	for (const CoreProfile& profile : kCoreProfiles)
+	{
+		if (profile.name == name)
+		{
+			return &profile;
+		}
+	}
+	return nullptr;
 }
 
-bool IsSupportedInputPath(const Instance& instance, XrPath path, InputRef& input)
+bool HasComponent(std::string_view components, std::string_view suffix, bool allowParent)
 {
-	const std::string value = instance.PathString(path);
-	if (value.empty())
+	while (!components.empty())
 	{
-		return false;
-	}
-	input = {};
-	const bool left = value.size() > kLeftPath.size() && value.starts_with(kLeftPath) && value[kLeftPath.size()] == '/';
-	const bool right = value.size() > kRightPath.size() && value.starts_with(kRightPath) && value[kRightPath.size()] == '/';
-	if (left)
-	{
-		input.left = true;
-	}
-	else if (!right)
-	{
-		return false;
-	}
-	if (value.ends_with("/output/haptic"))
-	{
-		input.kind = InputKind::Haptic;
-		return true;
-	}
-	if (value.ends_with("/trigger/value"))
-	{
-		input.kind = InputKind::Trigger;
-		return true;
-	}
-	if (value.ends_with("/squeeze/value"))
-	{
-		input.kind = InputKind::Squeeze;
-		return true;
-	}
-	if (value.ends_with("/thumbstick"))
-	{
-		input.kind = InputKind::Thumbstick;
-		return true;
-	}
-	if (value.ends_with("/thumbstick/x"))
-	{
-		input.kind = InputKind::ThumbstickX;
-		return true;
-	}
-	if (value.ends_with("/thumbstick/y"))
-	{
-		input.kind = InputKind::ThumbstickY;
-		return true;
-	}
-	if (value.ends_with("/thumbstick/click"))
-	{
-		input.kind = InputKind::Button;
-		input.channel = 3;
-		return true;
-	}
-	if (value.ends_with("/thumbstick/touch"))
-	{
-		input.kind = InputKind::Touch;
-		input.channel = 2;
-		return true;
-	}
-	if (value.ends_with("/thumbrest/touch"))
-	{
-		input.kind = InputKind::Touch;
-		input.channel = 4;
-		return true;
-	}
-	if (value.ends_with("/trigger/touch"))
-	{
-		input.kind = InputKind::Touch;
-		input.channel = 3;
-		return true;
-	}
-	if (value.ends_with("/x/click"))
-	{
-		input.kind = InputKind::Button;
-		input.channel = 0;
-		return input.left;
-	}
-	if (value.ends_with("/y/click"))
-	{
-		input.kind = InputKind::Button;
-		input.channel = 1;
-		return input.left;
-	}
-	if (value.ends_with("/menu/click"))
-	{
-		input.kind = InputKind::Button;
-		input.channel = 2;
-		return input.left;
-	}
-	if (value.ends_with("/a/click"))
-	{
-		input.kind = InputKind::Button;
-		input.channel = 0;
-		return !input.left;
-	}
-	if (value.ends_with("/b/click"))
-	{
-		input.kind = InputKind::Button;
-		input.channel = 1;
-		return !input.left;
-	}
-	if (value.ends_with("/x/touch"))
-	{
-		input.kind = InputKind::Touch;
-		input.channel = 0;
-		return input.left;
-	}
-	if (value.ends_with("/y/touch"))
-	{
-		input.kind = InputKind::Touch;
-		input.channel = 1;
-		return input.left;
-	}
-	if (value.ends_with("/a/touch"))
-	{
-		input.kind = InputKind::Touch;
-		input.channel = 0;
-		return !input.left;
-	}
-	if (value.ends_with("/b/touch"))
-	{
-		input.kind = InputKind::Touch;
-		input.channel = 1;
-		return !input.left;
+		const size_t end = components.find(' ');
+		const std::string_view component = components.substr(0, end);
+		if (component == suffix || (allowParent && suffix.starts_with("/input/") && component.substr(0, component.rfind('/')) == suffix))
+		{
+			return true;
+		}
+		if (end == std::string_view::npos)
+		{
+			break;
+		}
+		components.remove_prefix(end + 1);
 	}
 	return false;
 }
 
-bool IsPosePath(const Instance& instance, XrPath path)
+bool ProfilePathSupported(const CoreProfile& profile, std::string_view path, bool allowParent = true)
+{
+	std::string_view user = profile.user;
+	if (user.empty())
+	{
+		if (path.starts_with(kLeftPath) && path.size() > kLeftPath.size() && path[kLeftPath.size()] == '/')
+		{
+			user = kLeftPath;
+		}
+		else
+		{
+			user = kRightPath;
+		}
+	}
+	if (!path.starts_with(user) || path.size() <= user.size() || path[user.size()] != '/')
+	{
+		return false;
+	}
+	const std::string_view suffix = path.substr(user.size());
+	return HasComponent(profile.components, suffix, allowParent) || HasComponent(user == kLeftPath ? profile.leftOnly : profile.rightOnly, suffix, allowParent);
+}
+
+bool IsKnownTopLevel(const Instance& instance, XrPath path)
 {
 	const std::string value = instance.PathString(path);
-	return value == kHeadPath || value == "/user/hand/left/input/grip/pose" || value == "/user/hand/right/input/grip/pose" || value == "/user/hand/left/input/aim/pose" || value == "/user/hand/right/input/aim/pose";
+	return value == kLeftPath || value == kRightPath || value == kHeadPath || value == "/user/gamepad" || value == "/user/treadmill";
+}
+
+bool ResolveTouchPath(Instance& instance, XrPath path, XrActionType type, Binding& binding)
+{
+	const CoreProfile& profile = kCoreProfiles[7];
+	const std::string original = instance.PathString(path);
+	std::string resolved = original;
+	binding.input = {};
+	binding.input.left = original.starts_with(kLeftPath);
+	const size_t userSize = binding.input.left ? kLeftPath.size() : kRightPath.size();
+	std::string_view suffix = std::string_view(original).substr(userSize);
+	if (!ProfilePathSupported(profile, original, false))
+	{
+		const auto select = [&](std::string_view component)
+		{
+			const std::string candidate = original + std::string(component);
+			if (!ProfilePathSupported(profile, candidate, false))
+			{
+				return false;
+			}
+			resolved = candidate;
+			return true;
+		};
+		switch (type)
+		{
+			case XR_ACTION_TYPE_BOOLEAN_INPUT:
+			{
+				if (!select("/click") && !select("/value"))
+				{
+					return false;
+				}
+				break;
+			}
+			case XR_ACTION_TYPE_FLOAT_INPUT:
+			{
+				if (!select("/value") && !select("/click"))
+				{
+					return false;
+				}
+				break;
+			}
+			case XR_ACTION_TYPE_VECTOR2F_INPUT:
+			{
+				if (!ProfilePathSupported(profile, original + "/x", false) || !ProfilePathSupported(profile, original + "/y", false))
+				{
+					return false;
+				}
+				binding.input.kind = InputKind::Thumbstick;
+				binding.path = path;
+				return true;
+			}
+			case XR_ACTION_TYPE_POSE_INPUT:
+			{
+				if (!select("/pose"))
+				{
+					return false;
+				}
+				break;
+			}
+			default:
+			{
+				return false;
+			}
+		}
+		suffix = std::string_view(resolved).substr(userSize);
+	}
+	binding.path = instance.InternPath(resolved);
+	if (suffix == "/input/grip/pose" || suffix == "/input/aim/pose")
+	{
+		binding.input.kind = InputKind::Pose;
+		return type == XR_ACTION_TYPE_POSE_INPUT;
+	}
+	if (suffix == "/output/haptic")
+	{
+		binding.input.kind = InputKind::Haptic;
+		return type == XR_ACTION_TYPE_VIBRATION_OUTPUT;
+	}
+	if (type != XR_ACTION_TYPE_BOOLEAN_INPUT && type != XR_ACTION_TYPE_FLOAT_INPUT)
+	{
+		return false;
+	}
+	if (suffix == "/input/trigger/value")
+	{
+		binding.input.kind = InputKind::Trigger;
+		return true;
+	}
+	if (suffix == "/input/squeeze/value")
+	{
+		binding.input.kind = InputKind::Squeeze;
+		return true;
+	}
+	if (suffix == "/input/thumbstick/x")
+	{
+		binding.input.kind = InputKind::ThumbstickX;
+		return true;
+	}
+	if (suffix == "/input/thumbstick/y")
+	{
+		binding.input.kind = InputKind::ThumbstickY;
+		return true;
+	}
+	const bool touch = suffix.ends_with("/touch");
+	binding.input.kind = touch ? InputKind::Touch : InputKind::Button;
+	if (suffix == "/input/a/click" || suffix == "/input/a/touch" || suffix == "/input/x/click" || suffix == "/input/x/touch")
+	{
+		binding.input.channel = 0;
+		return true;
+	}
+	if (suffix == "/input/b/click" || suffix == "/input/b/touch" || suffix == "/input/y/click" || suffix == "/input/y/touch")
+	{
+		binding.input.channel = 1;
+		return true;
+	}
+	if (suffix == "/input/menu/click")
+	{
+		binding.input.channel = 2;
+		return true;
+	}
+	if (suffix == "/input/thumbstick/click")
+	{
+		binding.input.channel = binding.input.left ? 3 : 2;
+		return true;
+	}
+	if (suffix == "/input/thumbstick/touch")
+	{
+		binding.input.channel = 2;
+		return true;
+	}
+	if (suffix == "/input/trigger/touch")
+	{
+		binding.input.channel = 3;
+		return true;
+	}
+	if (suffix == "/input/thumbrest/touch")
+	{
+		binding.input.channel = 4;
+		return true;
+	}
+	return false;
 }
 
 XrPath SourcePath(Instance& instance, const Binding& binding)
@@ -181,7 +259,7 @@ XrPath SourcePath(Instance& instance, const Binding& binding)
 	{
 		return instance.InternPath(kRightPath);
 	}
-	return instance.InternPath(kHeadPath);
+	return XR_NULL_PATH;
 }
 
 bool IsActionAttached(const Session& session, const Action& action)
@@ -201,11 +279,6 @@ ReadValue ReadBinding(const SimState& state, const Binding& binding)
 {
 	ReadValue result;
 	const ControllerState& controller = binding.input.left ? state.left : state.right;
-	if (binding.input.kind == InputKind::Pose && binding.input.head)
-	{
-		result.active = state.head.positionValid && state.head.orientationValid;
-		return result;
-	}
 	result.active = controller.active;
 	switch (binding.input.kind)
 	{
@@ -249,26 +322,6 @@ bool IsSupportedActionType(XrActionType type)
 	return type == XR_ACTION_TYPE_BOOLEAN_INPUT || type == XR_ACTION_TYPE_FLOAT_INPUT || type == XR_ACTION_TYPE_VECTOR2F_INPUT || type == XR_ACTION_TYPE_POSE_INPUT || type == XR_ACTION_TYPE_VIBRATION_OUTPUT;
 }
 
-bool BindingTypeCompatible(InputKind kind, XrActionType actionType)
-{
-	switch (kind)
-	{
-	case InputKind::Button:
-	case InputKind::Touch:
-	case InputKind::Trigger:
-	case InputKind::Squeeze:
-	case InputKind::ThumbstickX:
-	case InputKind::ThumbstickY:
-		return actionType == XR_ACTION_TYPE_BOOLEAN_INPUT || actionType == XR_ACTION_TYPE_FLOAT_INPUT;
-	case InputKind::Thumbstick:
-		return actionType == XR_ACTION_TYPE_VECTOR2F_INPUT;
-	case InputKind::Pose:
-		return actionType == XR_ACTION_TYPE_POSE_INPUT;
-	case InputKind::Haptic:
-		return actionType == XR_ACTION_TYPE_VIBRATION_OUTPUT;
-	}
-	return false;
-}
 
 bool MatchesSubaction(const Binding& binding, XrPath subactionPath)
 {
@@ -289,25 +342,38 @@ ActionSnapshot ReadAction(const Action& action, const SimState& state, XrPath su
 		result.active = result.active || value.active;
 		switch (action.type)
 		{
-		case XR_ACTION_TYPE_BOOLEAN_INPUT:
-			result.booleanValue = result.booleanValue || (booleanBinding ? value.booleanValue : value.floatValue > 0.5f);
-			break;
-		case XR_ACTION_TYPE_FLOAT_INPUT:
-			if (value.active)
+			case XR_ACTION_TYPE_BOOLEAN_INPUT:
 			{
-				result.floatValue = booleanBinding ? (value.booleanValue ? 1.0f : 0.0f) : value.floatValue;
+				if (value.active)
+				{
+					result.booleanValue = result.booleanValue || (booleanBinding ? value.booleanValue : value.floatValue > 0.5f);
+				}
+				break;
 			}
-			break;
-		case XR_ACTION_TYPE_VECTOR2F_INPUT:
-			if (value.active)
+			case XR_ACTION_TYPE_FLOAT_INPUT:
 			{
-				result.vectorValue = value.vectorValue;
+				if (value.active)
+				{
+					result.floatValue = booleanBinding ? (value.booleanValue ? 1.0f : 0.0f) : value.floatValue;
+				}
+				break;
 			}
-			break;
-		case XR_ACTION_TYPE_POSE_INPUT:
-			break;
-		default:
-			break;
+			case XR_ACTION_TYPE_VECTOR2F_INPUT:
+			{
+				if (value.active)
+				{
+					result.vectorValue = value.vectorValue;
+				}
+				break;
+			}
+			case XR_ACTION_TYPE_POSE_INPUT:
+			{
+				break;
+			}
+			default:
+			{
+				break;
+			}
 		}
 	}
 	return result;
@@ -315,22 +381,32 @@ ActionSnapshot ReadAction(const Action& action, const SimState& state, XrPath su
 
 bool Changed(const ActionSnapshot& before, const ActionSnapshot& after, XrActionType type)
 {
-	if (before.active != after.active)
+	if (!before.active || !after.active)
 	{
-		return true;
+		return false;
 	}
 	switch (type)
 	{
-	case XR_ACTION_TYPE_BOOLEAN_INPUT:
-		return before.booleanValue != after.booleanValue;
-	case XR_ACTION_TYPE_FLOAT_INPUT:
-		return before.floatValue != after.floatValue;
-	case XR_ACTION_TYPE_VECTOR2F_INPUT:
-		return before.vectorValue.x != after.vectorValue.x || before.vectorValue.y != after.vectorValue.y;
-	case XR_ACTION_TYPE_POSE_INPUT:
-		return false;
-	default:
-		return false;
+		case XR_ACTION_TYPE_BOOLEAN_INPUT:
+		{
+			return before.booleanValue != after.booleanValue;
+		}
+		case XR_ACTION_TYPE_FLOAT_INPUT:
+		{
+			return before.floatValue != after.floatValue;
+		}
+		case XR_ACTION_TYPE_VECTOR2F_INPUT:
+		{
+			return before.vectorValue.x != after.vectorValue.x || before.vectorValue.y != after.vectorValue.y;
+		}
+		case XR_ACTION_TYPE_POSE_INPUT:
+		{
+			return false;
+		}
+		default:
+		{
+			return false;
+		}
 	}
 }
 
@@ -633,45 +709,40 @@ extern "C" AGENTXR_API XRAPI_ATTR XrResult XRAPI_CALL xrSuggestInteractionProfil
 			{
 				return XR_ERROR_HANDLE_INVALID;
 			}
+			if (binding.action->object->actionSet->everAttached)
+			{
+				return XR_ERROR_ACTIONSETS_ALREADY_ATTACHED;
+			}
 		}
-		const std::string profile = instance->object->PathString(suggestedBindings->interactionProfile);
-		if (profile.empty())
+		const std::string profileName = instance->object->PathString(suggestedBindings->interactionProfile);
+		if (profileName.empty())
 		{
 			return XR_ERROR_PATH_INVALID;
 		}
-		if (profile != kProfilePath)
+		const CoreProfile* profile = FindProfile(profileName);
+		if (profile == nullptr)
 		{
-			return XR_SUCCESS;
+			return XR_ERROR_PATH_UNSUPPORTED;
 		}
 		std::vector<std::pair<XrAction, XrPath>> bindings;
 		bindings.reserve(suggestedBindings->countSuggestedBindings);
 		for (uint32_t index = 0; index < suggestedBindings->countSuggestedBindings; ++index)
 		{
 			const XrActionSuggestedBinding& binding = suggestedBindings->suggestedBindings[index];
-			InputRef input;
-			const bool pose = IsPosePath(*instance->object, binding.binding);
-			const bool value = IsSupportedInputPath(*instance->object, binding.binding, input);
-			if (!pose && !value)
+			const std::string path = instance->object->PathString(binding.binding);
+			if (path.empty())
 			{
-				continue;
+				return XR_ERROR_PATH_INVALID;
 			}
-			if (pose)
+			if (!ProfilePathSupported(*profile, path))
 			{
-				input = {};
-				input.kind = InputKind::Pose;
-				const std::string path = instance->object->PathString(binding.binding);
-				input.head = path == kHeadPath;
-				input.left = path.find(kLeftPath) == 0;
+				return XR_ERROR_PATH_UNSUPPORTED;
 			}
-			if (!BindingTypeCompatible(pose ? InputKind::Pose : input.kind, binding.action->object->type))
+			const std::pair<XrAction, XrPath> entry{binding.action, binding.binding};
+			if (std::find(bindings.begin(), bindings.end(), entry) == bindings.end())
 			{
-				return XR_ERROR_ACTION_TYPE_MISMATCH;
+				bindings.push_back(entry);
 			}
-			if (std::find(bindings.begin(), bindings.end(), std::pair<XrAction, XrPath>{binding.action, binding.binding}) != bindings.end())
-			{
-				continue;
-			}
-			bindings.emplace_back(binding.action, binding.binding);
 		}
 		{
 			std::lock_guard lock(instance->object->mutex);
@@ -708,7 +779,6 @@ extern "C" AGENTXR_API XRAPI_ATTR XrResult XRAPI_CALL xrAttachSessionActionSets(
 		}
 		const XrPath leftPath = owner.instance->InternPath(kLeftPath);
 		const XrPath rightPath = owner.instance->InternPath(kRightPath);
-		const XrPath headPath = owner.instance->InternPath(kHeadPath);
 		std::lock_guard lock(owner.mutex);
 		if (owner.actionSetsAttached)
 		{
@@ -740,21 +810,17 @@ extern "C" AGENTXR_API XRAPI_ATTR XrResult XRAPI_CALL xrAttachSessionActionSets(
 					continue;
 				}
 				Binding binding;
-				binding.path = bindingPath;
-				const std::string path = owner.instance->PathString(bindingPath);
-				binding.subactionPath = path.find(kLeftPath) == 0 ? leftPath : path.find(kRightPath) == 0 ? rightPath : headPath;
-				if (IsPosePath(*owner.instance, bindingPath))
-				{
-					binding.input.kind = InputKind::Pose;
-					binding.input.head = path == kHeadPath;
-					binding.input.left = path.find(kLeftPath) == 0;
-				}
-				else if (!IsSupportedInputPath(*owner.instance, bindingPath, binding.input))
+				if (!ResolveTouchPath(*owner.instance, bindingPath, action.type, binding))
 				{
 					continue;
 				}
+				binding.subactionPath = binding.input.left ? leftPath : rightPath;
 				action.bindings.push_back(binding);
 			}
+		}
+		for (XrActionSet actionSet : requested)
+		{
+			actionSet->object->everAttached = true;
 		}
 		owner.actionSetsAttached = true;
 		XrEventDataInteractionProfileChanged profileChanged{XR_TYPE_EVENT_DATA_INTERACTION_PROFILE_CHANGED, nullptr, session};
@@ -775,11 +841,19 @@ extern "C" AGENTXR_API XRAPI_ATTR XrResult XRAPI_CALL xrGetCurrentInteractionPro
 		{
 			return XR_ERROR_VALIDATION_FAILURE;
 		}
-		if (!IsKnownTopLevel(*session->object->instance, topLevelUserPath) || topLevelUserPath == session->object->instance->InternPath(kHeadPath))
+		Session& owner = *session->object;
+		const std::string path = owner.instance->PathString(topLevelUserPath);
+		if (path.empty())
+		{
+			return XR_ERROR_PATH_INVALID;
+		}
+		if (!IsKnownTopLevel(*owner.instance, topLevelUserPath))
 		{
 			return XR_ERROR_PATH_UNSUPPORTED;
 		}
-		interactionProfile->interactionProfile = session->object->instance->InternPath(kProfilePath);
+		const XrPath touch = owner.instance->InternPath(kProfilePath);
+		std::lock_guard lock(owner.mutex);
+		interactionProfile->interactionProfile = owner.actionSetsAttached && (path == kLeftPath || path == kRightPath) && owner.instance->suggestions.contains(touch) ? touch : XR_NULL_PATH;
 		return XR_SUCCESS;
 	});
 }
@@ -798,16 +872,24 @@ extern "C" AGENTXR_API XRAPI_ATTR XrResult XRAPI_CALL xrSyncActions(XrSession se
 		}
 		Session& owner = *session->object;
 		std::lock_guard lock(owner.mutex);
-		if (!owner.IsFocused() || !owner.actionSetsAttached)
+		for (uint32_t index = 0; index < syncInfo->countActiveActionSets; ++index)
+		{
+			const XrActionSet actionSet = syncInfo->activeActionSets[index].actionSet;
+			if (!IsValidActionSet(actionSet) || actionSet->object->instance != owner.instance)
+			{
+				return XR_ERROR_HANDLE_INVALID;
+			}
+		}
+		if (!owner.actionSetsAttached)
 		{
 			return XR_ERROR_ACTIONSET_NOT_ATTACHED;
 		}
 		for (uint32_t index = 0; index < syncInfo->countActiveActionSets; ++index)
 		{
 			const XrActiveActionSet& active = syncInfo->activeActionSets[index];
-			if (!IsValidActionSet(active.actionSet) || std::find(owner.actionSets.begin(), owner.actionSets.end(), active.actionSet) == owner.actionSets.end())
+			if (std::find(owner.actionSets.begin(), owner.actionSets.end(), active.actionSet) == owner.actionSets.end())
 			{
-				return XR_ERROR_HANDLE_INVALID;
+				return XR_ERROR_ACTIONSET_NOT_ATTACHED;
 			}
 			if (active.subactionPath != XR_NULL_PATH && !IsKnownTopLevel(*owner.instance, active.subactionPath))
 			{
@@ -832,6 +914,9 @@ extern "C" AGENTXR_API XRAPI_ATTR XrResult XRAPI_CALL xrSyncActions(XrSession se
 		const SimState state = owner.StateAtLocked(sampleTime);
 		ActionSyncRecord record;
 		record.time = sampleTime;
+		record.focused = owner.IsFocused();
+		record.result = record.focused ? XR_SUCCESS : XR_SESSION_NOT_FOCUSED;
+		std::array<bool, 16> deliveredButtons{};
 		record.leftActive = state.left.active;
 		record.rightActive = state.right.active;
 		record.leftTrigger = state.left.trigger;
@@ -876,12 +961,12 @@ extern "C" AGENTXR_API XRAPI_ATTR XrResult XRAPI_CALL xrSyncActions(XrSession se
 							}
 						}
 					}
-					const ActionSnapshot next = subactionActive ? ReadAction(action, state, subactionPath) : ActionSnapshot{};
+					const ActionSnapshot next = subactionActive && record.focused ? ReadAction(action, state, subactionPath) : ActionSnapshot{};
 					const auto previousIt = action.snapshots.find(subactionPath);
-					const ActionSnapshot previous = previousIt == action.snapshots.end() ? ActionSnapshot{} : previousIt->second;
+					const ActionSnapshot previous = owner.lastSyncTime == 0 || previousIt == action.snapshots.end() ? ActionSnapshot{} : previousIt->second;
 					ActionSnapshot snapshot = next;
 					snapshot.changed = Changed(previous, next, action.type);
-					snapshot.lastChangeTime = snapshot.changed ? sampleTime : previous.lastChangeTime;
+					snapshot.lastChangeTime = !next.active || !previous.active ? 0 : snapshot.changed ? sampleTime : previous.lastChangeTime;
 					action.snapshots[subactionPath] = snapshot;
 					aggregate.active = aggregate.active || snapshot.active;
 					aggregate.booleanValue = aggregate.booleanValue || snapshot.booleanValue;
@@ -890,16 +975,26 @@ extern "C" AGENTXR_API XRAPI_ATTR XrResult XRAPI_CALL xrSyncActions(XrSession se
 						aggregate.floatValue = snapshot.floatValue;
 						aggregate.vectorValue = snapshot.vectorValue;
 					}
-					aggregate.changed = aggregate.changed || snapshot.changed;
-					if (snapshot.changed)
-					{
-						aggregate.lastChangeTime = std::max(aggregate.lastChangeTime, snapshot.lastChangeTime);
-					}
 					if (action.type == XR_ACTION_TYPE_BOOLEAN_INPUT && snapshot.changed)
 					{
 						++record.observedSamples;
+						for (const Binding& binding : action.bindings)
+						{
+							if (MatchesSubaction(binding, subactionPath) && binding.input.kind == InputKind::Button && binding.input.channel < 8)
+							{
+								const ControllerState& before = binding.input.left ? previousState.left : previousState.right;
+								const ControllerState& after = binding.input.left ? state.left : state.right;
+								if (owner.lastSyncFocused && before.active && after.active && before.buttons[binding.input.channel] != after.buttons[binding.input.channel])
+								{
+									deliveredButtons[(binding.input.left ? 0 : 8) + binding.input.channel] = true;
+								}
+							}
+						}
 					}
 				}
+				const ActionSnapshot previousAggregate = owner.lastSyncTime == 0 ? ActionSnapshot{} : action.aggregate;
+				aggregate.changed = Changed(previousAggregate, aggregate, action.type);
+				aggregate.lastChangeTime = !aggregate.active || !previousAggregate.active ? 0 : aggregate.changed ? sampleTime : previousAggregate.lastChangeTime;
 				action.aggregate = aggregate;
 			}
 		}
@@ -926,11 +1021,11 @@ extern "C" AGENTXR_API XRAPI_ATTR XrResult XRAPI_CALL xrSyncActions(XrSession se
 			}
 			for (size_t index = 0; index < 8; ++index)
 			{
-				if (transitionCounts[index] != 0 && previousState.left.buttons[index] != state.left.buttons[index])
+				if (transitionCounts[index] != 0 && deliveredButtons[index])
 				{
 					--transitionCounts[index];
 				}
-				if (transitionCounts[index + 8] != 0 && previousState.right.buttons[index] != state.right.buttons[index])
+				if (transitionCounts[index + 8] != 0 && deliveredButtons[index + 8])
 				{
 					--transitionCounts[index + 8];
 				}
@@ -938,6 +1033,7 @@ extern "C" AGENTXR_API XRAPI_ATTR XrResult XRAPI_CALL xrSyncActions(XrSession se
 			}
 		}
 		owner.lastSyncTime = sampleTime;
+		owner.lastSyncFocused = record.focused;
 		if (collectEvidence)
 		{
 			owner.report.actionSyncs.push_back(record);
@@ -949,7 +1045,7 @@ extern "C" AGENTXR_API XRAPI_ATTR XrResult XRAPI_CALL xrSyncActions(XrSession se
 			owner.report.observedSamples += record.observedSamples;
 			owner.report.unobservedDigitalTransitions += record.unobservedDigitalTransitions;
 		}
-		return XR_SUCCESS;
+		return record.result;
 	});
 }
 
@@ -974,7 +1070,7 @@ extern "C" AGENTXR_API XRAPI_ATTR XrResult XRAPI_CALL xrGetActionStateBoolean(Xr
 		}
 		Action& action = *getInfo->action->object;
 		const auto found = action.snapshots.find(getInfo->subactionPath);
-		const ActionSnapshot& snapshot = found == action.snapshots.end() ? action.aggregate : found->second;
+		const ActionSnapshot snapshot = owner.IsFocused() ? (found == action.snapshots.end() ? action.aggregate : found->second) : ActionSnapshot{};
 		state->currentState = snapshot.booleanValue ? XR_TRUE : XR_FALSE;
 		state->changedSinceLastSync = snapshot.changed ? XR_TRUE : XR_FALSE;
 		state->lastChangeTime = snapshot.lastChangeTime;
@@ -1004,7 +1100,7 @@ extern "C" AGENTXR_API XRAPI_ATTR XrResult XRAPI_CALL xrGetActionStateFloat(XrSe
 		}
 		Action& action = *getInfo->action->object;
 		const auto found = action.snapshots.find(getInfo->subactionPath);
-		const ActionSnapshot& snapshot = found == action.snapshots.end() ? action.aggregate : found->second;
+		const ActionSnapshot snapshot = owner.IsFocused() ? (found == action.snapshots.end() ? action.aggregate : found->second) : ActionSnapshot{};
 		state->currentState = snapshot.floatValue;
 		state->changedSinceLastSync = snapshot.changed ? XR_TRUE : XR_FALSE;
 		state->lastChangeTime = snapshot.lastChangeTime;
@@ -1034,7 +1130,7 @@ extern "C" AGENTXR_API XRAPI_ATTR XrResult XRAPI_CALL xrGetActionStateVector2f(X
 		}
 		Action& action = *getInfo->action->object;
 		const auto found = action.snapshots.find(getInfo->subactionPath);
-		const ActionSnapshot& snapshot = found == action.snapshots.end() ? action.aggregate : found->second;
+		const ActionSnapshot snapshot = owner.IsFocused() ? (found == action.snapshots.end() ? action.aggregate : found->second) : ActionSnapshot{};
 		state->currentState = snapshot.vectorValue;
 		state->changedSinceLastSync = snapshot.changed ? XR_TRUE : XR_FALSE;
 		state->lastChangeTime = snapshot.lastChangeTime;
@@ -1064,7 +1160,7 @@ extern "C" AGENTXR_API XRAPI_ATTR XrResult XRAPI_CALL xrGetActionStatePose(XrSes
 		}
 		Action& action = *getInfo->action->object;
 		const auto found = action.snapshots.find(getInfo->subactionPath);
-		const ActionSnapshot& snapshot = found == action.snapshots.end() ? action.aggregate : found->second;
+		const ActionSnapshot snapshot = owner.IsFocused() ? (found == action.snapshots.end() ? action.aggregate : found->second) : ActionSnapshot{};
 		state->isActive = snapshot.active ? XR_TRUE : XR_FALSE;
 		return XR_SUCCESS;
 	});
@@ -1176,6 +1272,10 @@ extern "C" AGENTXR_API XRAPI_ATTR XrResult XRAPI_CALL xrApplyHapticFeedback(XrSe
 		if (!std::isfinite(vibration->amplitude) || vibration->amplitude < 0.0f || vibration->amplitude > 1.0f || !std::isfinite(vibration->frequency) || vibration->frequency < 0.0f || (vibration->duration < XR_MIN_HAPTIC_DURATION || vibration->duration > 120000000000LL))
 		{
 			return XR_ERROR_VALIDATION_FAILURE;
+		}
+		if (!owner.IsFocused())
+		{
+			return XR_SESSION_NOT_FOCUSED;
 		}
 		HapticRecord record;
 		record.time = owner.instance->clock.Now();
