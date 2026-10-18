@@ -72,6 +72,7 @@ add_library(AgentXRRuntime SHARED
 	src/runtime.cpp
 	src/actions.cpp
 	src/spaces.cpp
+	src/extensions.cpp
 	src/timeline.cpp
 	src/compositor.cpp
 	src/control.cpp)
@@ -92,10 +93,20 @@ target_compile_definitions(agent-xr-smoke PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX X
 target_link_libraries(agent-xr-smoke PRIVATE AgentXROpenXRLoader d3d12 dxgi dxguid windowscodecs ole32 user32 dbghelp)
 set_target_properties(agent-xr-smoke PROPERTIES OUTPUT_NAME agent-xr-smoke RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
-install(TARGETS AgentXRRuntime agent-xr-mcp agent-xr-smoke RUNTIME DESTINATION . LIBRARY DESTINATION . ARCHIVE DESTINATION .)
+add_executable(agent-xr-calibrate tools/calibrate.cpp)
+target_include_directories(agent-xr-calibrate PRIVATE ${AGENTXR_INCLUDE_DIRS})
+target_compile_definitions(agent-xr-calibrate PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX XR_USE_GRAPHICS_API_D3D12 UNICODE _UNICODE WINVER=0x0601 _WIN32_WINNT=0x0601)
+target_link_libraries(agent-xr-calibrate PRIVATE AgentXROpenXRLoader d3d12 dxgi dxguid)
+set_target_properties(agent-xr-calibrate PROPERTIES OUTPUT_NAME agent-xr-calibrate RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+
+install(TARGETS AgentXRRuntime agent-xr-mcp agent-xr-smoke agent-xr-calibrate RUNTIME DESTINATION . LIBRARY DESTINATION . ARCHIVE DESTINATION .)
 install(FILES agent-xr.json DESTINATION .)
 install(FILES launch-agentxr-editor.ps1 DESTINATION .)
 install(FILES src/compositor.hlsl DESTINATION .)
 install(FILES third_party/THIRD_PARTY_NOTICES.txt DESTINATION third_party)
 install(FILES third_party/openxr/LICENSE.txt third_party/nlohmann/LICENSE.MIT DESTINATION third_party)
 install(DIRECTORY examples/ DESTINATION examples)
+
+# The dist profile comes only from calibration (agent-xr-calibrate); the fixture is for agent-xr-smoke only.
+install(FILES profiles/oculus-touch-controller.json DESTINATION profiles OPTIONAL)
+install(FILES tests/fixtures/oculus-touch-controller.json DESTINATION test-fixtures)

@@ -2,7 +2,9 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
+#include <fstream>
 #include <limits>
 
 namespace agentxr
@@ -80,28 +82,8 @@ bool IsAttached(const Session& session, const Action& action)
 	return action.actionSet != nullptr && std::find(session.actionSets.begin(), session.actionSets.end(), action.actionSet->handle) != session.actionSets.end();
 }
 
-TrackedPose PoseFromState(const SimState& state, std::string_view path)
+TrackedPose InvalidPose()
 {
-	if (path == "/user/head")
-	{
-		return state.head;
-	}
-	if (path == "/user/hand/left/input/grip/pose")
-	{
-		return state.leftGrip;
-	}
-	if (path == "/user/hand/left/input/aim/pose")
-	{
-		return state.leftAim;
-	}
-	if (path == "/user/hand/right/input/grip/pose")
-	{
-		return state.rightGrip;
-	}
-	if (path == "/user/hand/right/input/aim/pose")
-	{
-		return state.rightAim;
-	}
 	TrackedPose invalid;
 	invalid.positionValid = false;
 	invalid.orientationValid = false;
@@ -141,21 +123,11 @@ XrPosef WorldReferencePose(const Space& space, XrTime time, const SimState& stat
 					}
 				}
 			}
-			const std::string path = session.instance->PathString(bindingPath);
-			tracked = PoseFromState(state, path);
-			const bool left = path.find("/user/hand/left/") == 0;
-			const bool right = path.find("/user/hand/right/") == 0;
-			if ((left && !state.left.active) || (right && !state.right.active))
-			{
-				tracked.positionValid = false;
-				tracked.orientationValid = false;
-				tracked.positionTracked = false;
-				tracked.orientationTracked = false;
-			}
+			tracked = ResolveInputPose(state, session.instance->PathString(bindingPath));
 			return Compose(ToXrPose(tracked), space.poseInParent);
 		}
 	}
-	tracked = PoseFromState(state, {});
+	tracked = InvalidPose();
 	return Identity();
 }
 
@@ -173,64 +145,261 @@ XrResult ValidateLocateTime(const Session& session, XrTime time)
 	return XR_SUCCESS;
 }
 
-XrResult LocateInternal(Space& space, Space& base, XrTime time, XrSpaceLocation& location)
-{
-	Session& session = *space.session;
-	if (ValidateLocateTime(session, time) != XR_SUCCESS)
-	{
-		return XR_ERROR_TIME_INVALID;
-	}
-	const SimState state = session.StateAt(time);
-	TrackedPose objectTracking;
-	TrackedPose baseTracking;
-	const XrPosef objectWorld = WorldReferencePose(space, time, state, objectTracking);
-	const XrPosef baseWorld = WorldReferencePose(base, time, state, baseTracking);
-	const XrPosef relative = Compose(Inverse(baseWorld), objectWorld);
-	location.pose = relative;
-	location.locationFlags = 0;
-	if (objectTracking.orientationValid && baseTracking.orientationValid)
-	{
-		location.locationFlags |= XR_SPACE_LOCATION_ORIENTATION_VALID_BIT;
-	}
-	if (objectTracking.positionValid && baseTracking.positionValid)
-	{
-		location.locationFlags |= XR_SPACE_LOCATION_POSITION_VALID_BIT;
-	}
-	if (objectTracking.orientationTracked && baseTracking.orientationTracked)
-	{
-		location.locationFlags |= XR_SPACE_LOCATION_ORIENTATION_TRACKED_BIT;
-	}
-	if (objectTracking.positionTracked && baseTracking.positionTracked)
-	{
-		location.locationFlags |= XR_SPACE_LOCATION_POSITION_TRACKED_BIT;
-	}
-	for (auto* next = reinterpret_cast<XrBaseOutStructure*>(location.next); next != nullptr; next = next->next)
-	{
-		if (next->type == XR_TYPE_SPACE_VELOCITY)
-		{
-			auto* velocity = reinterpret_cast<XrSpaceVelocity*>(next);
-			velocity->velocityFlags = 0;
-			velocity->linearVelocity = {0.0f, 0.0f, 0.0f};
-			velocity->angularVelocity = {0.0f, 0.0f, 0.0f};
-			if ((location.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT) != 0)
-			{
-				velocity->velocityFlags |= XR_SPACE_VELOCITY_LINEAR_VALID_BIT;
-			}
-			if ((location.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT) != 0)
-			{
-				velocity->velocityFlags |= XR_SPACE_VELOCITY_ANGULAR_VALID_BIT;
-			}
-		}
-	}
-	return XR_SUCCESS;
-}
-
 bool ValidReferenceType(const Session& session, XrReferenceSpaceType type)
 {
 	return type == XR_REFERENCE_SPACE_TYPE_VIEW || type == XR_REFERENCE_SPACE_TYPE_LOCAL || type == XR_REFERENCE_SPACE_TYPE_STAGE || (type == XR_REFERENCE_SPACE_TYPE_LOCAL_FLOOR && session.instance->localFloorEnabled);
 }
 
 } // namespace
+
+namespace
+{
+constexpr XrDuration kVelocityHalfWindowNs = 500000;
+constexpr std::string_view kProfileFile = "oculus-touch-controller.json";
+constexpr std::string_view kProfileInteraction = "/interaction_profiles/oculus/touch_controller";
+constexpr std::string_view kCalibrationHint = "measure it on a machine with a physical OpenXR runtime and Touch controllers: agent-xr-calibrate --out <this path> (see agent-xr/README.md, \"Device profile\")";
+
+std::mutex gProfileMutex;
+std::optional<DeviceProfile> gProfile;
+
+std::filesystem::path ProfilePath(bool& fromEnvironment)
+{
+	std::vector<wchar_t> buffer(32768);
+	const DWORD overrideLength = GetEnvironmentVariableW(L"AGENTXR_DEVICE_PROFILE", buffer.data(), static_cast<DWORD>(buffer.size()));
+	fromEnvironment = overrideLength > 0;
+	if (fromEnvironment)
+	{
+		return overrideLength < buffer.size() ? std::filesystem::path(buffer.data(), buffer.data() + overrideLength) : std::filesystem::path();
+	}
+	HMODULE module = nullptr;
+	if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, reinterpret_cast<LPCWSTR>(&ProfilePath), &module))
+	{
+		return {};
+	}
+	const DWORD length = GetModuleFileNameW(module, buffer.data(), static_cast<DWORD>(buffer.size()));
+	if (length == 0 || length >= buffer.size())
+	{
+		return {};
+	}
+	return std::filesystem::path(buffer.data(), buffer.data() + length).parent_path() / "profiles" / std::string(kProfileFile);
+}
+
+bool ParseProfilePose(const protocol::Json& value, XrPosef& pose)
+{
+	if (!value.is_object() || !value.contains("position") || !value.contains("orientation"))
+	{
+		return false;
+	}
+	const protocol::Json& position = value.at("position");
+	const protocol::Json& orientation = value.at("orientation");
+	if (!position.is_array() || position.size() != 3 || !orientation.is_array() || orientation.size() != 4)
+	{
+		return false;
+	}
+	double p[3]{};
+	double q[4]{};
+	for (size_t index = 0; index < 3; ++index)
+	{
+		if (!position[index].is_number())
+		{
+			return false;
+		}
+		p[index] = position[index].get<double>();
+		if (!std::isfinite(p[index]))
+		{
+			return false;
+		}
+	}
+	for (size_t index = 0; index < 4; ++index)
+	{
+		if (!orientation[index].is_number())
+		{
+			return false;
+		}
+		q[index] = orientation[index].get<double>();
+		if (!std::isfinite(q[index]))
+		{
+			return false;
+		}
+	}
+	const double length = std::sqrt(q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]);
+	if (std::fabs(length - 1.0) > 0.01)
+	{
+		return false;
+	}
+	pose.position = {static_cast<float>(p[0]), static_cast<float>(p[1]), static_cast<float>(p[2])};
+	pose.orientation = {static_cast<float>(q[0] / length), static_cast<float>(q[1] / length), static_cast<float>(q[2] / length), static_cast<float>(q[3] / length)};
+	return true;
+}
+
+bool ParseProfileHand(const protocol::Json& root, const char* key, HandProfile& hand)
+{
+	return root.contains(key) && root.at(key).is_object() && ParseProfilePose(root.at(key).value("aimFromGrip", protocol::Json()), hand.aimFromGrip) && ParseProfilePose(root.at(key).value("palmFromGrip", protocol::Json()), hand.palmFromGrip);
+}
+
+bool ParseProfile(const protocol::Json& root, DeviceProfile& profile)
+{
+	return root.is_object() && root.value("interactionProfile", std::string()) == kProfileInteraction && root.contains("source") && root.at("source").is_object() && ParseProfileHand(root, "left", profile.left) && ParseProfileHand(root, "right", profile.right);
+}
+
+void LogProfileFailure(const std::filesystem::path& path, bool fromEnvironment, std::string_view reason)
+{
+	const std::string message = "AgentXR: device profile " + std::string(reason) + ": " + path.string() + (fromEnvironment ? " (from AGENTXR_DEVICE_PROFILE)" : " (default location beside the runtime DLL)") + "; " + std::string(kCalibrationHint) + "\n";
+	std::fputs(message.c_str(), stderr);
+	OutputDebugStringA(message.c_str());
+}
+
+XrQuaternionf Normalized(const XrQuaternionf& value)
+{
+	const float length = std::sqrt(value.x * value.x + value.y * value.y + value.z * value.z + value.w * value.w);
+	return {value.x / length, value.y / length, value.z / length, value.w / length};
+}
+
+void SampleRelative(Space& space, Space& base, XrTime time, XrPosef& pose, XrSpaceLocationFlags& flags)
+{
+	const SimState state = space.session->StateAt(time);
+	TrackedPose objectTracking;
+	TrackedPose baseTracking;
+	const XrPosef objectWorld = WorldReferencePose(space, time, state, objectTracking);
+	const XrPosef baseWorld = WorldReferencePose(base, time, state, baseTracking);
+	pose = Compose(Inverse(baseWorld), objectWorld);
+	flags = 0;
+	if (objectTracking.orientationValid && baseTracking.orientationValid)
+	{
+		flags |= XR_SPACE_LOCATION_ORIENTATION_VALID_BIT;
+	}
+	if (objectTracking.positionValid && baseTracking.positionValid)
+	{
+		flags |= XR_SPACE_LOCATION_POSITION_VALID_BIT;
+	}
+	if (objectTracking.orientationTracked && baseTracking.orientationTracked)
+	{
+		flags |= XR_SPACE_LOCATION_ORIENTATION_TRACKED_BIT;
+	}
+	if (objectTracking.positionTracked && baseTracking.positionTracked)
+	{
+		flags |= XR_SPACE_LOCATION_POSITION_TRACKED_BIT;
+	}
+}
+
+TrackedPose ComposeTracked(const TrackedPose& grip, const XrPosef& offset)
+{
+	TrackedPose result = FromXrPose(Compose(ToXrPose(grip), offset));
+	result.positionValid = grip.positionValid;
+	result.orientationValid = grip.orientationValid;
+	result.positionTracked = grip.positionTracked;
+	result.orientationTracked = grip.orientationTracked;
+	return result;
+}
+} // namespace
+
+bool LoadDeviceProfile()
+{
+	bool fromEnvironment = false;
+	const std::filesystem::path path = ProfilePath(fromEnvironment);
+	std::ifstream file(path, std::ios::binary);
+	if (!file)
+	{
+		LogProfileFailure(path, fromEnvironment, "missing");
+		return false;
+	}
+	const protocol::Json root = protocol::Json::parse(file, nullptr, false);
+	DeviceProfile profile;
+	if (root.is_discarded() || !ParseProfile(root, profile))
+	{
+		LogProfileFailure(path, fromEnvironment, "invalid");
+		return false;
+	}
+	std::lock_guard lock(gProfileMutex);
+	gProfile = profile;
+	return true;
+}
+
+DeviceProfile GetDeviceProfile()
+{
+	std::lock_guard lock(gProfileMutex);
+	return gProfile.value();
+}
+
+TrackedPose ResolveInputPose(const SimState& state, std::string_view path)
+{
+	if (path == "/user/head")
+	{
+		return state.head;
+	}
+	constexpr std::string_view leftPrefix = "/user/hand/left/input/";
+	constexpr std::string_view rightPrefix = "/user/hand/right/input/";
+	const bool left = path.starts_with(leftPrefix);
+	if (!left && !path.starts_with(rightPrefix))
+	{
+		return InvalidPose();
+	}
+	if (!(left ? state.left : state.right).active)
+	{
+		return InvalidPose();
+	}
+	const std::string_view input = path.substr(left ? leftPrefix.size() : rightPrefix.size());
+	const TrackedPose& grip = left ? state.leftGrip : state.rightGrip;
+	if (input == "grip/pose")
+	{
+		return grip;
+	}
+	const DeviceProfile profile = GetDeviceProfile();
+	const HandProfile& hand = left ? profile.left : profile.right;
+	if (input == "aim/pose")
+	{
+		return ComposeTracked(grip, hand.aimFromGrip);
+	}
+	if (input == "palm_ext/pose" || input == "grip_surface/pose")
+	{
+		return ComposeTracked(grip, hand.palmFromGrip);
+	}
+	return InvalidPose();
+}
+
+XrResult LocateRelative(Space& space, Space& base, XrTime time, bool withVelocity, RelativeMotion& motion)
+{
+	if (ValidateLocateTime(*space.session, time) != XR_SUCCESS)
+	{
+		return XR_ERROR_TIME_INVALID;
+	}
+	motion = {};
+	SampleRelative(space, base, time, motion.pose, motion.locationFlags);
+	if (!withVelocity)
+	{
+		return XR_SUCCESS;
+	}
+	XrPosef before;
+	XrPosef after;
+	XrSpaceLocationFlags beforeFlags = 0;
+	XrSpaceLocationFlags afterFlags = 0;
+	SampleRelative(space, base, time - kVelocityHalfWindowNs, before, beforeFlags);
+	SampleRelative(space, base, time + kVelocityHalfWindowNs, after, afterFlags);
+	const XrSpaceLocationFlags valid = motion.locationFlags & beforeFlags & afterFlags;
+	const float seconds = static_cast<float>(2 * kVelocityHalfWindowNs) * 1.0e-9f;
+	if ((valid & XR_SPACE_LOCATION_POSITION_VALID_BIT) != 0)
+	{
+		motion.velocityFlags |= XR_SPACE_VELOCITY_LINEAR_VALID_BIT;
+		motion.linearVelocity = {(after.position.x - before.position.x) / seconds, (after.position.y - before.position.y) / seconds, (after.position.z - before.position.z) / seconds};
+	}
+	if ((valid & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT) != 0)
+	{
+		motion.velocityFlags |= XR_SPACE_VELOCITY_ANGULAR_VALID_BIT;
+		// Rotation taking the earlier orientation to the later one, expressed in the base frame.
+		XrQuaternionf delta = Normalized(Multiply(after.orientation, Conjugate(before.orientation)));
+		if (delta.w < 0.0f)
+		{
+			delta = {-delta.x, -delta.y, -delta.z, -delta.w};
+		}
+		const float sine = std::sqrt(delta.x * delta.x + delta.y * delta.y + delta.z * delta.z);
+		if (sine > 0.0f)
+		{
+			const float scale = 2.0f * std::atan2(sine, delta.w) / (sine * seconds);
+			motion.angularVelocity = {delta.x * scale, delta.y * scale, delta.z * scale};
+		}
+	}
+	return XR_SUCCESS;
+}
 
 extern "C" AGENTXR_API XRAPI_ATTR XrResult XRAPI_CALL xrEnumerateReferenceSpaces(XrSession session, uint32_t capacity, uint32_t* count, XrReferenceSpaceType* spaces)
 {
@@ -378,7 +547,93 @@ extern "C" AGENTXR_API XRAPI_ATTR XrResult XRAPI_CALL xrLocateSpace(XrSpace spac
 		{
 			return XR_ERROR_VALIDATION_FAILURE;
 		}
-		return LocateInternal(*space->object, *baseSpace->object, time, *location);
+		XrSpaceVelocity* velocity = nullptr;
+		for (auto* next = reinterpret_cast<XrBaseOutStructure*>(location->next); next != nullptr; next = next->next)
+		{
+			if (next->type == XR_TYPE_SPACE_VELOCITY)
+			{
+				velocity = reinterpret_cast<XrSpaceVelocity*>(next);
+			}
+		}
+		RelativeMotion motion;
+		const XrResult located = LocateRelative(*space->object, *baseSpace->object, time, velocity != nullptr, motion);
+		if (located != XR_SUCCESS)
+		{
+			return located;
+		}
+		location->pose = motion.pose;
+		location->locationFlags = motion.locationFlags;
+		if (velocity != nullptr)
+		{
+			velocity->velocityFlags = motion.velocityFlags;
+			velocity->linearVelocity = motion.linearVelocity;
+			velocity->angularVelocity = motion.angularVelocity;
+		}
+		return XR_SUCCESS;
+	});
+}
+
+extern "C" AGENTXR_API XRAPI_ATTR XrResult XRAPI_CALL xrLocateSpaces(XrSession session, const XrSpacesLocateInfo* locateInfo, XrSpaceLocations* spaceLocations)
+{
+	return GuardResult([&]() -> XrResult
+	{
+		if (!IsValidSession(session))
+		{
+			return XR_ERROR_HANDLE_INVALID;
+		}
+		if (CheckType(locateInfo, XR_TYPE_SPACES_LOCATE_INFO) != XR_SUCCESS || CheckOutput(spaceLocations, XR_TYPE_SPACE_LOCATIONS) != XR_SUCCESS)
+		{
+			return XR_ERROR_VALIDATION_FAILURE;
+		}
+		if (locateInfo->spaceCount == 0 || locateInfo->spaces == nullptr || spaceLocations->locationCount != locateInfo->spaceCount || spaceLocations->locations == nullptr)
+		{
+			return XR_ERROR_VALIDATION_FAILURE;
+		}
+		XrSpaceVelocities* velocities = nullptr;
+		for (auto* next = reinterpret_cast<XrBaseOutStructure*>(spaceLocations->next); next != nullptr; next = next->next)
+		{
+			if (next->type == XR_TYPE_SPACE_VELOCITIES)
+			{
+				velocities = reinterpret_cast<XrSpaceVelocities*>(next);
+			}
+		}
+		if (velocities != nullptr && (velocities->velocityCount != locateInfo->spaceCount || velocities->velocities == nullptr))
+		{
+			return XR_ERROR_VALIDATION_FAILURE;
+		}
+		if (!IsValidSpace(locateInfo->baseSpace) || locateInfo->baseSpace->object->session != session->object)
+		{
+			return XR_ERROR_HANDLE_INVALID;
+		}
+		for (uint32_t index = 0; index < locateInfo->spaceCount; ++index)
+		{
+			if (!IsValidSpace(locateInfo->spaces[index]) || locateInfo->spaces[index]->object->session != session->object)
+			{
+				return XR_ERROR_HANDLE_INVALID;
+			}
+		}
+		if (ValidateLocateTime(*session->object, locateInfo->time) != XR_SUCCESS)
+		{
+			return XR_ERROR_TIME_INVALID;
+		}
+		for (uint32_t index = 0; index < locateInfo->spaceCount; ++index)
+		{
+			RelativeMotion motion;
+			const XrResult located = LocateRelative(*locateInfo->spaces[index]->object, *locateInfo->baseSpace->object, locateInfo->time, velocities != nullptr, motion);
+			if (located != XR_SUCCESS)
+			{
+				return located;
+			}
+			spaceLocations->locations[index].locationFlags = motion.locationFlags;
+			spaceLocations->locations[index].pose = motion.pose;
+			if (velocities != nullptr)
+			{
+				velocities->velocities[index].velocityFlags = motion.velocityFlags;
+				velocities->velocities[index].linearVelocity = motion.linearVelocity;
+				velocities->velocities[index].angularVelocity = motion.angularVelocity;
+			}
+		}
+		return XR_SUCCESS;
 	});
 }
 

@@ -428,6 +428,10 @@ private:
 class OpenXR
 {
 public:
+	// Set before Load: the OpenXR API version the application requests and the extensions it enables.
+	XrVersion apiVersion = XR_API_VERSION_1_0;
+	std::vector<const char*> extensions = {XR_KHR_D3D12_ENABLE_EXTENSION_NAME, XR_EXT_LOCAL_FLOOR_EXTENSION_NAME};
+
 	~OpenXR()
 	{
 		DestroySessionOnly();
@@ -532,42 +536,29 @@ public:
 		{
 			return false;
 		}
-		bool haveD3D12 = false;
-		bool haveLocalFloor = false;
-		for (const XrExtensionProperties& property : available)
+		for (const char* required : extensions)
 		{
-			haveD3D12 = haveD3D12 || std::strcmp(property.extensionName, XR_KHR_D3D12_ENABLE_EXTENSION_NAME) == 0;
-			haveLocalFloor = haveLocalFloor || std::strcmp(property.extensionName, XR_EXT_LOCAL_FLOOR_EXTENSION_NAME) == 0;
+			const bool found = std::any_of(available.begin(), available.end(), [&](const XrExtensionProperties& property)
+			{
+				return std::strcmp(property.extensionName, required) == 0;
+			});
+			if (!found)
+			{
+				std::cerr << "required extension missing: " << required << '\n';
+				return false;
+			}
 		}
-		if (!haveD3D12 || !haveLocalFloor)
-		{
-			std::cerr << "required extension missing\n";
-			return false;
-		}
-		const char* extensions[] = {XR_KHR_D3D12_ENABLE_EXTENSION_NAME, XR_EXT_LOCAL_FLOOR_EXTENSION_NAME};
 		XrApplicationInfo application{};
 		std::strcpy(application.applicationName, "AgentXR Smoke");
 		std::strcpy(application.engineName, "AgentXR");
 		application.applicationVersion = 1;
 		application.engineVersion = 1;
+		application.apiVersion = apiVersion;
 		XrInstanceCreateInfo createInfo{XR_TYPE_INSTANCE_CREATE_INFO};
 		createInfo.applicationInfo = application;
-		createInfo.enabledExtensionCount = static_cast<uint32_t>(std::size(extensions));
-		createInfo.enabledExtensionNames = extensions;
-		createInfo.applicationInfo.apiVersion = XR_MAKE_VERSION(1, 1, 0);
-		XrResult result = xrCreateInstance(&createInfo, &instance);
-		if (result != XR_ERROR_API_VERSION_UNSUPPORTED)
-		{
-			if (result == XR_SUCCESS)
-			{
-				xrDestroyInstance(instance);
-				instance = XR_NULL_HANDLE;
-			}
-			return Expect(result, XR_ERROR_API_VERSION_UNSUPPORTED, "API 1.1 fallback probe");
-		}
-		apiFallbackObserved = true;
-		createInfo.applicationInfo.apiVersion = XR_API_VERSION_1_0;
-		return Check(xrCreateInstance(&createInfo, &instance), "create API 1.0 instance");
+		createInfo.enabledExtensionCount = static_cast<uint32_t>(extensions.size());
+		createInfo.enabledExtensionNames = extensions.data();
+		return Check(xrCreateInstance(&createInfo, &instance), "create instance");
 	}
 
 	bool LoadFunctions()
@@ -629,11 +620,6 @@ public:
 
 	bool InitializeGraphics(bool createDefaultResources = true)
 	{
-		if (!apiFallbackObserved)
-		{
-			std::cerr << "initialize graphics: API 1.1 fallback not observed\n";
-			return false;
-		}
 		if (!graphics.Initialize())
 		{
 			std::cerr << "initialize graphics: D3D12 initialization failed\n";
@@ -1776,6 +1762,67 @@ public:
 		return Check(xrCreateActionSpace(session, &space, &rightGripSpace), "fidelity grip space") && CreateSwapchain();
 	}
 
+	bool PreparePoseModel()
+	{
+		XrActionSetCreateInfo setInfo{XR_TYPE_ACTION_SET_CREATE_INFO};
+		std::strcpy(setInfo.actionSetName, "pose_model");
+		std::strcpy(setInfo.localizedActionSetName, "Pose Model");
+		if (!Check(xrCreateActionSet(instance, &setInfo, &actionSet), "create pose model set"))
+		{
+			return false;
+		}
+		rightPath = Path("/user/hand/right");
+		const auto create = [&](const char* name, XrAction& output)
+		{
+			XrActionCreateInfo info{XR_TYPE_ACTION_CREATE_INFO};
+			std::strcpy(info.actionName, name);
+			std::strcpy(info.localizedActionName, name);
+			info.actionType = XR_ACTION_TYPE_POSE_INPUT;
+			info.countSubactionPaths = 1;
+			info.subactionPaths = &rightPath;
+			return Check(xrCreateAction(actionSet, &info, &output), name);
+		};
+		if (!create("grip", poseAction) || !create("aim", aimPoseAction))
+		{
+			return false;
+		}
+		const XrActionSuggestedBinding bindings[] = {
+			{poseAction, Path("/user/hand/right/input/grip/pose")},
+			{aimPoseAction, Path("/user/hand/right/input/aim/pose")}};
+		XrInteractionProfileSuggestedBinding suggestions{XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING};
+		suggestions.interactionProfile = Path("/interaction_profiles/oculus/touch_controller");
+		suggestions.countSuggestedBindings = static_cast<uint32_t>(std::size(bindings));
+		suggestions.suggestedBindings = bindings;
+		XrSessionActionSetsAttachInfo attach{XR_TYPE_SESSION_ACTION_SETS_ATTACH_INFO};
+		attach.countActionSets = 1;
+		attach.actionSets = &actionSet;
+		if (!Check(xrSuggestInteractionProfileBindings(instance, &suggestions), "pose model suggestions") ||
+			!Check(xrAttachSessionActionSets(session, &attach), "attach pose model set"))
+		{
+			return false;
+		}
+		XrActionSpaceCreateInfo space{XR_TYPE_ACTION_SPACE_CREATE_INFO};
+		space.subactionPath = rightPath;
+		space.poseInActionSpace = {{0.0f, 0.0f, 0.0f, 1.0f}, {0.0f, 0.0f, 0.0f}};
+		space.action = poseAction;
+		if (!Check(xrCreateActionSpace(session, &space, &rightGripSpace), "pose model grip space"))
+		{
+			return false;
+		}
+		space.action = aimPoseAction;
+		return Check(xrCreateActionSpace(session, &space, &rightAimSpace), "pose model aim space") && CreateSwapchain();
+	}
+
+	// Stage space: timeline positions are floor-relative, while LOCAL is anchored at the initial head pose.
+	bool LocateRightPoseSpaces(XrTime time, XrSpaceLocation& grip, XrSpaceVelocity& gripVelocity, XrSpaceLocation& aim)
+	{
+		gripVelocity = {XR_TYPE_SPACE_VELOCITY};
+		grip = {XR_TYPE_SPACE_LOCATION};
+		grip.next = &gripVelocity;
+		aim = {XR_TYPE_SPACE_LOCATION};
+		return Check(xrLocateSpace(rightGripSpace, stageSpace, time, &grip), "pose model locate grip") && Check(xrLocateSpace(rightAimSpace, stageSpace, time, &aim), "pose model locate aim");
+	}
+
 	bool ReadFidelity(FidelityState& output)
 	{
 		XrActionStateGetInfo info{XR_TYPE_ACTION_STATE_GET_INFO};
@@ -2077,9 +2124,346 @@ public:
 		return session == XR_NULL_HANDLE;
 	}
 
-	bool HasApiFallback() const
+	// Core 1.1 functions need a 1.1 instance; extension functions need their extension enabled.
+	bool CheckInstanceGates(bool version11, bool extensionsEnabled)
 	{
-		return apiFallbackObserved;
+		const auto gate = [&](const char* name, bool expected)
+		{
+			PFN_xrVoidFunction function = nullptr;
+			const XrResult result = getInstanceProcAddr(instance, name, &function);
+			if (expected)
+			{
+				return Check(result, name) && function != nullptr;
+			}
+			return Expect(result, XR_ERROR_FUNCTION_UNSUPPORTED, name);
+		};
+		return gate("xrLocateSpaces", version11) && gate("xrLocateSpacesKHR", extensionsEnabled) && gate("xrGetVisibilityMaskKHR", false) && gate("xrCreateHandTrackerEXT", extensionsEnabled) && gate("xrDestroyHandTrackerEXT", extensionsEnabled) && gate("xrLocateHandJointsEXT", extensionsEnabled);
+	}
+
+	bool CheckApiVersionRejected()
+	{
+		const char* names[] = {XR_KHR_D3D12_ENABLE_EXTENSION_NAME};
+		XrInstanceCreateInfo createInfo{XR_TYPE_INSTANCE_CREATE_INFO};
+		std::strcpy(createInfo.applicationInfo.applicationName, "AgentXR Smoke");
+		std::strcpy(createInfo.applicationInfo.engineName, "AgentXR");
+		createInfo.applicationInfo.applicationVersion = 1;
+		createInfo.applicationInfo.engineVersion = 1;
+		createInfo.applicationInfo.apiVersion = XR_MAKE_VERSION(1, 2, 0);
+		createInfo.enabledExtensionCount = 1;
+		createInfo.enabledExtensionNames = names;
+		XrInstance rejected = XR_NULL_HANDLE;
+		return Expect(xrCreateInstance(&createInfo, &rejected), XR_ERROR_API_VERSION_UNSUPPORTED, "API 1.2 instance");
+	}
+
+	// The runtime has no lens, so it has no visibility mask to report: the extension is not advertised.
+	bool CheckVisibilityMaskNotPresent()
+	{
+		uint32_t count = 0;
+		if (!Check(xrEnumerateInstanceExtensionProperties(nullptr, 0, &count, nullptr), "enumerate extensions count"))
+		{
+			return false;
+		}
+		std::vector<XrExtensionProperties> available(count, {XR_TYPE_EXTENSION_PROPERTIES});
+		if (!Check(xrEnumerateInstanceExtensionProperties(nullptr, count, &count, available.data()), "enumerate extensions"))
+		{
+			return false;
+		}
+		for (const XrExtensionProperties& property : available)
+		{
+			if (std::strcmp(property.extensionName, XR_KHR_VISIBILITY_MASK_EXTENSION_NAME) == 0)
+			{
+				std::cerr << "visibility mask extension is advertised\n";
+				return false;
+			}
+		}
+		return true;
+	}
+
+	// grip_surface needs API 1.1 (or XR_KHR_maintenance1), palm_ext needs XR_EXT_palm_pose, the eye gaze profile needs XR_EXT_eye_gaze_interaction.
+	// Must run before the first attach: it replaces the touch controller suggestion.
+	bool CheckPosePathContracts(bool gripSurface, bool palm, bool eyeGaze)
+	{
+		XrActionSetCreateInfo setInfo{XR_TYPE_ACTION_SET_CREATE_INFO};
+		std::strcpy(setInfo.actionSetName, "path_contracts");
+		std::strcpy(setInfo.localizedActionSetName, "Path Contracts");
+		XrActionSet paths = XR_NULL_HANDLE;
+		if (!Check(xrCreateActionSet(instance, &setInfo, &paths), "create path contract set"))
+		{
+			return false;
+		}
+		XrActionCreateInfo actionInfo{XR_TYPE_ACTION_CREATE_INFO};
+		std::strcpy(actionInfo.actionName, "pose");
+		std::strcpy(actionInfo.localizedActionName, "Pose");
+		actionInfo.actionType = XR_ACTION_TYPE_POSE_INPUT;
+		XrAction pose = XR_NULL_HANDLE;
+		if (!Check(xrCreateAction(paths, &actionInfo, &pose), "create path contract action"))
+		{
+			xrDestroyActionSet(paths);
+			return false;
+		}
+		const auto suggest = [&](const char* profile, const char* path, XrResult expected)
+		{
+			const XrActionSuggestedBinding binding{pose, Path(path)};
+			XrInteractionProfileSuggestedBinding suggestions{XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING};
+			suggestions.interactionProfile = Path(profile);
+			suggestions.countSuggestedBindings = 1;
+			suggestions.suggestedBindings = &binding;
+			return Expect(xrSuggestInteractionProfileBindings(instance, &suggestions), expected, path);
+		};
+		const char* touch = "/interaction_profiles/oculus/touch_controller";
+		const bool passed = suggest(touch, "/user/hand/right/input/grip/pose", XR_SUCCESS) &&
+			suggest(touch, "/user/hand/right/input/grip_surface/pose", gripSurface ? XR_SUCCESS : XR_ERROR_PATH_UNSUPPORTED) &&
+			suggest(touch, "/user/hand/right/input/palm_ext/pose", palm ? XR_SUCCESS : XR_ERROR_PATH_UNSUPPORTED) &&
+			(!eyeGaze || suggest("/interaction_profiles/ext/eye_gaze_interaction", "/user/eyes_ext/input/gaze_ext/pose", XR_SUCCESS));
+		xrDestroyActionSet(paths);
+		return passed;
+	}
+
+	// actionSet (priority 1) holds the grip pose and a trigger action; lowActionSet (priority 0) binds the same trigger plus an unrelated squeeze.
+	bool PrepareOpenXr11()
+	{
+		const auto createSet = [&](const char* name, uint32_t priority, XrActionSet& output)
+		{
+			XrActionSetCreateInfo info{XR_TYPE_ACTION_SET_CREATE_INFO};
+			std::strcpy(info.actionSetName, name);
+			std::strcpy(info.localizedActionSetName, name);
+			info.priority = priority;
+			return Check(xrCreateActionSet(instance, &info, &output), name);
+		};
+		const auto createAction = [&](XrActionSet owner, const char* name, XrActionType type, XrAction& output)
+		{
+			XrActionCreateInfo info{XR_TYPE_ACTION_CREATE_INFO};
+			std::strcpy(info.actionName, name);
+			std::strcpy(info.localizedActionName, name);
+			info.actionType = type;
+			return Check(xrCreateAction(owner, &info, &output), name);
+		};
+		if (!createSet("high_priority", 1, actionSet) || !createSet("low_priority", 0, lowActionSet) ||
+			!createAction(actionSet, "grip", XR_ACTION_TYPE_POSE_INPUT, poseAction) ||
+			!createAction(actionSet, "high_trigger", XR_ACTION_TYPE_FLOAT_INPUT, highTriggerAction) ||
+			!createAction(lowActionSet, "low_trigger", XR_ACTION_TYPE_FLOAT_INPUT, lowTriggerAction) ||
+			!createAction(lowActionSet, "low_squeeze", XR_ACTION_TYPE_FLOAT_INPUT, lowSqueezeAction))
+		{
+			return false;
+		}
+		const XrActionSuggestedBinding bindings[] = {
+			{poseAction, Path("/user/hand/right/input/grip/pose")},
+			{highTriggerAction, Path("/user/hand/right/input/trigger/value")},
+			{lowTriggerAction, Path("/user/hand/right/input/trigger/value")},
+			{lowSqueezeAction, Path("/user/hand/right/input/squeeze/value")}};
+		XrInteractionProfileSuggestedBinding suggestions{XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING};
+		suggestions.interactionProfile = Path("/interaction_profiles/oculus/touch_controller");
+		suggestions.countSuggestedBindings = static_cast<uint32_t>(std::size(bindings));
+		suggestions.suggestedBindings = bindings;
+		const XrActionSet sets[] = {actionSet, lowActionSet};
+		XrSessionActionSetsAttachInfo attach{XR_TYPE_SESSION_ACTION_SETS_ATTACH_INFO};
+		attach.countActionSets = static_cast<uint32_t>(std::size(sets));
+		attach.actionSets = sets;
+		if (!Check(xrSuggestInteractionProfileBindings(instance, &suggestions), "priority suggestions") || !Check(xrAttachSessionActionSets(session, &attach), "attach priority sets"))
+		{
+			return false;
+		}
+		XrActionSpaceCreateInfo space{XR_TYPE_ACTION_SPACE_CREATE_INFO};
+		space.action = poseAction;
+		space.poseInActionSpace = {{0.0f, 0.0f, 0.0f, 1.0f}, {0.0f, 0.0f, 0.0f}};
+		return Check(xrCreateActionSpace(session, &space, &rightGripSpace), "priority grip space");
+	}
+
+	bool VerifyOpenXr11(XrTime time)
+	{
+		PFN_xrLocateSpaces locateSpaces = nullptr;
+		PFN_xrLocateSpaces locateSpacesKhr = nullptr;
+		PFN_xrCreateHandTrackerEXT createHandTracker = nullptr;
+		PFN_xrDestroyHandTrackerEXT destroyHandTracker = nullptr;
+		PFN_xrLocateHandJointsEXT locateHandJoints = nullptr;
+		const auto load = [&](const char* name, auto& function)
+		{
+			return Check(getInstanceProcAddr(instance, name, reinterpret_cast<PFN_xrVoidFunction*>(&function)), name) && function != nullptr;
+		};
+		if (!load("xrLocateSpaces", locateSpaces) || !load("xrLocateSpacesKHR", locateSpacesKhr) || !load("xrCreateHandTrackerEXT", createHandTracker) || !load("xrDestroyHandTrackerEXT", destroyHandTracker) || !load("xrLocateHandJointsEXT", locateHandJoints))
+		{
+			return false;
+		}
+		return VerifyLocateSpaces({locateSpaces, locateSpacesKhr}, time) && VerifyHandAndEyeTracking(createHandTracker, destroyHandTracker, locateHandJoints, time) && VerifyActionSetPriority() && VerifyDepthSwapchain();
+	}
+
+	// xrLocateSpaces (core and KHR alias) must match one xrLocateSpace call per space at the same time.
+	bool VerifyLocateSpaces(const std::array<PFN_xrLocateSpaces, 2>& functions, XrTime time)
+	{
+		const std::array<XrSpace, 4> spaces = {viewSpace, localFloorSpace, stageSpace, rightGripSpace};
+		XrSpacesLocateInfo info{XR_TYPE_SPACES_LOCATE_INFO};
+		info.baseSpace = localSpace;
+		info.time = time;
+		info.spaceCount = static_cast<uint32_t>(spaces.size());
+		info.spaces = spaces.data();
+		for (PFN_xrLocateSpaces locateSpaces : functions)
+		{
+			std::array<XrSpaceLocationData, 4> batch{};
+			XrSpaceLocations locations{XR_TYPE_SPACE_LOCATIONS};
+			locations.locationCount = static_cast<uint32_t>(batch.size());
+			locations.locations = batch.data();
+			if (!Check(locateSpaces(session, &info, &locations), "locate spaces"))
+			{
+				return false;
+			}
+			if ((batch[0].locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT) == 0)
+			{
+				std::cerr << "locate spaces: view space orientation not valid\n";
+				return false;
+			}
+			for (size_t index = 0; index < spaces.size(); ++index)
+			{
+				XrSpaceLocation single{XR_TYPE_SPACE_LOCATION};
+				if (!Check(xrLocateSpace(spaces[index], localSpace, time, &single), "locate single space"))
+				{
+					return false;
+				}
+				if (single.locationFlags != batch[index].locationFlags || std::memcmp(&single.pose, &batch[index].pose, sizeof(XrPosef)) != 0)
+				{
+					std::cerr << "locate spaces: space " << index << " differs from xrLocateSpace\n";
+					return false;
+				}
+			}
+		}
+		return true;
+	}
+
+	// Controllers are the only tracked devices: hand tracking is supported but inactive, eye gaze is unsupported.
+	bool VerifyHandAndEyeTracking(PFN_xrCreateHandTrackerEXT createHandTracker, PFN_xrDestroyHandTrackerEXT destroyHandTracker, PFN_xrLocateHandJointsEXT locateHandJoints, XrTime time)
+	{
+		XrSystemHandTrackingPropertiesEXT handProperties{XR_TYPE_SYSTEM_HAND_TRACKING_PROPERTIES_EXT};
+		XrSystemEyeGazeInteractionPropertiesEXT eyeProperties{XR_TYPE_SYSTEM_EYE_GAZE_INTERACTION_PROPERTIES_EXT};
+		eyeProperties.supportsEyeGazeInteraction = XR_TRUE;
+		handProperties.next = &eyeProperties;
+		XrSystemProperties systemProperties{XR_TYPE_SYSTEM_PROPERTIES};
+		systemProperties.next = &handProperties;
+		if (!Check(xrGetSystemProperties(instance, systemId, &systemProperties), "hand/eye system properties"))
+		{
+			return false;
+		}
+		if (handProperties.supportsHandTracking != XR_TRUE || eyeProperties.supportsEyeGazeInteraction != XR_FALSE)
+		{
+			std::cerr << "system properties: hand=" << handProperties.supportsHandTracking << " eye=" << eyeProperties.supportsEyeGazeInteraction << '\n';
+			return false;
+		}
+		for (XrHandEXT hand : {XR_HAND_LEFT_EXT, XR_HAND_RIGHT_EXT})
+		{
+			XrHandTrackerCreateInfoEXT createInfo{XR_TYPE_HAND_TRACKER_CREATE_INFO_EXT};
+			createInfo.hand = hand;
+			createInfo.handJointSet = XR_HAND_JOINT_SET_DEFAULT_EXT;
+			XrHandTrackerEXT tracker = XR_NULL_HANDLE;
+			if (!Check(createHandTracker(session, &createInfo, &tracker), "create hand tracker"))
+			{
+				return false;
+			}
+			std::array<XrHandJointLocationEXT, XR_HAND_JOINT_COUNT_EXT> joints{};
+			for (XrHandJointLocationEXT& joint : joints)
+			{
+				joint.locationFlags = ~static_cast<XrSpaceLocationFlags>(0);
+			}
+			XrHandJointsLocateInfoEXT locateInfo{XR_TYPE_HAND_JOINTS_LOCATE_INFO_EXT};
+			locateInfo.baseSpace = localSpace;
+			locateInfo.time = time;
+			XrHandJointLocationsEXT locations{XR_TYPE_HAND_JOINT_LOCATIONS_EXT};
+			locations.isActive = XR_TRUE;
+			locations.jointCount = static_cast<uint32_t>(joints.size());
+			locations.jointLocations = joints.data();
+			const bool located = Check(locateHandJoints(tracker, &locateInfo, &locations), "locate hand joints");
+			const bool inactive = located && locations.isActive == XR_FALSE && std::all_of(joints.begin(), joints.end(), [](const XrHandJointLocationEXT& joint)
+			{
+				return joint.locationFlags == 0;
+			});
+			if (located && !inactive)
+			{
+				std::cerr << "hand joints: expected inactive joints with zero flags\n";
+			}
+			if (!Check(destroyHandTracker(tracker), "destroy hand tracker") || !inactive)
+			{
+				return false;
+			}
+		}
+		return true;
+	}
+
+	// Same input source in a priority-1 and a priority-0 set: only the priority-1 action reads input, unless XR_EXT_active_action_set_priority overrides it.
+	bool VerifyActionSetPriority()
+	{
+		const auto sync = [&](const void* next, XrResult expected)
+		{
+			const XrActiveActionSet active[] = {{actionSet, XR_NULL_PATH}, {lowActionSet, XR_NULL_PATH}};
+			XrActionsSyncInfo info{XR_TYPE_ACTIONS_SYNC_INFO};
+			info.next = next;
+			info.countActiveActionSets = static_cast<uint32_t>(std::size(active));
+			info.activeActionSets = active;
+			return Expect(xrSyncActions(session, &info), expected, "priority sync");
+		};
+		const auto isActive = [&](XrAction target)
+		{
+			XrActionStateGetInfo info{XR_TYPE_ACTION_STATE_GET_INFO};
+			info.action = target;
+			XrActionStateFloat state{XR_TYPE_ACTION_STATE_FLOAT};
+			return xrGetActionStateFloat(session, &info, &state) == XR_SUCCESS && state.isActive == XR_TRUE;
+		};
+		const auto expectActive = [&](bool highTrigger, bool lowTrigger, bool lowSqueeze, std::string_view phase)
+		{
+			const bool high = isActive(highTriggerAction);
+			const bool low = isActive(lowTriggerAction);
+			const bool squeeze = isActive(lowSqueezeAction);
+			if (high != highTrigger || low != lowTrigger || squeeze != lowSqueeze)
+			{
+				std::cerr << "priority " << phase << ": high=" << high << " low=" << low << " squeeze=" << squeeze << " expected " << highTrigger << lowTrigger << lowSqueeze << '\n';
+				return false;
+			}
+			return true;
+		};
+		if (!sync(nullptr, XR_SUCCESS) || !expectActive(true, false, true, "core"))
+		{
+			return false;
+		}
+		XrActiveActionSetPriorityEXT entries[] = {{lowActionSet, 5}, {actionSet, 0}};
+		XrActiveActionSetPrioritiesEXT overrides{XR_TYPE_ACTIVE_ACTION_SET_PRIORITIES_EXT};
+		overrides.actionSetPriorityCount = 1;
+		overrides.actionSetPriorities = &entries[0];
+		if (!sync(&overrides, XR_SUCCESS) || !expectActive(false, true, true, "override low above high"))
+		{
+			return false;
+		}
+		overrides.actionSetPriorities = &entries[1];
+		if (!sync(&overrides, XR_SUCCESS) || !expectActive(true, true, true, "equal priority"))
+		{
+			return false;
+		}
+		entries[1] = {lowActionSet, 5};
+		overrides.actionSetPriorityCount = 2;
+		overrides.actionSetPriorities = entries;
+		return sync(&overrides, XR_ERROR_VALIDATION_FAILURE);
+	}
+
+	// XR_KHR_composition_layer_depth: depth formats are enumerable and a depth swapchain is creatable.
+	bool VerifyDepthSwapchain()
+	{
+		uint32_t formatCount = 0;
+		if (!Check(xrEnumerateSwapchainFormats(session, 0, &formatCount, nullptr), "depth format count"))
+		{
+			return false;
+		}
+		std::vector<int64_t> formats(formatCount);
+		if (!Check(xrEnumerateSwapchainFormats(session, formatCount, &formatCount, formats.data()), "depth formats") || std::find(formats.begin(), formats.end(), static_cast<int64_t>(DXGI_FORMAT_D32_FLOAT)) == formats.end())
+		{
+			std::cerr << "depth swapchain: D32_FLOAT not enumerated\n";
+			return false;
+		}
+		XrSwapchainCreateInfo createInfo{XR_TYPE_SWAPCHAIN_CREATE_INFO};
+		createInfo.usageFlags = XR_SWAPCHAIN_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+		createInfo.format = static_cast<int64_t>(DXGI_FORMAT_D32_FLOAT);
+		createInfo.sampleCount = 1;
+		createInfo.width = 1024;
+		createInfo.height = 1024;
+		createInfo.arraySize = 2;
+		createInfo.faceCount = 1;
+		createInfo.mipCount = 1;
+		XrSwapchain depth = XR_NULL_HANDLE;
+		return Check(xrCreateSwapchain(session, &createInfo, &depth), "create depth swapchain") && Check(xrDestroySwapchain(depth), "destroy depth swapchain");
 	}
 
 	bool ReleaseInstance(XrInstance& releasedInstance, PFN_xrDestroyInstance& destroyFunction)
@@ -2121,6 +2505,11 @@ private:
 
 	void DestroySessionOnly()
 	{
+		if (rightAimSpace != XR_NULL_HANDLE && xrDestroySpace != nullptr)
+		{
+			xrDestroySpace(rightAimSpace);
+			rightAimSpace = XR_NULL_HANDLE;
+		}
 		if (rightGripSpace != XR_NULL_HANDLE && xrDestroySpace != nullptr)
 		{
 			xrDestroySpace(rightGripSpace);
@@ -2167,6 +2556,11 @@ private:
 			xrDestroyAction(triggerValueAction);
 			triggerValueAction = XR_NULL_HANDLE;
 		}
+		if (aimPoseAction != XR_NULL_HANDLE && xrDestroyAction != nullptr)
+		{
+			xrDestroyAction(aimPoseAction);
+			aimPoseAction = XR_NULL_HANDLE;
+		}
 		if (poseAction != XR_NULL_HANDLE && xrDestroyAction != nullptr)
 		{
 			xrDestroyAction(poseAction);
@@ -2182,6 +2576,14 @@ private:
 			xrDestroyActionSet(actionSet);
 			actionSet = XR_NULL_HANDLE;
 		}
+		if (lowActionSet != XR_NULL_HANDLE && xrDestroyActionSet != nullptr)
+		{
+			xrDestroyActionSet(lowActionSet);
+			lowActionSet = XR_NULL_HANDLE;
+		}
+		highTriggerAction = XR_NULL_HANDLE;
+		lowTriggerAction = XR_NULL_HANDLE;
+		lowSqueezeAction = XR_NULL_HANDLE;
 		running = false;
 		lastDisplayTime = 0;
 	}
@@ -2398,9 +2800,11 @@ private:
 	XrSpace localFloorSpace = XR_NULL_HANDLE;
 	XrSpace stageSpace = XR_NULL_HANDLE;
 	XrSpace rightGripSpace = XR_NULL_HANDLE;
+	XrSpace rightAimSpace = XR_NULL_HANDLE;
 	XrActionSet actionSet = XR_NULL_HANDLE;
 	XrAction action = XR_NULL_HANDLE;
 	XrAction poseAction = XR_NULL_HANDLE;
+	XrAction aimPoseAction = XR_NULL_HANDLE;
 	XrAction triggerValueAction = XR_NULL_HANDLE;
 	XrAction aClickFloatAction = XR_NULL_HANDLE;
 	XrAction fidelityTrigger = XR_NULL_HANDLE;
@@ -2463,7 +2867,10 @@ private:
 	PFN_xrWaitSwapchainImage xrWaitSwapchainImage = nullptr;
 	PFN_xrReleaseSwapchainImage xrReleaseSwapchainImage = nullptr;
 	PFN_xrGetD3D12GraphicsRequirementsKHR xrGetD3D12GraphicsRequirementsKHR = nullptr;
-	bool apiFallbackObserved = false;
+	XrActionSet lowActionSet = XR_NULL_HANDLE;
+	XrAction highTriggerAction = XR_NULL_HANDLE;
+	XrAction lowTriggerAction = XR_NULL_HANDLE;
+	XrAction lowSqueezeAction = XR_NULL_HANDLE;
 	bool graphicsRequirementsQueried = false;
 	bool running = false;
 	XrTime lastDisplayTime = 0;
@@ -2544,7 +2951,6 @@ bool RunLiveTimelineRegression(OpenXR& client, Control& control, const Json& rep
 	const float newGripX = replacementTimeline.at("initial").at("right").at("grip").at("position").at(0).get<float>();
 	oldTimeline["initial"]["head"]["position"][0] = newHeadX + 0.5f;
 	oldTimeline["initial"]["right"]["grip"]["position"][0] = newGripX + 0.5f;
-	oldTimeline["initial"]["right"]["aim"]["position"][0] = newGripX + 0.5f;
 
 	uint64_t oldTimelineId = 0;
 	if (!SubmitTimeline(control, oldTimeline, oldTimelineId, true))
@@ -3454,7 +3860,7 @@ int RunFidelityScenario(const std::wstring& runtimeManifest, const std::filesyst
 						observationFailure();
 						return 1;
 					}
-					const char* poses[] = {"head", "leftGrip", "leftAim", "rightGrip", "rightAim"};
+					const char* poses[] = {"head", "leftGrip", "rightGrip"};
 					for (const char* pose : poses)
 					{
 						const Json& raw = tracking.at(pose);
@@ -3656,6 +4062,199 @@ int RunFidelityScenario(const std::wstring& runtimeManifest, const std::filesyst
 	}
 	std::cerr << name << ": API contract observations passed\n";
 	return 0;
+}
+
+XrVector3f RotateVector(const XrQuaternionf& q, const XrVector3f& v)
+{
+	const XrVector3f t{2.0f * (q.y * v.z - q.z * v.y), 2.0f * (q.z * v.x - q.x * v.z), 2.0f * (q.x * v.y - q.y * v.x)};
+	return {v.x + q.w * t.x + (q.y * t.z - q.z * t.y), v.y + q.w * t.y + (q.z * t.x - q.x * t.z), v.z + q.w * t.z + (q.x * t.y - q.y * t.x)};
+}
+
+XrQuaternionf MultiplyQuaternion(const XrQuaternionf& a, const XrQuaternionf& b)
+{
+	return {a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y, a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x, a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w, a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z};
+}
+
+bool ReadRuntimeProfilePose(const Json& hand, const char* key, XrPosef& pose)
+{
+	const Json& value = hand.at(key);
+	const Json& position = value.at("position");
+	const Json& orientation = value.at("orientation");
+	pose.position = {position.at(0).get<float>(), position.at(1).get<float>(), position.at(2).get<float>()};
+	pose.orientation = {orientation.at(0).get<float>(), orientation.at(1).get<float>(), orientation.at(2).get<float>(), orientation.at(3).get<float>()};
+	return true;
+}
+
+// Reads the profile the loaded runtime itself read: the file named by AGENTXR_DEVICE_PROFILE (set in main).
+bool ReadRuntimeProfile(Json& profile)
+{
+	std::array<wchar_t, 32768> path{};
+	const DWORD length = GetEnvironmentVariableW(L"AGENTXR_DEVICE_PROFILE", path.data(), static_cast<DWORD>(path.size()));
+	if (length == 0 || length >= path.size())
+	{
+		std::cerr << "pose-model: AGENTXR_DEVICE_PROFILE is unset or too long\n";
+		return false;
+	}
+	const std::filesystem::path profilePath(std::wstring(path.data(), length));
+	if (!ReadJsonFile(profilePath, profile))
+	{
+		std::cerr << "pose-model: could not read device profile " << profilePath.string() << '\n';
+		return false;
+	}
+	return true;
+}
+
+// Exact-time pose, real velocity, aim == grip * aimFromGrip, implied touch, and rejection of the removed schema keys.
+int RunPoseModel(const std::wstring& runtimeManifest, const std::filesystem::path& executable)
+{
+	Json profile;
+	XrPosef aimFromGrip{};
+	try
+	{
+		if (!ReadRuntimeProfile(profile) || !ReadRuntimeProfilePose(profile.at("right"), "aimFromGrip", aimFromGrip))
+		{
+			return 1;
+		}
+	}
+	catch (const std::exception& error)
+	{
+		std::cerr << "pose-model: invalid device profile: " << error.what() << '\n';
+		return 1;
+	}
+	Json timeline;
+	const std::filesystem::path neutralPath = ResolveExample(executable, "neutral");
+	if (neutralPath.empty() || !ReadJsonFile(neutralPath, timeline))
+	{
+		std::cerr << "pose-model: neutral example not found\n";
+		return 1;
+	}
+	// Moves the right grip +1 m/s along x and rotates it 20 degrees about y over one second; trigger is held pulled with no authored touch.
+	// Analog input is discrete at keyframe time, so the pull is authored in the initial state to cover the sampled window.
+	const XrQuaternionf endOrientation{0.0f, 0.1736481777f, 0.0f, 0.984807753f};
+	timeline["interpolation"] = "linear";
+	timeline["initial"]["right"]["trigger"] = 0.8;
+	timeline["keyframes"] = Json::array({Json{{"timeSeconds", 1.0}, {"state", {{"right", {{"grip", {{"position", Json::array({1.25, 1.2, -0.35})}, {"orientation", Json::array({endOrientation.x, endOrientation.y, endOrientation.z, endOrientation.w})}}}}}}}}});
+
+	OpenXR client;
+	if (!client.Load(runtimeManifest) || !client.InitializeGraphics(false) || !client.PreparePoseModel() || !client.Begin())
+	{
+		std::cerr << "pose-model: setup failed\n";
+		return 1;
+	}
+	RuntimeEndpoint endpoint;
+	Control control;
+	if (!FindEndpoint(endpoint) || !control.Connect(endpoint))
+	{
+		return 1;
+	}
+	uint64_t ignoredId = 0;
+	Json rejected = timeline;
+	rejected["initial"]["right"]["aim"] = rejected.at("initial").at("right").at("grip");
+	if (!SubmitTimeline(control, rejected, ignoredId, false))
+	{
+		std::cerr << "pose-model: timeline with an aim key was not rejected\n";
+		return 1;
+	}
+	rejected = timeline;
+	rejected["sampleRateHz"] = 90;
+	if (!SubmitTimeline(control, rejected, ignoredId, false))
+	{
+		std::cerr << "pose-model: timeline with sampleRateHz was not rejected\n";
+		return 1;
+	}
+	uint64_t timelineId = 0;
+	if (!SubmitTimeline(control, timeline, timelineId, true))
+	{
+		return 1;
+	}
+
+	const XrTime locateOffset = 5000000; // 5 ms: lies between 90 Hz frame boundaries.
+	uint32_t frames = 0;
+	uint32_t checked = 0;
+	uint32_t touchChecked = 0;
+	for (uint32_t attempt = 0; attempt < 400; ++attempt)
+	{
+		XrTime displayTime = 0;
+		Json snapshot;
+		if (!client.Frame(true, frames, nullptr, &displayTime) || !control.Snapshot(snapshot) || !client.SyncFidelity(XR_SUCCESS))
+		{
+			return 1;
+		}
+		const Json& snapshotTimeline = snapshot.at("timeline");
+		if (snapshotTimeline.value("id", 0ull) != timelineId || snapshotTimeline.value("status", std::string{}) != "running")
+		{
+			if (checked > 0)
+			{
+				break;
+			}
+			continue;
+		}
+		const XrTime locateTime = displayTime + locateOffset;
+		const double seconds = static_cast<double>(locateTime - snapshotTimeline.value("start", static_cast<XrTime>(0))) / 1000000000.0;
+		if (seconds < 0.1 || seconds > 0.9)
+		{
+			continue;
+		}
+		XrSpaceLocation grip{XR_TYPE_SPACE_LOCATION};
+		XrSpaceVelocity gripVelocity{XR_TYPE_SPACE_VELOCITY};
+		XrSpaceLocation aim{XR_TYPE_SPACE_LOCATION};
+		if (!client.LocateRightPoseSpaces(locateTime, grip, gripVelocity, aim))
+		{
+			return 1;
+		}
+		const auto fail = [&](const char* what)
+		{
+			std::cerr << "pose-model: " << what << " seconds=" << seconds << " gripPosition=" << grip.pose.position.x << ',' << grip.pose.position.y << ',' << grip.pose.position.z
+				<< " gripOrientation=" << grip.pose.orientation.x << ',' << grip.pose.orientation.y << ',' << grip.pose.orientation.z << ',' << grip.pose.orientation.w
+				<< " linearVelocity=" << gripVelocity.linearVelocity.x << ',' << gripVelocity.linearVelocity.y << ',' << gripVelocity.linearVelocity.z
+				<< " angularVelocity=" << gripVelocity.angularVelocity.x << ',' << gripVelocity.angularVelocity.y << ',' << gripVelocity.angularVelocity.z
+				<< " velocityFlags=" << gripVelocity.velocityFlags << '\n';
+			return 1;
+		};
+		// Exact evaluation at the queried time, not floored to a frame or sample boundary.
+		const float alpha = static_cast<float>(seconds);
+		const float rotationW = (1.0f - alpha) + alpha * endOrientation.w;
+		const float rotationY = alpha * endOrientation.y;
+		const float rotationNorm = std::sqrt(rotationW * rotationW + rotationY * rotationY);
+		const XrQuaternionf expectedOrientation{0.0f, rotationY / rotationNorm, 0.0f, rotationW / rotationNorm};
+		if (std::fabs(grip.pose.position.x - (0.25f + alpha)) > 3.0e-4f || std::fabs(grip.pose.position.y - 1.2f) > 1.0e-4f || std::fabs(grip.pose.position.z + 0.35f) > 1.0e-4f ||
+			std::fabs(grip.pose.orientation.y - expectedOrientation.y) > 3.0e-4f || std::fabs(grip.pose.orientation.w - expectedOrientation.w) > 3.0e-4f)
+		{
+			return fail("grip pose is not the exact evaluation at the queried time");
+		}
+		constexpr XrSpaceVelocityFlags velocityFlags = XR_SPACE_VELOCITY_LINEAR_VALID_BIT | XR_SPACE_VELOCITY_ANGULAR_VALID_BIT;
+		const float angularRate = 0.3490658504f; // 20 degrees per second; nlerp rate differs within tolerance.
+		if ((gripVelocity.velocityFlags & velocityFlags) != velocityFlags ||
+			std::fabs(gripVelocity.linearVelocity.x - 1.0f) > 0.02f || std::fabs(gripVelocity.linearVelocity.y) > 0.02f || std::fabs(gripVelocity.linearVelocity.z) > 0.02f ||
+			std::fabs(gripVelocity.angularVelocity.x) > 0.02f || std::fabs(gripVelocity.angularVelocity.y - angularRate) > 0.03f || std::fabs(gripVelocity.angularVelocity.z) > 0.02f)
+		{
+			return fail("grip velocity does not match the authored motion");
+		}
+		const XrVector3f offset = RotateVector(grip.pose.orientation, aimFromGrip.position);
+		const XrPosef expectedAim{MultiplyQuaternion(grip.pose.orientation, aimFromGrip.orientation), {grip.pose.position.x + offset.x, grip.pose.position.y + offset.y, grip.pose.position.z + offset.z}};
+		if (std::fabs(aim.pose.position.x - expectedAim.position.x) > 1.0e-4f || std::fabs(aim.pose.position.y - expectedAim.position.y) > 1.0e-4f || std::fabs(aim.pose.position.z - expectedAim.position.z) > 1.0e-4f ||
+			std::fabs(aim.pose.orientation.x - expectedAim.orientation.x) > 1.0e-4f || std::fabs(aim.pose.orientation.y - expectedAim.orientation.y) > 1.0e-4f ||
+			std::fabs(aim.pose.orientation.z - expectedAim.orientation.z) > 1.0e-4f || std::fabs(aim.pose.orientation.w - expectedAim.orientation.w) > 1.0e-4f)
+		{
+			return fail("aim pose is not grip * aimFromGrip");
+		}
+		const Json& right = snapshot.at("tracking").at("right");
+		if (right.at("trigger").get<float>() > 0.0f)
+		{
+			if (!right.at("touches").at("trigger").get<bool>())
+			{
+				return fail("trigger value without authored touch did not report touch");
+			}
+			++touchChecked;
+		}
+		++checked;
+	}
+	if (checked < 5 || touchChecked < 5)
+	{
+		std::cerr << "pose-model: too few samples checked=" << checked << " touchChecked=" << touchChecked << '\n';
+		return 1;
+	}
+	return client.End() ? 0 : 1;
 }
 
 int RunScenario(const std::wstring& runtimeManifest, const std::filesystem::path& executable, std::string_view scenarioName)
@@ -4070,7 +4669,6 @@ int RunScenario(const std::wstring& runtimeManifest, const std::filesystem::path
 			return 1;
 		}
 		timeline["durationSeconds"] = 0.25;
-		timeline["sampleRateHz"] = 90;
 		timeline["interpolation"] = "step";
 		timeline["keyframes"] = Json::array({Json{{"timeSeconds", 0.25}, {"state", Json::object()}}});
 
@@ -4961,11 +5559,7 @@ int RunLifecycle(const std::wstring& runtimeManifest)
 		std::cerr << "lifecycle: session begin failed\n";
 		return 1;
 	}
-	if (!client.HasApiFallback())
-	{
-		std::cerr << "lifecycle: API 1.1 fallback was not observed\n";
-		return 1;
-	}
+
 	uint32_t frames = 0;
 	for (uint32_t index = 0; index < 10; ++index)
 	{
@@ -4988,10 +5582,47 @@ int RunLifecycle(const std::wstring& runtimeManifest)
 	return 0;
 }
 
+// OpenXR 1.1 contract: version negotiation, entry-point gating, promoted features, and the advertised extensions.
+int RunOpenXr11(const std::wstring& runtimeManifest)
+{
+	{
+		OpenXR legacy;
+		legacy.extensions = {XR_KHR_D3D12_ENABLE_EXTENSION_NAME};
+		if (!legacy.Load(runtimeManifest) || !legacy.CheckApiVersionRejected() || !legacy.CheckInstanceGates(false, false) || !legacy.CheckPosePathContracts(false, false, false))
+		{
+			std::cerr << "openxr-11: API 1.0 instance contract failed\n";
+			return 1;
+		}
+	}
+	{
+		OpenXR plain;
+		plain.apiVersion = XR_MAKE_VERSION(1, 1, 0);
+		plain.extensions = {XR_KHR_D3D12_ENABLE_EXTENSION_NAME};
+		// LOCAL_FLOOR must be a core reference space here: CreateSpaces requires it and XR_EXT_local_floor is not enabled.
+		if (!plain.Load(runtimeManifest) || !plain.CheckVisibilityMaskNotPresent() || !plain.CheckInstanceGates(true, false) || !plain.InitializeGraphics(false) || !plain.CheckPosePathContracts(true, false, false))
+		{
+			std::cerr << "openxr-11: API 1.1 instance without extensions contract failed\n";
+			return 1;
+		}
+	}
+	OpenXR client;
+	client.apiVersion = XR_MAKE_VERSION(1, 1, 0);
+	client.extensions = {XR_KHR_D3D12_ENABLE_EXTENSION_NAME, XR_KHR_COMPOSITION_LAYER_DEPTH_EXTENSION_NAME, XR_EXT_PALM_POSE_EXTENSION_NAME, XR_EXT_ACTIVE_ACTION_SET_PRIORITY_EXTENSION_NAME, XR_EXT_HAND_TRACKING_EXTENSION_NAME, XR_EXT_EYE_GAZE_INTERACTION_EXTENSION_NAME, XR_KHR_LOCATE_SPACES_EXTENSION_NAME, XR_KHR_MAINTENANCE1_EXTENSION_NAME};
+	uint32_t frames = 0;
+	XrTime displayTime = 0;
+	if (!client.Load(runtimeManifest) || !client.CheckInstanceGates(true, true) || !client.InitializeGraphics(false) || !client.CheckPosePathContracts(true, true, true) || !client.PrepareOpenXr11() || !client.Begin() || !client.Frame(false, frames, nullptr, &displayTime) || !client.VerifyOpenXr11(displayTime) || !client.End())
+	{
+		std::cerr << "openxr-11: API 1.1 instance with all extensions failed\n";
+		return 1;
+	}
+	return 0;
+}
+
 void PrintHelp()
 {
-	std::cerr << "usage: agent-xr-smoke.exe --runtime <manifest> [--scenario <name>]\n";
-	std::cerr << "scenarios: lifecycle session-restart stereo-composition capture-wait idle-client-shutdown timeline-actions report-lifetime tracking-recovery invalid-input pipelined-swapchain pipelined-frame unreal-action-setup binding-contract focus-recovery inactive-controller\n";
+	std::cerr << "usage: agent-xr-smoke.exe --runtime <manifest> [--scenario <name>] [--device-profile <path>]\n";
+	std::cerr << "device profile: --device-profile, else AGENTXR_DEVICE_PROFILE, else <exe dir>/test-fixtures/oculus-touch-controller.json\n";
+	std::cerr << "scenarios: lifecycle session-restart stereo-composition capture-wait idle-client-shutdown timeline-actions report-lifetime tracking-recovery invalid-input pipelined-swapchain pipelined-frame unreal-action-setup binding-contract focus-recovery inactive-controller pose-model openxr-11\n";
 }
 
 } // namespace
@@ -5003,6 +5634,7 @@ int wmain(int argc, wchar_t** argv)
 	std::set_terminate(&SmokeTerminateHandler);
 	std::wstring runtimeManifest;
 	std::string scenarioName = "lifecycle";
+	std::wstring deviceProfile;
 	for (int index = 1; index < argc; ++index)
 	{
 		const std::wstring_view argument(argv[index]);
@@ -5019,8 +5651,28 @@ int wmain(int argc, wchar_t** argv)
 		{
 			scenarioName = agentxr::protocol::Utf8FromWide(argv[++index]);
 		}
+		else if (argument == L"--device-profile" && index + 1 < argc)
+		{
+			deviceProfile = argv[++index];
+		}
 	}
 
+	if (!deviceProfile.empty())
+	{
+		SetEnvironmentVariableW(L"AGENTXR_DEVICE_PROFILE", deviceProfile.c_str());
+	}
+	else if (GetEnvironmentVariableW(L"AGENTXR_DEVICE_PROFILE", nullptr, 0) == 0)
+	{
+		std::array<wchar_t, 32768> exePath{};
+		const DWORD exeLength = GetModuleFileNameW(nullptr, exePath.data(), static_cast<DWORD>(exePath.size()));
+		if (exeLength == 0 || exeLength >= exePath.size())
+		{
+			std::cerr << "could not resolve smoke executable path\n";
+			return 2;
+		}
+		const std::filesystem::path fixture = std::filesystem::path(std::wstring(exePath.data(), exeLength)).parent_path() / L"test-fixtures" / L"oculus-touch-controller.json";
+		SetEnvironmentVariableW(L"AGENTXR_DEVICE_PROFILE", fixture.c_str());
+	}
 	if (runtimeManifest.empty())
 	{
 		std::wcerr << L"--runtime required\n";
@@ -5041,6 +5693,14 @@ int wmain(int argc, wchar_t** argv)
 	if (scenarioName == "unreal-action-setup")
 	{
 		return RunUnrealActionSetup(runtimeManifest);
+	}
+	if (scenarioName == "openxr-11")
+	{
+		return RunOpenXr11(runtimeManifest);
+	}
+	if (scenarioName == "pose-model")
+	{
+		return RunPoseModel(runtimeManifest, std::filesystem::path(argv[0]));
 	}
 	if (scenarioName == "binding-contract" || scenarioName == "focus-recovery" || scenarioName == "inactive-controller")
 	{

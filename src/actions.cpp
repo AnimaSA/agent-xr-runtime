@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstring>
 #include <string>
+#include <unordered_map>
 
 namespace agentxr
 {
@@ -12,6 +13,7 @@ namespace
 constexpr std::string_view kLeftPath = "/user/hand/left";
 constexpr std::string_view kRightPath = "/user/hand/right";
 constexpr std::string_view kHeadPath = "/user/head";
+constexpr std::string_view kEyesPath = "/user/eyes_ext";
 constexpr std::string_view kProfilePath = "/interaction_profiles/oculus/touch_controller";
 template<size_t Size>
 bool ReadName(const char (&value)[Size], std::string& result)
@@ -25,6 +27,13 @@ bool ReadName(const char (&value)[Size], std::string& result)
 	return true;
 }
 
+enum class Availability : uint8_t
+{
+	Always,
+	Version11,
+	EyeGaze
+};
+
 struct CoreProfile
 {
 	std::string_view name;
@@ -32,6 +41,8 @@ struct CoreProfile
 	std::string_view components;
 	std::string_view leftOnly;
 	std::string_view rightOnly;
+	std::string_view since11 = "";
+	Availability availability = Availability::Always;
 };
 
 constexpr CoreProfile kCoreProfiles[] = {
@@ -42,8 +53,24 @@ constexpr CoreProfile kCoreProfiles[] = {
 	{"/interaction_profiles/microsoft/motion_controller", "", "/input/menu/click /input/squeeze/click /input/trigger/value /input/thumbstick/x /input/thumbstick/y /input/thumbstick/click /input/trackpad/x /input/trackpad/y /input/trackpad/click /input/trackpad/touch /input/grip/pose /input/aim/pose /output/haptic", "", ""},
 	{"/interaction_profiles/microsoft/xbox_controller", "/user/gamepad", "/input/menu/click /input/view/click /input/a/click /input/b/click /input/x/click /input/y/click /input/dpad_down/click /input/dpad_right/click /input/dpad_up/click /input/dpad_left/click /input/shoulder_left/click /input/shoulder_right/click /input/thumbstick_left/click /input/thumbstick_right/click /input/trigger_left/value /input/trigger_right/value /input/thumbstick_left/x /input/thumbstick_left/y /input/thumbstick_right/x /input/thumbstick_right/y /output/haptic_left /output/haptic_right /output/haptic_left_trigger /output/haptic_right_trigger", "", ""},
 	{"/interaction_profiles/oculus/go_controller", "", "/input/system/click /input/trigger/click /input/back/click /input/trackpad/x /input/trackpad/y /input/trackpad/click /input/trackpad/touch /input/grip/pose /input/aim/pose", "", ""},
-	{kProfilePath, "", "/input/squeeze/value /input/trigger/value /input/trigger/touch /input/thumbstick/x /input/thumbstick/y /input/thumbstick/click /input/thumbstick/touch /input/thumbrest/touch /input/grip/pose /input/aim/pose /output/haptic", "/input/x/click /input/x/touch /input/y/click /input/y/touch /input/menu/click", "/input/a/click /input/a/touch /input/b/click /input/b/touch /input/system/click"},
-	{"/interaction_profiles/valve/index_controller", "", "/input/system/click /input/system/touch /input/a/click /input/a/touch /input/b/click /input/b/touch /input/squeeze/value /input/squeeze/force /input/trigger/click /input/trigger/value /input/trigger/touch /input/thumbstick/x /input/thumbstick/y /input/thumbstick/click /input/thumbstick/touch /input/trackpad/x /input/trackpad/y /input/trackpad/force /input/trackpad/touch /input/grip/pose /input/aim/pose /output/haptic", "", ""}
+	{kProfilePath, "", "/input/squeeze/value /input/trigger/value /input/trigger/touch /input/thumbstick/x /input/thumbstick/y /input/thumbstick/click /input/thumbstick/touch /input/thumbrest/touch /input/grip/pose /input/aim/pose /output/haptic", "/input/x/click /input/x/touch /input/y/click /input/y/touch /input/menu/click", "/input/a/click /input/a/touch /input/b/click /input/b/touch /input/system/click", "/input/trigger/proximity /input/thumb_resting_surfaces/proximity"},
+	{"/interaction_profiles/valve/index_controller", "", "/input/system/click /input/system/touch /input/a/click /input/a/touch /input/b/click /input/b/touch /input/squeeze/value /input/squeeze/force /input/trigger/click /input/trigger/value /input/trigger/touch /input/thumbstick/x /input/thumbstick/y /input/thumbstick/click /input/thumbstick/touch /input/trackpad/x /input/trackpad/y /input/trackpad/force /input/trackpad/touch /input/grip/pose /input/aim/pose /output/haptic", "", ""},
+	// Profiles promoted to core in OpenXR 1.1 (spec 6.4): valid only on 1.1 instances because the promoting extensions are not advertised.
+	{"/interaction_profiles/bytedance/pico_neo3_controller", "", "/input/menu/click /input/system/click /input/trigger/click /input/trigger/value /input/trigger/touch /input/thumbstick/x /input/thumbstick/y /input/thumbstick/click /input/thumbstick/touch /input/squeeze/click /input/squeeze/value /input/grip/pose /input/aim/pose /output/haptic", "/input/x/click /input/x/touch /input/y/click /input/y/touch", "/input/a/click /input/a/touch /input/b/click /input/b/touch", "", Availability::Version11},
+	{"/interaction_profiles/bytedance/pico4_controller", "", "/input/trigger/click /input/trigger/value /input/trigger/touch /input/thumbstick/x /input/thumbstick/y /input/thumbstick/click /input/thumbstick/touch /input/squeeze/click /input/squeeze/value /input/grip/pose /input/aim/pose /output/haptic", "/input/x/click /input/x/touch /input/y/click /input/y/touch /input/menu/click", "/input/a/click /input/a/touch /input/b/click /input/b/touch /input/system/click", "", Availability::Version11},
+	{"/interaction_profiles/bytedance/pico_g3_controller", "", "/input/trigger/click /input/trigger/value /input/menu/click /input/thumbstick/x /input/thumbstick/y /input/thumbstick/click /input/grip/pose /input/aim/pose", "", "", "", Availability::Version11},
+	{"/interaction_profiles/hp/mixed_reality_controller", "", "/input/menu/click /input/squeeze/value /input/trigger/value /input/thumbstick/x /input/thumbstick/y /input/thumbstick/click /input/grip/pose /input/aim/pose /output/haptic", "/input/x/click /input/y/click", "/input/a/click /input/b/click", "", Availability::Version11},
+	{"/interaction_profiles/htc/vive_cosmos_controller", "", "/input/shoulder/click /input/squeeze/click /input/trigger/click /input/trigger/value /input/thumbstick/x /input/thumbstick/y /input/thumbstick/click /input/thumbstick/touch /input/grip/pose /input/aim/pose /output/haptic", "/input/x/click /input/y/click /input/menu/click", "/input/a/click /input/b/click /input/system/click", "", Availability::Version11},
+	{"/interaction_profiles/htc/vive_focus3_controller", "", "/input/squeeze/click /input/squeeze/touch /input/squeeze/value /input/trigger/click /input/trigger/touch /input/trigger/value /input/thumbstick/x /input/thumbstick/y /input/thumbstick/click /input/thumbstick/touch /input/thumbrest/touch /input/grip/pose /input/aim/pose /output/haptic", "/input/x/click /input/y/click /input/menu/click", "/input/a/click /input/b/click /input/system/click", "", Availability::Version11},
+	{"/interaction_profiles/ml/ml2_controller", "", "/input/menu/click /input/home/click /input/trigger/click /input/trigger/value /input/trackpad/x /input/trackpad/y /input/trackpad/click /input/trackpad/force /input/trackpad/touch /input/aim/pose /input/grip/pose /input/shoulder/click /output/haptic", "", "", "", Availability::Version11},
+	{"/interaction_profiles/meta/touch_pro_controller", "", "/input/squeeze/value /input/trigger/value /input/trigger/touch /input/trigger/proximity /input/trigger_curl/value /input/trigger_slide/value /input/thumb_resting_surfaces/proximity /input/thumbstick/x /input/thumbstick/y /input/thumbstick/click /input/thumbstick/touch /input/thumbrest/touch /input/thumbrest/force /input/stylus/force /input/grip/pose /input/aim/pose /output/haptic /output/haptic_trigger /output/haptic_thumb", "/input/x/click /input/x/touch /input/y/click /input/y/touch /input/menu/click", "/input/a/click /input/a/touch /input/b/click /input/b/touch /input/system/click", "", Availability::Version11},
+	{"/interaction_profiles/meta/touch_plus_controller", "", "/input/squeeze/value /input/trigger/value /input/trigger/touch /input/trigger/force /input/trigger/proximity /input/trigger_curl/value /input/trigger_slide/value /input/thumb_resting_surfaces/proximity /input/thumbstick/x /input/thumbstick/y /input/thumbstick/click /input/thumbstick/touch /input/thumbrest/touch /input/grip/pose /input/aim/pose /output/haptic", "/input/x/click /input/x/touch /input/y/click /input/y/touch /input/menu/click", "/input/a/click /input/a/touch /input/b/click /input/b/touch /input/system/click", "", Availability::Version11},
+	{"/interaction_profiles/meta/touch_controller_rift_cv1", "", "/input/squeeze/value /input/trigger/value /input/trigger/touch /input/trigger/proximity /input/thumb_resting_surfaces/proximity /input/thumbstick/x /input/thumbstick/y /input/thumbstick/click /input/thumbstick/touch /input/thumbrest/touch /input/grip/pose /input/aim/pose /output/haptic", "/input/x/click /input/x/touch /input/y/click /input/y/touch /input/menu/click", "/input/a/click /input/a/touch /input/b/click /input/b/touch /input/system/click", "", Availability::Version11},
+	{"/interaction_profiles/meta/touch_controller_quest_1_rift_s", "", "/input/squeeze/value /input/trigger/value /input/trigger/touch /input/trigger/proximity /input/thumb_resting_surfaces/proximity /input/thumbstick/x /input/thumbstick/y /input/thumbstick/click /input/thumbstick/touch /input/grip/pose /input/aim/pose /output/haptic", "/input/x/click /input/x/touch /input/y/click /input/y/touch /input/menu/click", "/input/a/click /input/a/touch /input/b/click /input/b/touch /input/system/click", "", Availability::Version11},
+	{"/interaction_profiles/meta/touch_controller_quest_2", "", "/input/squeeze/value /input/trigger/value /input/trigger/touch /input/trigger/proximity /input/thumb_resting_surfaces/proximity /input/thumbstick/x /input/thumbstick/y /input/thumbstick/click /input/thumbstick/touch /input/thumbrest/touch /input/grip/pose /input/aim/pose /output/haptic", "/input/x/click /input/x/touch /input/y/click /input/y/touch /input/menu/click", "/input/a/click /input/a/touch /input/b/click /input/b/touch /input/system/click", "", Availability::Version11},
+	{"/interaction_profiles/samsung/odyssey_controller", "", "/input/menu/click /input/squeeze/click /input/trigger/value /input/thumbstick/x /input/thumbstick/y /input/thumbstick/click /input/trackpad/x /input/trackpad/y /input/trackpad/click /input/trackpad/touch /input/grip/pose /input/aim/pose /output/haptic", "", "", "", Availability::Version11},
+	// XR_EXT_eye_gaze_interaction: gaze pose only; the runtime reports no eye tracking, so this profile never becomes current.
+	{"/interaction_profiles/ext/eye_gaze_interaction", "/user/eyes_ext", "/input/gaze_ext/pose", "", "", "", Availability::EyeGaze}
 };
 
 const CoreProfile* FindProfile(std::string_view name)
@@ -77,7 +104,28 @@ bool HasComponent(std::string_view components, std::string_view suffix, bool all
 	return false;
 }
 
-bool ProfilePathSupported(const CoreProfile& profile, std::string_view path, bool allowParent = true)
+bool ProfileAvailable(const Instance& instance, const CoreProfile& profile)
+{
+	switch (profile.availability)
+	{
+		case Availability::Always:
+		{
+			return true;
+		}
+		case Availability::Version11:
+		{
+			return instance.version11;
+		}
+		case Availability::EyeGaze:
+		{
+			return instance.eyeGazeEnabled;
+		}
+	}
+	return false;
+}
+
+// Validates a suggested binding path against a profile. grip_surface (OpenXR 1.1 / XR_KHR_maintenance1) and palm_ext (XR_EXT_palm_pose) are valid on every hand profile that has grip/pose once enabled.
+bool ProfilePathSupported(const Instance& instance, const CoreProfile& profile, std::string_view path, bool allowParent = true)
 {
 	std::string_view user = profile.user;
 	if (user.empty())
@@ -96,30 +144,52 @@ bool ProfilePathSupported(const CoreProfile& profile, std::string_view path, boo
 		return false;
 	}
 	const std::string_view suffix = path.substr(user.size());
-	return HasComponent(profile.components, suffix, allowParent) || HasComponent(user == kLeftPath ? profile.leftOnly : profile.rightOnly, suffix, allowParent);
+	const bool surface = suffix == "/input/grip_surface/pose" || (allowParent && suffix == "/input/grip_surface");
+	const bool palm = suffix == "/input/palm_ext/pose" || (allowParent && suffix == "/input/palm_ext");
+	if (surface || palm)
+	{
+		const bool enabled = palm ? instance.palmPoseEnabled : instance.version11 || instance.maintenance1Enabled;
+		return enabled && HasComponent(profile.components, "/input/grip/pose", false);
+	}
+	const std::string_view sideOnly = user == kLeftPath ? profile.leftOnly : profile.rightOnly;
+	return HasComponent(profile.components, suffix, allowParent) || HasComponent(sideOnly, suffix, allowParent) || (instance.version11 && HasComponent(profile.since11, suffix, allowParent));
+}
+
+// Input source identity per the action set priority rule: user path plus identifier (e.g. /user/hand/left/input/trigger), ignoring the component.
+std::string InputSourceKey(const std::string& path)
+{
+	for (const std::string_view marker : {std::string_view("/input/"), std::string_view("/output/")})
+	{
+		const size_t start = path.find(marker);
+		if (start != std::string::npos)
+		{
+			return path.substr(0, path.find('/', start + marker.size()));
+		}
+	}
+	return path;
 }
 
 bool IsKnownTopLevel(const Instance& instance, XrPath path)
 {
 	const std::string value = instance.PathString(path);
-	return value == kLeftPath || value == kRightPath || value == kHeadPath || value == "/user/gamepad" || value == "/user/treadmill";
+	return value == kLeftPath || value == kRightPath || value == kHeadPath || value == "/user/gamepad" || value == "/user/treadmill" || (instance.eyeGazeEnabled && value == kEyesPath);
 }
 
 bool ResolveTouchPath(Instance& instance, XrPath path, XrActionType type, Binding& binding)
 {
-	const CoreProfile& profile = kCoreProfiles[7];
+	const CoreProfile& profile = *FindProfile(kProfilePath);
 	const std::string original = instance.PathString(path);
 	std::string resolved = original;
 	binding.input = {};
 	binding.input.left = original.starts_with(kLeftPath);
 	const size_t userSize = binding.input.left ? kLeftPath.size() : kRightPath.size();
 	std::string_view suffix = std::string_view(original).substr(userSize);
-	if (!ProfilePathSupported(profile, original, false))
+	if (!ProfilePathSupported(instance, profile, original, false))
 	{
 		const auto select = [&](std::string_view component)
 		{
 			const std::string candidate = original + std::string(component);
-			if (!ProfilePathSupported(profile, candidate, false))
+			if (!ProfilePathSupported(instance, profile, candidate, false))
 			{
 				return false;
 			}
@@ -146,7 +216,7 @@ bool ResolveTouchPath(Instance& instance, XrPath path, XrActionType type, Bindin
 			}
 			case XR_ACTION_TYPE_VECTOR2F_INPUT:
 			{
-				if (!ProfilePathSupported(profile, original + "/x", false) || !ProfilePathSupported(profile, original + "/y", false))
+				if (!ProfilePathSupported(instance, profile, original + "/x", false) || !ProfilePathSupported(instance, profile, original + "/y", false))
 				{
 					return false;
 				}
@@ -170,7 +240,7 @@ bool ResolveTouchPath(Instance& instance, XrPath path, XrActionType type, Bindin
 		suffix = std::string_view(resolved).substr(userSize);
 	}
 	binding.path = instance.InternPath(resolved);
-	if (suffix == "/input/grip/pose" || suffix == "/input/aim/pose")
+	if (suffix == "/input/grip/pose" || suffix == "/input/aim/pose" || suffix == "/input/grip_surface/pose" || suffix == "/input/palm_ext/pose")
 	{
 		binding.input.kind = InputKind::Pose;
 		return type == XR_ACTION_TYPE_POSE_INPUT;
@@ -236,6 +306,18 @@ bool ResolveTouchPath(Instance& instance, XrPath path, XrActionType type, Bindin
 		binding.input.channel = 3;
 		return true;
 	}
+	if (suffix == "/input/trigger/proximity")
+	{
+		binding.input.kind = InputKind::Proximity;
+		binding.input.channel = 0;
+		return true;
+	}
+	if (suffix == "/input/thumb_resting_surfaces/proximity")
+	{
+		binding.input.kind = InputKind::Proximity;
+		binding.input.channel = 1;
+		return true;
+	}
 	if (suffix == "/input/thumbrest/touch")
 	{
 		binding.input.channel = 4;
@@ -294,6 +376,17 @@ ReadValue ReadBinding(const SimState& state, const Binding& binding)
 			result.booleanValue = controller.touches[binding.input.channel];
 		}
 		break;
+	case InputKind::Proximity:
+		// Touch implies proximity. Channel 0 is the trigger; channel 1 covers every thumb resting surface (face buttons, thumbstick, thumbrest).
+		if (binding.input.channel == 0)
+		{
+			result.booleanValue = controller.touches[3];
+		}
+		else
+		{
+			result.booleanValue = controller.touches[0] || controller.touches[1] || controller.touches[2] || controller.touches[4];
+		}
+		break;
 	case InputKind::Trigger:
 		result.floatValue = controller.trigger;
 		break;
@@ -328,17 +421,17 @@ bool MatchesSubaction(const Binding& binding, XrPath subactionPath)
 	return subactionPath == XR_NULL_PATH || binding.subactionPath == XR_NULL_PATH || binding.subactionPath == subactionPath;
 }
 
-ActionSnapshot ReadAction(const Action& action, const SimState& state, XrPath subactionPath)
+ActionSnapshot ReadAction(const Action& action, const SimState& state, XrPath subactionPath, const std::unordered_set<const Binding*>& suppressed)
 {
 	ActionSnapshot result;
 	for (const Binding& binding : action.bindings)
 	{
-		if (!MatchesSubaction(binding, subactionPath))
+		if (!MatchesSubaction(binding, subactionPath) || suppressed.contains(&binding))
 		{
 			continue;
 		}
 		const ReadValue value = ReadBinding(state, binding);
-		const bool booleanBinding = binding.input.kind == InputKind::Button || binding.input.kind == InputKind::Touch;
+		const bool booleanBinding = binding.input.kind == InputKind::Button || binding.input.kind == InputKind::Touch || binding.input.kind == InputKind::Proximity;
 		result.active = result.active || value.active;
 		switch (action.type)
 		{
@@ -720,7 +813,7 @@ extern "C" AGENTXR_API XRAPI_ATTR XrResult XRAPI_CALL xrSuggestInteractionProfil
 			return XR_ERROR_PATH_INVALID;
 		}
 		const CoreProfile* profile = FindProfile(profileName);
-		if (profile == nullptr)
+		if (profile == nullptr || !ProfileAvailable(*instance->object, *profile))
 		{
 			return XR_ERROR_PATH_UNSUPPORTED;
 		}
@@ -734,7 +827,7 @@ extern "C" AGENTXR_API XRAPI_ATTR XrResult XRAPI_CALL xrSuggestInteractionProfil
 			{
 				return XR_ERROR_PATH_INVALID;
 			}
-			if (!ProfilePathSupported(*profile, path))
+			if (!ProfilePathSupported(*instance->object, *profile, path))
 			{
 				return XR_ERROR_PATH_UNSUPPORTED;
 			}
@@ -904,6 +997,72 @@ extern "C" AGENTXR_API XRAPI_ATTR XrResult XRAPI_CALL xrSyncActions(XrSession se
 				}
 			}
 		}
+		// Core action set priority (XrActionSetCreateInfo::priority): a binding is suppressed while an active action in a higher-priority set is bound to the same input source.
+		// XR_EXT_active_action_set_priority overrides the priority of the listed sets for this sync only.
+		std::unordered_map<XrActionSet, uint32_t> priorityOverrides;
+		if (owner.instance->activeActionSetPriorityEnabled)
+		{
+			for (const auto* chain = static_cast<const XrBaseInStructure*>(syncInfo->next); chain != nullptr; chain = chain->next)
+			{
+				if (chain->type != XR_TYPE_ACTIVE_ACTION_SET_PRIORITIES_EXT)
+				{
+					continue;
+				}
+				const auto* priorities = reinterpret_cast<const XrActiveActionSetPrioritiesEXT*>(chain);
+				if (priorities->actionSetPriorityCount == 0 || priorities->actionSetPriorities == nullptr)
+				{
+					return XR_ERROR_VALIDATION_FAILURE;
+				}
+				for (uint32_t index = 0; index < priorities->actionSetPriorityCount; ++index)
+				{
+					const XrActiveActionSetPriorityEXT& entry = priorities->actionSetPriorities[index];
+					if (!IsValidActionSet(entry.actionSet) || entry.actionSet->object->instance != owner.instance)
+					{
+						return XR_ERROR_HANDLE_INVALID;
+					}
+					if (!priorityOverrides.emplace(entry.actionSet, entry.priorityOverride).second)
+					{
+						return XR_ERROR_VALIDATION_FAILURE;
+					}
+				}
+			}
+		}
+		struct ActiveBinding
+		{
+			const Binding* binding;
+			uint32_t priority;
+			std::string source;
+		};
+		std::vector<ActiveBinding> activeBindings;
+		std::unordered_map<std::string, uint32_t> highestPriority;
+		for (uint32_t index = 0; index < syncInfo->countActiveActionSets; ++index)
+		{
+			const XrActiveActionSet& active = syncInfo->activeActionSets[index];
+			const auto overridden = priorityOverrides.find(active.actionSet);
+			const uint32_t priority = overridden != priorityOverrides.end() ? overridden->second : active.actionSet->object->priority;
+			for (XrAction actionHandle : active.actionSet->object->actions)
+			{
+				for (const Binding& binding : actionHandle->object->bindings)
+				{
+					if (active.subactionPath != XR_NULL_PATH && binding.subactionPath != active.subactionPath)
+					{
+						continue;
+					}
+					std::string source = InputSourceKey(owner.instance->PathString(binding.path));
+					uint32_t& highest = highestPriority.try_emplace(source, 0).first->second;
+					highest = std::max(highest, priority);
+					activeBindings.push_back({&binding, priority, std::move(source)});
+				}
+			}
+		}
+		std::unordered_set<const Binding*> suppressed;
+		for (const ActiveBinding& entry : activeBindings)
+		{
+			if (entry.priority < highestPriority[entry.source])
+			{
+				suppressed.insert(entry.binding);
+			}
+		}
 		const XrTime sampleTime = owner.instance->clock.Now();
 		const SimState previousState = owner.lastSyncTime == 0 ? owner.fallbackState : owner.StateAtLocked(owner.lastSyncTime);
 		if (owner.neutralizePending)
@@ -961,7 +1120,7 @@ extern "C" AGENTXR_API XRAPI_ATTR XrResult XRAPI_CALL xrSyncActions(XrSession se
 							}
 						}
 					}
-					const ActionSnapshot next = subactionActive && record.focused ? ReadAction(action, state, subactionPath) : ActionSnapshot{};
+					const ActionSnapshot next = subactionActive && record.focused ? ReadAction(action, state, subactionPath, suppressed) : ActionSnapshot{};
 					const auto previousIt = action.snapshots.find(subactionPath);
 					const ActionSnapshot previous = owner.lastSyncTime == 0 || previousIt == action.snapshots.end() ? ActionSnapshot{} : previousIt->second;
 					ActionSnapshot snapshot = next;

@@ -114,9 +114,36 @@ std::filesystem::path ModulePath()
 	return std::filesystem::path(buffer.data(), buffer.data() + length);
 }
 
-bool IsExpectedExtension(std::string_view name)
+struct ExtensionInfo
 {
-	return name == XR_KHR_D3D12_ENABLE_EXTENSION_NAME || name == XR_EXT_LOCAL_FLOOR_EXTENSION_NAME;
+	const char* name;
+	uint32_t version;
+	bool Instance::* flag;
+};
+
+// Every extension the runtime advertises; each one is a bool on Instance so entry points and validation can gate on it.
+inline constexpr std::array kExtensions = std::to_array<ExtensionInfo>({
+	{XR_KHR_D3D12_ENABLE_EXTENSION_NAME, XR_KHR_D3D12_enable_SPEC_VERSION, &Instance::d3d12Enabled},
+	{XR_EXT_LOCAL_FLOOR_EXTENSION_NAME, XR_EXT_local_floor_SPEC_VERSION, &Instance::localFloorEnabled},
+	{XR_KHR_COMPOSITION_LAYER_DEPTH_EXTENSION_NAME, XR_KHR_composition_layer_depth_SPEC_VERSION, &Instance::compositionLayerDepthEnabled},
+	{XR_EXT_PALM_POSE_EXTENSION_NAME, XR_EXT_palm_pose_SPEC_VERSION, &Instance::palmPoseEnabled},
+	{XR_EXT_ACTIVE_ACTION_SET_PRIORITY_EXTENSION_NAME, XR_EXT_active_action_set_priority_SPEC_VERSION, &Instance::activeActionSetPriorityEnabled},
+	{XR_EXT_HAND_TRACKING_EXTENSION_NAME, XR_EXT_hand_tracking_SPEC_VERSION, &Instance::handTrackingEnabled},
+	{XR_EXT_EYE_GAZE_INTERACTION_EXTENSION_NAME, XR_EXT_eye_gaze_interaction_SPEC_VERSION, &Instance::eyeGazeEnabled},
+	{XR_KHR_LOCATE_SPACES_EXTENSION_NAME, XR_KHR_locate_spaces_SPEC_VERSION, &Instance::locateSpacesEnabled},
+	{XR_KHR_MAINTENANCE1_EXTENSION_NAME, XR_KHR_maintenance1_SPEC_VERSION, &Instance::maintenance1Enabled},
+});
+
+const ExtensionInfo* FindExtension(std::string_view name)
+{
+	for (const ExtensionInfo& extension : kExtensions)
+	{
+		if (name == extension.name)
+		{
+			return &extension;
+		}
+	}
+	return nullptr;
 }
 
 XrResult EnsureInstance(XrInstance instance)
@@ -241,9 +268,7 @@ SimState DefaultSimState()
 	SimState state;
 	state.head.position = {0.0f, 1.65f, 0.0f};
 	state.leftGrip.position = {-0.25f, 1.20f, -0.35f};
-	state.leftAim.position = {-0.25f, 1.20f, -0.35f};
 	state.rightGrip.position = {0.25f, 1.20f, -0.35f};
-	state.rightAim.position = {0.25f, 1.20f, -0.35f};
 	return state;
 }
 
@@ -674,12 +699,15 @@ extern "C" AGENTXR_API XRAPI_ATTR XrResult XRAPI_CALL xrNegotiateLoaderRuntimeIn
 		{
 			return XR_ERROR_INITIALIZATION_FAILED;
 		}
-		if (loaderInfo->minInterfaceVersion > XR_CURRENT_LOADER_RUNTIME_VERSION || loaderInfo->maxInterfaceVersion < XR_CURRENT_LOADER_RUNTIME_VERSION || loaderInfo->minApiVersion > XR_API_VERSION_1_0 || loaderInfo->maxApiVersion < XR_API_VERSION_1_0)
+		// Negotiate on major.minor only: loaders report their own patch level (for example 1.1.46) independent of the vendored headers.
+		const XrVersion minimum = XR_MAKE_VERSION(XR_VERSION_MAJOR(loaderInfo->minApiVersion), XR_VERSION_MINOR(loaderInfo->minApiVersion), 0);
+		const XrVersion maximum = XR_MAKE_VERSION(XR_VERSION_MAJOR(loaderInfo->maxApiVersion), XR_VERSION_MINOR(loaderInfo->maxApiVersion), 0);
+		if (loaderInfo->minInterfaceVersion > XR_CURRENT_LOADER_RUNTIME_VERSION || loaderInfo->maxInterfaceVersion < XR_CURRENT_LOADER_RUNTIME_VERSION || minimum > XR_MAKE_VERSION(1, 1, 0) || maximum < XR_MAKE_VERSION(1, 0, 0))
 		{
 			return XR_ERROR_API_VERSION_UNSUPPORTED;
 		}
 		runtimeRequest->runtimeInterfaceVersion = XR_CURRENT_LOADER_RUNTIME_VERSION;
-		runtimeRequest->runtimeApiVersion = XR_API_VERSION_1_0;
+		runtimeRequest->runtimeApiVersion = maximum >= XR_MAKE_VERSION(1, 1, 0) ? XR_API_VERSION_1_1 : XR_API_VERSION_1_0;
 		runtimeRequest->getInstanceProcAddr = &xrGetInstanceProcAddr;
 		return XR_SUCCESS;
 	});
@@ -761,6 +789,35 @@ extern "C" AGENTXR_API XRAPI_ATTR XrResult XRAPI_CALL xrGetInstanceProcAddr(XrIn
 		AGENTXR_INSTANCE_PROC(xrGetInputSourceLocalizedName)
 		AGENTXR_INSTANCE_PROC(xrApplyHapticFeedback)
 		AGENTXR_INSTANCE_PROC(xrStopHapticFeedback)
+		const agentxr::Instance& enabledInstance = *instance->object;
+		if (enabledInstance.version11 && std::strcmp(name, "xrLocateSpaces") == 0)
+		{
+			*function = reinterpret_cast<PFN_xrVoidFunction>(&xrLocateSpaces);
+			return XR_SUCCESS;
+		}
+		if (enabledInstance.locateSpacesEnabled && std::strcmp(name, "xrLocateSpacesKHR") == 0)
+		{
+			*function = reinterpret_cast<PFN_xrVoidFunction>(&xrLocateSpaces);
+			return XR_SUCCESS;
+		}
+		if (enabledInstance.handTrackingEnabled)
+		{
+			if (std::strcmp(name, "xrCreateHandTrackerEXT") == 0)
+			{
+				*function = reinterpret_cast<PFN_xrVoidFunction>(&xrCreateHandTrackerEXT);
+				return XR_SUCCESS;
+			}
+			if (std::strcmp(name, "xrDestroyHandTrackerEXT") == 0)
+			{
+				*function = reinterpret_cast<PFN_xrVoidFunction>(&xrDestroyHandTrackerEXT);
+				return XR_SUCCESS;
+			}
+			if (std::strcmp(name, "xrLocateHandJointsEXT") == 0)
+			{
+				*function = reinterpret_cast<PFN_xrVoidFunction>(&xrLocateHandJointsEXT);
+				return XR_SUCCESS;
+			}
+		}
 		if (std::strcmp(name, "xrGetD3D12GraphicsRequirementsKHR") == 0 && instance->object->d3d12Enabled)
 		{
 			*function = reinterpret_cast<PFN_xrVoidFunction>(&xrGetD3D12GraphicsRequirementsKHR);
@@ -796,13 +853,13 @@ extern "C" AGENTXR_API XRAPI_ATTR XrResult XRAPI_CALL xrEnumerateInstanceExtensi
 		{
 			return XR_ERROR_API_LAYER_NOT_PRESENT;
 		}
-		std::array<XrExtensionProperties, 2> supported{};
-		supported[0].type = XR_TYPE_EXTENSION_PROPERTIES;
-		supported[0].extensionVersion = XR_KHR_D3D12_enable_SPEC_VERSION;
-		agentxr::CopyString(supported[0].extensionName, sizeof(supported[0].extensionName), XR_KHR_D3D12_ENABLE_EXTENSION_NAME);
-		supported[1].type = XR_TYPE_EXTENSION_PROPERTIES;
-		supported[1].extensionVersion = XR_EXT_local_floor_SPEC_VERSION;
-		agentxr::CopyString(supported[1].extensionName, sizeof(supported[1].extensionName), XR_EXT_LOCAL_FLOOR_EXTENSION_NAME);
+		std::array<XrExtensionProperties, agentxr::kExtensions.size()> supported{};
+		for (size_t index = 0; index < supported.size(); ++index)
+		{
+			supported[index].type = XR_TYPE_EXTENSION_PROPERTIES;
+			supported[index].extensionVersion = agentxr::kExtensions[index].version;
+			agentxr::CopyString(supported[index].extensionName, sizeof(supported[index].extensionName), agentxr::kExtensions[index].name);
+		}
 		return agentxr::EnumerateArray(capacity, count, properties, sizeof(XrExtensionProperties), supported.data(), static_cast<uint32_t>(supported.size()));
 	});
 }
@@ -815,7 +872,7 @@ extern "C" AGENTXR_API XRAPI_ATTR XrResult XRAPI_CALL xrCreateInstance(const XrI
 		{
 			return XR_ERROR_VALIDATION_FAILURE;
 		}
-		if (createInfo->applicationInfo.apiVersion != 0 && (XR_VERSION_MAJOR(createInfo->applicationInfo.apiVersion) != 1 || XR_VERSION_MINOR(createInfo->applicationInfo.apiVersion) > 0))
+		if (createInfo->applicationInfo.apiVersion != 0 && (XR_VERSION_MAJOR(createInfo->applicationInfo.apiVersion) != 1 || XR_VERSION_MINOR(createInfo->applicationInfo.apiVersion) > 1))
 		{
 			return XR_ERROR_API_VERSION_UNSUPPORTED;
 		}
@@ -828,8 +885,8 @@ extern "C" AGENTXR_API XRAPI_ATTR XrResult XRAPI_CALL xrCreateInstance(const XrI
 			}
 			return XR_ERROR_API_LAYER_NOT_PRESENT;
 		}
-		bool d3d12 = false;
-		bool localFloor = false;
+		const bool version11 = createInfo->applicationInfo.apiVersion != 0 && XR_VERSION_MINOR(createInfo->applicationInfo.apiVersion) == 1;
+		std::array<bool, agentxr::kExtensions.size()> enabledFlags{};
 		for (uint32_t index = 0; index < createInfo->enabledExtensionCount; ++index)
 		{
 			if (createInfo->enabledExtensionNames == nullptr || createInfo->enabledExtensionNames[index] == nullptr)
@@ -841,17 +898,26 @@ extern "C" AGENTXR_API XRAPI_ATTR XrResult XRAPI_CALL xrCreateInstance(const XrI
 			{
 				return XR_ERROR_NAME_DUPLICATED;
 			}
-			if (!agentxr::IsExpectedExtension(extension))
+			const agentxr::ExtensionInfo* known = agentxr::FindExtension(extension);
+			if (known == nullptr)
 			{
 				return XR_ERROR_EXTENSION_NOT_PRESENT;
 			}
-			d3d12 = d3d12 || extension == XR_KHR_D3D12_ENABLE_EXTENSION_NAME;
-			localFloor = localFloor || extension == XR_EXT_LOCAL_FLOOR_EXTENSION_NAME;
+			enabledFlags[static_cast<size_t>(known - agentxr::kExtensions.data())] = true;
+		}
+		if (!agentxr::LoadDeviceProfile())
+		{
+			return XR_ERROR_RUNTIME_FAILURE;
 		}
 		auto* state = new agentxr::Instance;
 		state->clock = agentxr::Clock::Create();
-		state->d3d12Enabled = d3d12;
-		state->localFloorEnabled = localFloor;
+		for (size_t index = 0; index < enabledFlags.size(); ++index)
+		{
+			state->*(agentxr::kExtensions[index].flag) = enabledFlags[index];
+		}
+		state->version11 = version11;
+		// Core 1.1 includes LOCAL_FLOOR; 1.0 applications opt in through XR_EXT_local_floor.
+		state->localFloorEnabled = state->localFloorEnabled || version11;
 		state->instanceId = agentxr::MakeInstanceId();
 		state->processCreationTime = agentxr::ProcessCreationTime();
 		state->manifestPath = agentxr::ModulePath().parent_path() / L"agent-xr.json";
@@ -1048,6 +1114,18 @@ extern "C" AGENTXR_API XRAPI_ATTR XrResult XRAPI_CALL xrGetSystemProperties(XrIn
 		agentxr::CopyString(properties->systemName, sizeof(properties->systemName), "AgentXR");
 		properties->graphicsProperties = {4096, 4096, XR_MIN_COMPOSITION_LAYERS_SUPPORTED};
 		properties->trackingProperties = {XR_TRUE, XR_TRUE};
+		for (auto* next = reinterpret_cast<XrBaseOutStructure*>(properties->next); next != nullptr; next = next->next)
+		{
+			if (next->type == XR_TYPE_SYSTEM_HAND_TRACKING_PROPERTIES_EXT && instance->object->handTrackingEnabled)
+			{
+				reinterpret_cast<XrSystemHandTrackingPropertiesEXT*>(next)->supportsHandTracking = XR_TRUE;
+			}
+			else if (next->type == XR_TYPE_SYSTEM_EYE_GAZE_INTERACTION_PROPERTIES_EXT && instance->object->eyeGazeEnabled)
+			{
+				// Controllers are the only tracked devices; there is no eye tracker.
+				reinterpret_cast<XrSystemEyeGazeInteractionPropertiesEXT*>(next)->supportsEyeGazeInteraction = XR_FALSE;
+			}
+		}
 		return XR_SUCCESS;
 	});
 }
@@ -1481,8 +1559,8 @@ extern "C" AGENTXR_API XRAPI_ATTR XrResult XRAPI_CALL xrWaitFrame(XrSession sess
 			}
 			if (!state.report.frames.empty())
 			{
-				const agentxr::TrackedPose* before[] = {&state.lastPublishedState.head, &state.lastPublishedState.leftGrip, &state.lastPublishedState.leftAim, &state.lastPublishedState.rightGrip, &state.lastPublishedState.rightAim};
-				const agentxr::TrackedPose* after[] = {&sampled.head, &sampled.leftGrip, &sampled.leftAim, &sampled.rightGrip, &sampled.rightAim};
+				const agentxr::TrackedPose* before[] = {&state.lastPublishedState.head, &state.lastPublishedState.leftGrip, &state.lastPublishedState.rightGrip};
+				const agentxr::TrackedPose* after[] = {&sampled.head, &sampled.leftGrip, &sampled.rightGrip};
 				for (size_t index = 0; index < std::size(before); ++index)
 				{
 					if (before[index]->positionValid != after[index]->positionValid)

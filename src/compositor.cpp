@@ -114,10 +114,20 @@ bool SupportedFormat(int64_t value)
 	return format == DXGI_FORMAT_R8G8B8A8_UNORM || format == DXGI_FORMAT_B8G8R8A8_UNORM || format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB || format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
 }
 
+bool SupportedDepthFormat(int64_t value)
+{
+	const DXGI_FORMAT format = static_cast<DXGI_FORMAT>(value);
+	return format == DXGI_FORMAT_D24_UNORM_S8_UINT || format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT || format == DXGI_FORMAT_D32_FLOAT || format == DXGI_FORMAT_D16_UNORM;
+}
+
 DXGI_FORMAT TypelessFormat(DXGI_FORMAT format)
 {
 	if (format == DXGI_FORMAT_R8G8B8A8_UNORM || format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB) return DXGI_FORMAT_R8G8B8A8_TYPELESS;
 	if (format == DXGI_FORMAT_B8G8R8A8_UNORM || format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB) return DXGI_FORMAT_B8G8R8A8_TYPELESS;
+	if (format == DXGI_FORMAT_D24_UNORM_S8_UINT) return DXGI_FORMAT_R24G8_TYPELESS;
+	if (format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT) return DXGI_FORMAT_R32G8X24_TYPELESS;
+	if (format == DXGI_FORMAT_D32_FLOAT) return DXGI_FORMAT_R32_TYPELESS;
+	if (format == DXGI_FORMAT_D16_UNORM) return DXGI_FORMAT_R16_TYPELESS;
 	return format;
 }
 
@@ -712,18 +722,31 @@ XrResult Compositor::CreateSwapchain(const XrSwapchainCreateInfo& info, Swapchai
 {
 	std::lock_guard lock(mutex);
 	if (!initialized || deviceLost) return XR_ERROR_GRAPHICS_DEVICE_INVALID;
-	if (!SupportedFormat(info.format)) return XR_ERROR_SWAPCHAIN_FORMAT_UNSUPPORTED;
+	const bool depthUsage = (info.usageFlags & XR_SWAPCHAIN_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT) != 0;
+	const bool colorUsage = (info.usageFlags & XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT) != 0;
+	if (depthUsage ? !SupportedDepthFormat(info.format) : !SupportedFormat(info.format)) return XR_ERROR_SWAPCHAIN_FORMAT_UNSUPPORTED;
 	if (info.sampleCount != 1 || info.faceCount != 1 || info.mipCount != 1 || (info.arraySize != 1 && info.arraySize != 2) || info.width == 0 || info.height == 0 || info.width > 4096 || info.height > 4096) return XR_ERROR_VALIDATION_FAILURE;
-	if ((info.usageFlags & XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT) == 0 || (info.usageFlags & XR_SWAPCHAIN_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT) != 0) return XR_ERROR_FEATURE_UNSUPPORTED;
+	if (depthUsage == colorUsage) return XR_ERROR_FEATURE_UNSUPPORTED;
 	swapchain.info = info;
+	swapchain.depth = depthUsage;
 	swapchain.viewFormat = static_cast<DXGI_FORMAT>(info.format);
-	swapchain.resourceFormat = (info.usageFlags & XR_SWAPCHAIN_USAGE_MUTABLE_FORMAT_BIT) != 0 ? TypelessFormat(swapchain.viewFormat) : swapchain.viewFormat;
+	// Depth images are always typeless so the application can create both depth-stencil and shader-resource views.
+	swapchain.resourceFormat = depthUsage || (info.usageFlags & XR_SWAPCHAIN_USAGE_MUTABLE_FORMAT_BIT) != 0 ? TypelessFormat(swapchain.viewFormat) : swapchain.viewFormat;
 	swapchain.staticImage = (info.createFlags & XR_SWAPCHAIN_CREATE_STATIC_IMAGE_BIT) != 0;
 	swapchain.images.resize(swapchain.staticImage ? 1u : 3u);
 	D3D12_HEAP_PROPERTIES heap{};
 	heap.Type = D3D12_HEAP_TYPE_DEFAULT;
-	const D3D12_RESOURCE_DESC description = TextureDesc(swapchain.resourceFormat, info.width, info.height, static_cast<UINT16>(info.arraySize), D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
-	const D3D12_CLEAR_VALUE clear{swapchain.viewFormat, {0.0f, 0.0f, 0.0f, 1.0f}};
+	const D3D12_RESOURCE_DESC description = TextureDesc(swapchain.resourceFormat, info.width, info.height, static_cast<UINT16>(info.arraySize), depthUsage ? D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL : D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+	D3D12_CLEAR_VALUE clear{};
+	clear.Format = swapchain.viewFormat;
+	if (depthUsage)
+	{
+		clear.DepthStencil = {1.0f, 0};
+	}
+	else
+	{
+		clear.Color[3] = 1.0f;
+	}
 	for (SwapchainImage& image : swapchain.images)
 	{
 		if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &description, D3D12_RESOURCE_STATE_COMMON, &clear, IID_PPV_ARGS(&image.resource)))) return XR_ERROR_OUT_OF_MEMORY;
@@ -812,12 +835,13 @@ XrResult Compositor::WaitSwapchainImage(Swapchain& swapchain, XrDuration timeout
 	if (swapchain.acquiredIndices.empty() || swapchain.acquiredIndices.front() != candidate || candidate >= swapchain.images.size()) return XR_ERROR_CALL_ORDER_INVALID;
 	SwapchainImage& waitedImage = swapchain.images[candidate];
 	if (!waitedImage.acquired || waitedImage.waited || waitedImage.released) return XR_ERROR_CALL_ORDER_INVALID;
-	if (waitedImage.state != D3D12_RESOURCE_STATE_RENDER_TARGET)
+	const D3D12_RESOURCE_STATES waitTarget = swapchain.depth ? D3D12_RESOURCE_STATE_DEPTH_WRITE : D3D12_RESOURCE_STATE_RENDER_TARGET;
+	if (waitedImage.state != waitTarget)
 	{
 		if (FAILED(allocator->Reset()) || FAILED(commandList->Reset(allocator.Get(), pipeline.Get()))) return XR_ERROR_RUNTIME_FAILURE;
-		Transition(commandList.Get(), waitedImage.resource.Get(), waitedImage.state, D3D12_RESOURCE_STATE_RENDER_TARGET);
+		Transition(commandList.Get(), waitedImage.resource.Get(), waitedImage.state, waitTarget);
 		if (!SubmitAndSignal(0)) return XR_ERROR_RUNTIME_FAILURE;
-		waitedImage.state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+		waitedImage.state = waitTarget;
 	}
 	swapchain.acquiredIndices.pop_front();
 	swapchain.waitedIndices.push_back(candidate);
@@ -880,6 +904,11 @@ XrResult Compositor::Compose(const XrFrameEndInfo& endInfo, uint64_t frameId, Co
 			return false;
 		}
 		Swapchain& source = *subImage.swapchain->object;
+		if (source.depth)
+		{
+			preflightResult = XR_ERROR_LAYER_INVALID;
+			return false;
+		}
 		if (source.lastReleasedIndex == UINT32_MAX || source.lastReleasedIndex >= source.images.size() || subImage.imageArrayIndex >= source.info.arraySize || !ValidRect(subImage.imageRect, source.info.width, source.info.height))
 		{
 			preflightResult = XR_ERROR_LAYER_INVALID;
@@ -893,6 +922,40 @@ XrResult Compositor::Compose(const XrFrameEndInfo& endInfo, uint64_t frameId, Co
 		}
 		hasFreshContent = hasFreshContent || image.releaseSerial != image.lastComposedReleaseSerial;
 		++preflightSrvIndex;
+		return true;
+	};
+	// XR_KHR_composition_layer_depth: validate the depth image chained on a projection view; the depth image is never drawn.
+	const auto inspectDepth = [&](const XrCompositionLayerProjectionView& view) -> bool
+	{
+		if (!session.instance->compositionLayerDepthEnabled)
+		{
+			return true;
+		}
+		for (const auto* next = static_cast<const XrBaseInStructure*>(view.next); next != nullptr; next = next->next)
+		{
+			if (next->type != XR_TYPE_COMPOSITION_LAYER_DEPTH_INFO_KHR)
+			{
+				continue;
+			}
+			const auto* depth = reinterpret_cast<const XrCompositionLayerDepthInfoKHR*>(next);
+			if (!IsValidSwapchain(depth->subImage.swapchain) || depth->subImage.swapchain->object->session != &session)
+			{
+				preflightResult = XR_ERROR_LAYER_INVALID;
+				return false;
+			}
+			const Swapchain& source = *depth->subImage.swapchain->object;
+			if (!source.depth || source.lastReleasedIndex == UINT32_MAX || source.lastReleasedIndex >= source.images.size() || !source.images[source.lastReleasedIndex].released || depth->subImage.imageArrayIndex >= source.info.arraySize || !ValidRect(depth->subImage.imageRect, source.info.width, source.info.height))
+			{
+				preflightResult = XR_ERROR_LAYER_INVALID;
+				return false;
+			}
+			// minDepth < maxDepth within [0, 1]; nearZ and farZ positive and distinct (farZ may be infinite). NaN fails every comparison.
+			if (!(depth->minDepth >= 0.0f && depth->maxDepth <= 1.0f && depth->minDepth < depth->maxDepth) || !(depth->nearZ > 0.0f && depth->farZ > 0.0f && depth->nearZ != depth->farZ))
+			{
+				preflightResult = XR_ERROR_VALIDATION_FAILURE;
+				return false;
+			}
+		}
 		return true;
 	};
 	for (uint32_t layerIndex = 0; layerIndex < endInfo.layerCount && preflightResult == XR_SUCCESS; ++layerIndex)
@@ -913,7 +976,7 @@ XrResult Compositor::Compose(const XrFrameEndInfo& endInfo, uint64_t frameId, Co
 			}
 			for (uint32_t viewIndex = 0; viewIndex < 2; ++viewIndex)
 			{
-				if (!inspect(projection->views[viewIndex].subImage))
+				if (!inspect(projection->views[viewIndex].subImage) || !inspectDepth(projection->views[viewIndex]))
 				{
 					break;
 				}
@@ -1254,7 +1317,7 @@ extern "C" AGENTXR_API XRAPI_ATTR XrResult XRAPI_CALL xrEnumerateSwapchainFormat
 	return GuardResult([&]() -> XrResult
 	{
 		if (!IsValidSession(session)) return XR_ERROR_HANDLE_INVALID;
-		const std::array<int64_t, 4> supported = {DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, DXGI_FORMAT_B8G8R8A8_UNORM_SRGB};
+		const std::array<int64_t, 8> supported = {DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, DXGI_FORMAT_B8G8R8A8_UNORM_SRGB, DXGI_FORMAT_D24_UNORM_S8_UINT, DXGI_FORMAT_D32_FLOAT_S8X24_UINT, DXGI_FORMAT_D32_FLOAT, DXGI_FORMAT_D16_UNORM};
 		return EnumerateArray(capacity, count, formats, sizeof(int64_t), supported.data(), static_cast<uint32_t>(supported.size()));
 	});
 }

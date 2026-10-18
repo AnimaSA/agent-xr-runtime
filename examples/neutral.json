@@ -1,7 +1,6 @@
 {
   "schemaVersion": 1,
   "durationSeconds": 1.0,
-  "sampleRateHz": 90,
   "interpolation": "step",
   "initial": {
     "head": {
@@ -10,7 +9,6 @@
     },
     "left": {
       "grip": {"position": [-0.25, 1.2, -0.35], "orientation": [0.0, 0.0, 0.0, 1.0]},
-      "aim": {"position": [-0.25, 1.2, -0.35], "orientation": [0.0, 0.0, 0.0, 1.0]},
       "active": true,
       "buttons": {"x": false, "y": false, "menu": false, "thumbstick": false},
       "touches": {"x": false, "y": false, "thumbstick": false, "trigger": false},
@@ -20,7 +18,6 @@
     },
     "right": {
       "grip": {"position": [0.25, 1.2, -0.35], "orientation": [0.0, 0.0, 0.0, 1.0]},
-      "aim": {"position": [0.25, 1.2, -0.35], "orientation": [0.0, 0.0, 0.0, 1.0]},
       "active": true,
       "buttons": {"a": false, "b": false, "thumbstick": false},
       "touches": {"a": false, "b": false, "thumbstick": false, "trigger": false},

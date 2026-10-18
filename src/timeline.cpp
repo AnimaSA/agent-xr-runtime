@@ -39,27 +39,15 @@ struct StatePatch
 	std::optional<bool> focused;
 	std::optional<PosePatch> head;
 	std::optional<PosePatch> leftGrip;
-	std::optional<PosePatch> leftAim;
 	std::optional<PosePatch> rightGrip;
-	std::optional<PosePatch> rightAim;
 	std::optional<ControllerPatch> left;
 	std::optional<ControllerPatch> right;
-};
-
-enum class Interpolation : uint8_t
-{
-	Step,
-	Linear,
-	EaseIn,
-	EaseOut,
-	EaseInOut
 };
 
 struct Keyframe
 {
 	int64_t timeNs = 0;
 	Interpolation interpolation = Interpolation::Linear;
-	uint32_t sampleRateHz = 90;
 	StatePatch patch;
 };
 
@@ -312,7 +300,7 @@ bool ParseStatePatch(const Json& value, StatePatch& result, std::string& error, 
 		error = "missing head";
 		return false;
 	}
-	const auto parseHand = [&](const char* key, bool left, std::optional<ControllerPatch>& controller, std::optional<PosePatch>& grip, std::optional<PosePatch>& aim) -> bool
+	const auto parseHand = [&](const char* key, bool left, std::optional<ControllerPatch>& controller, std::optional<PosePatch>& grip) -> bool
 	{
 		if (!value.contains(key))
 		{
@@ -329,17 +317,14 @@ bool ParseStatePatch(const Json& value, StatePatch& result, std::string& error, 
 			error = std::string(key) + " must be object";
 			return false;
 		}
-		if (!HasOnly(hand, {"grip", "aim", "active", "buttons", "touches", "trigger", "squeeze", "thumbstick"}, error))
+		if (!HasOnly(hand, {"grip", "active", "buttons", "touches", "trigger", "squeeze", "thumbstick"}, error))
 		{
 			return false;
 		}
-		if (!hand.contains("grip") || !hand.contains("aim"))
+		if (!hand.contains("grip") && requireComplete)
 		{
-			if (requireComplete)
-			{
-				error = std::string(key) + " requires grip and aim";
-				return false;
-			}
+			error = std::string(key) + " requires grip";
+			return false;
 		}
 		if (hand.contains("grip"))
 		{
@@ -350,18 +335,8 @@ bool ParseStatePatch(const Json& value, StatePatch& result, std::string& error, 
 			}
 			grip = std::move(patch);
 		}
-		if (hand.contains("aim"))
-		{
-			PosePatch patch;
-			if (!ParsePosePatch(hand.at("aim"), patch, error, requireComplete))
-			{
-				return false;
-			}
-			aim = std::move(patch);
-		}
 		Json input = hand;
 		input.erase("grip");
-		input.erase("aim");
 		ControllerPatch patch;
 		if (!ParseControllerPatch(input, patch, error, requireComplete))
 		{
@@ -370,7 +345,7 @@ bool ParseStatePatch(const Json& value, StatePatch& result, std::string& error, 
 		controller = std::move(patch);
 		return true;
 	};
-	return parseHand("left", true, result.left, result.leftGrip, result.leftAim) && parseHand("right", false, result.right, result.rightGrip, result.rightAim);
+	return parseHand("left", true, result.left, result.leftGrip) && parseHand("right", false, result.right, result.rightGrip);
 }
 
 bool ParseInterpolation(const Json& value, Interpolation& result, std::string& error)
@@ -489,12 +464,10 @@ bool ApplyPatch(SimState& destination, const StatePatch& patch, std::string& err
 	}
 	if (patch.head.has_value()) ApplyPose(destination.head, *patch.head);
 	if (patch.leftGrip.has_value()) ApplyPose(destination.leftGrip, *patch.leftGrip);
-	if (patch.leftAim.has_value()) ApplyPose(destination.leftAim, *patch.leftAim);
 	if (patch.rightGrip.has_value()) ApplyPose(destination.rightGrip, *patch.rightGrip);
-	if (patch.rightAim.has_value()) ApplyPose(destination.rightAim, *patch.rightAim);
 	if (patch.left.has_value() && !ApplyController(destination.left, *patch.left, true, error)) return false;
 	if (patch.right.has_value() && !ApplyController(destination.right, *patch.right, false, error)) return false;
-	const TrackedPose* poses[] = {&destination.head, &destination.leftGrip, &destination.leftAim, &destination.rightGrip, &destination.rightAim};
+	const TrackedPose* poses[] = {&destination.head, &destination.leftGrip, &destination.rightGrip};
 	for (const TrackedPose* pose : poses)
 	{
 		if ((pose->positionTracked && !pose->positionValid) || (pose->orientationTracked && !pose->orientationValid))
@@ -542,18 +515,13 @@ Quat Nlerp(Quat a, Quat b, float alpha)
 TrackedPose InterpolatePose(const TrackedPose& a, const TrackedPose& b, float alpha)
 {
 	TrackedPose result = a;
+	if (a.position.x == b.position.x && a.position.y == b.position.y && a.position.z == b.position.z && a.orientation.x == b.orientation.x && a.orientation.y == b.orientation.y && a.orientation.z == b.orientation.z && a.orientation.w == b.orientation.w)
+	{
+		return result;
+	}
 	result.position = {a.position.x + (b.position.x - a.position.x) * alpha, a.position.y + (b.position.y - a.position.y) * alpha, a.position.z + (b.position.z - a.position.z) * alpha};
 	result.orientation = Nlerp(a.orientation, b.orientation, alpha);
 	return result;
-}
-
-void InterpolateChanged(SimState& destination, const SimState& start, const SimState& end, const StatePatch& patch, float alpha)
-{
-	if (patch.head.has_value()) destination.head = InterpolatePose(start.head, end.head, alpha);
-	if (patch.leftGrip.has_value()) destination.leftGrip = InterpolatePose(start.leftGrip, end.leftGrip, alpha);
-	if (patch.leftAim.has_value()) destination.leftAim = InterpolatePose(start.leftAim, end.leftAim, alpha);
-	if (patch.rightGrip.has_value()) destination.rightGrip = InterpolatePose(start.rightGrip, end.rightGrip, alpha);
-	if (patch.rightAim.has_value()) destination.rightAim = InterpolatePose(start.rightAim, end.rightAim, alpha);
 }
 
 bool ButtonValue(const ControllerState& state, size_t index)
@@ -573,9 +541,44 @@ void RecordDigitalChanges(TimelineEpoch& epoch, int64_t offset, const SimState& 
 	}
 }
 
+void ApplyImpliedTouches(ControllerState& controller, bool left)
+{
+	controller.touches[0] = controller.touches[0] || controller.buttons[0];
+	controller.touches[1] = controller.touches[1] || controller.buttons[1];
+	controller.touches[2] = controller.touches[2] || controller.buttons[left ? 3 : 2] || controller.thumbstick.x != 0.0f || controller.thumbstick.y != 0.0f;
+	controller.touches[3] = controller.touches[3] || controller.trigger > 0.0f;
+}
+
+// Oculus Touch cannot press, pull or deflect a control without touching it, so effective touch is authored touch or implied touch.
+void ApplyImpliedTouches(SimState& state)
+{
+	ApplyImpliedTouches(state.left, true);
+	ApplyImpliedTouches(state.right, false);
+}
+
+SimState EvaluateEpoch(const TimelineEpoch& epoch, int64_t offset)
+{
+	const auto next = std::upper_bound(epoch.samples.begin(), epoch.samples.end(), offset, [](int64_t value, const TimelineSample& sample) { return value < sample.offsetNs; });
+	if (next == epoch.samples.begin())
+	{
+		return epoch.samples.front().state;
+	}
+	const TimelineSample& previous = *(next - 1);
+	if (next == epoch.samples.end() || next->interpolation == Interpolation::Step)
+	{
+		return previous.state;
+	}
+	const float alpha = Ease(next->interpolation, static_cast<float>(static_cast<double>(offset - previous.offsetNs) / static_cast<double>(next->offsetNs - previous.offsetNs)));
+	SimState result = previous.state;
+	result.head = InterpolatePose(previous.state.head, next->state.head, alpha);
+	result.leftGrip = InterpolatePose(previous.state.leftGrip, next->state.leftGrip, alpha);
+	result.rightGrip = InterpolatePose(previous.state.rightGrip, next->state.rightGrip, alpha);
+	return result;
+}
+
 std::shared_ptr<TimelineEpoch> CompileTimeline(const Json& input, std::string& error)
 {
-	if (!HasOnly(input, {"schemaVersion", "durationSeconds", "sampleRateHz", "interpolation", "initial", "keyframes"}, error)) return {};
+	if (!HasOnly(input, {"schemaVersion", "durationSeconds", "interpolation", "initial", "keyframes"}, error)) return {};
 	if (!input.contains("schemaVersion") || !input.at("schemaVersion").is_number_integer() || input.at("schemaVersion").get<int>() != 1)
 	{
 		error = "schemaVersion must be 1";
@@ -592,17 +595,6 @@ std::shared_ptr<TimelineEpoch> CompileTimeline(const Json& input, std::string& e
 	{
 		error = "durationSeconds is below one nanosecond";
 		return {};
-	}
-	uint32_t sampleRate = 90;
-	if (input.contains("sampleRateHz"))
-	{
-		double value = 0.0;
-		if (!Number(input.at("sampleRateHz"), value) || value < 1.0 || value > 240.0 || std::floor(value) != value)
-		{
-			error = "sampleRateHz must be an integer in [1,240]";
-			return {};
-		}
-		sampleRate = static_cast<uint32_t>(value);
 	}
 	Interpolation interpolation = Interpolation::Linear;
 	if (input.contains("interpolation") && !ParseInterpolation(input.at("interpolation"), interpolation, error)) return {};
@@ -629,7 +621,7 @@ std::shared_ptr<TimelineEpoch> CompileTimeline(const Json& input, std::string& e
 	int64_t previousTime = -1;
 	for (const Json& item : input.at("keyframes"))
 	{
-		if (!HasOnly(item, {"timeSeconds", "interpolation", "sampleRateHz", "state"}, error)) return {};
+		if (!HasOnly(item, {"timeSeconds", "interpolation", "state"}, error)) return {};
 		if (!item.contains("timeSeconds") || !item.contains("state"))
 		{
 			error = "keyframe requires timeSeconds and state";
@@ -644,17 +636,6 @@ std::shared_ptr<TimelineEpoch> CompileTimeline(const Json& input, std::string& e
 		previousTime = frame.timeNs;
 		frame.interpolation = interpolation;
 		if (item.contains("interpolation") && !ParseInterpolation(item.at("interpolation"), frame.interpolation, error)) return {};
-		frame.sampleRateHz = sampleRate;
-		if (item.contains("sampleRateHz"))
-		{
-			double value = 0.0;
-			if (!Number(item.at("sampleRateHz"), value) || value < 1.0 || value > 240.0 || std::floor(value) != value)
-			{
-				error = "keyframe sampleRateHz must be an integer in [1,240]";
-				return {};
-			}
-			frame.sampleRateHz = static_cast<uint32_t>(value);
-		}
 		if (!ParseStatePatch(item.at("state"), frame.patch, error, false)) return {};
 		keyframes.push_back(std::move(frame));
 	}
@@ -665,9 +646,7 @@ std::shared_ptr<TimelineEpoch> CompileTimeline(const Json& input, std::string& e
 	}
 	auto epoch = std::make_shared<TimelineEpoch>();
 	epoch->durationNs = durationNs;
-	epoch->sampleRateHz = sampleRate;
-	epoch->samples.push_back({0, state});
-	int64_t previous = 0;
+	epoch->samples.push_back({0, Interpolation::Step, state});
 	for (const Keyframe& frame : keyframes)
 	{
 		const SimState start = state;
@@ -683,33 +662,16 @@ std::shared_ptr<TimelineEpoch> CompileTimeline(const Json& input, std::string& e
 			error = "compiled timeline exceeds 100000 samples and transitions";
 			return {};
 		}
-		const int64_t interval = frame.timeNs - previous;
-		const int64_t step = std::max<int64_t>(1, static_cast<int64_t>(std::llround(1000000000.0 / static_cast<double>(frame.sampleRateHz))));
-		if (frame.interpolation != Interpolation::Step)
+		if (epoch->samples.back().offsetNs == frame.timeNs)
 		{
-			for (int64_t at = previous + step; at < frame.timeNs; at += step)
-			{
-				if (epoch->samples.size() + epoch->digitalChanges.size() >= 100000)
-				{
-					error = "compiled timeline exceeds 100000 samples and transitions";
-					return {};
-				}
-				const float alpha = Ease(frame.interpolation, static_cast<float>(at - previous) / static_cast<float>(interval));
-				SimState interpolated = start;
-				InterpolateChanged(interpolated, start, target, frame.patch, alpha);
-				epoch->samples.push_back({at, interpolated});
-			}
-		}
-		if (!epoch->samples.empty() && epoch->samples.back().offsetNs == frame.timeNs)
-		{
+			epoch->samples.back().interpolation = frame.interpolation;
 			epoch->samples.back().state = target;
 		}
 		else
 		{
-			epoch->samples.push_back({frame.timeNs, target});
+			epoch->samples.push_back({frame.timeNs, frame.interpolation, target});
 		}
 		state = target;
-		previous = frame.timeNs;
 	}
 	if (epoch->samples.size() + epoch->digitalChanges.size() > 100000)
 	{
@@ -759,7 +721,7 @@ Json ControllerJson(const ControllerState& state, bool left)
 
 Json StateJson(const SimState& state)
 {
-	return {{"focused", state.focused}, {"head", PoseJson(state.head)}, {"leftGrip", PoseJson(state.leftGrip)}, {"leftAim", PoseJson(state.leftAim)}, {"rightGrip", PoseJson(state.rightGrip)}, {"rightAim", PoseJson(state.rightAim)}, {"left", ControllerJson(state.left, true)}, {"right", ControllerJson(state.right, false)}};
+	return {{"focused", state.focused}, {"head", PoseJson(state.head)}, {"leftGrip", PoseJson(state.leftGrip)}, {"rightGrip", PoseJson(state.rightGrip)}, {"left", ControllerJson(state.left, true)}, {"right", ControllerJson(state.right, false)}};
 }
 
 Json FrameJson(const FrameRecord& frame)
@@ -845,16 +807,11 @@ SimState Session::StateAtLocked(XrTime time, std::shared_ptr<const TimelineEpoch
 			}
 		}
 	}
+	SimState result;
 	if (epoch != nullptr)
 	{
 		const int64_t offset = std::max<int64_t>(0, std::min<int64_t>(epoch->durationNs, time - startTime));
-		SimState result = epoch->samples.empty() ? fallbackState : epoch->samples.front().state;
-		auto found = std::upper_bound(epoch->samples.begin(), epoch->samples.end(), offset, [](int64_t value, const TimelineSample& sample) { return value < sample.offsetNs; });
-		if (found != epoch->samples.begin())
-		{
-			--found;
-			result = found->state;
-		}
+		result = EvaluateEpoch(*epoch, offset);
 		if (current && inputsNeutralized)
 		{
 			neutralize(result);
@@ -863,17 +820,20 @@ SimState Session::StateAtLocked(XrTime time, std::shared_ptr<const TimelineEpoch
 		{
 			*selectedEpoch = epoch;
 		}
-		return result;
 	}
-	if (selectedEpoch != nullptr)
+	else
 	{
-		selectedEpoch->reset();
+		if (selectedEpoch != nullptr)
+		{
+			selectedEpoch->reset();
+		}
+		result = previousFallbackState.has_value() ? previousFallbackState.value() : fallbackState;
+		if (inputsNeutralized)
+		{
+			neutralize(result);
+		}
 	}
-	SimState result = previousFallbackState.has_value() ? previousFallbackState.value() : fallbackState;
-	if (inputsNeutralized)
-	{
-		neutralize(result);
-	}
+	ApplyImpliedTouches(result);
 	return result;
 }
 
@@ -1208,6 +1168,16 @@ void Session::InvalidateChildren()
 		}
 	}
 	swapchains.clear();
+	for (XrHandTrackerEXT handle : handTrackers)
+	{
+		if (handle != XR_NULL_HANDLE && handle->object != nullptr)
+		{
+			handle->alive = false;
+			delete handle->object;
+			handle->object = nullptr;
+		}
+	}
+	handTrackers.clear();
 	actionSets.clear();
 }
 

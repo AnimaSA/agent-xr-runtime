@@ -1,0 +1,18 @@
+{
+  "interactionProfile": "/interaction_profiles/oculus/touch_controller",
+  "source": {
+    "runtimeName": "agent-xr-smoke fixture",
+    "runtimeVersion": "0.0.0",
+    "systemName": "agent-xr-smoke fixture",
+    "sampleCount": 0,
+    "measuredAtUtc": "2026-01-01T00:00:00Z"
+  },
+  "left": {
+    "aimFromGrip": {"position": [0.01, -0.02, -0.04], "orientation": [-0.5, 0.0, 0.0, 0.8660254038]},
+    "palmFromGrip": {"position": [0.005, 0.0, 0.03], "orientation": [0.0, 0.1736481777, 0.0, 0.984807753]}
+  },
+  "right": {
+    "aimFromGrip": {"position": [-0.01, -0.02, -0.04], "orientation": [-0.5, 0.0, 0.0, 0.8660254038]},
+    "palmFromGrip": {"position": [-0.005, 0.0, 0.03], "orientation": [0.0, -0.1736481777, 0.0, 0.984807753]}
+  }
+}

@@ -49,6 +49,7 @@ struct Space;
 struct ActionSet;
 struct Action;
 struct Swapchain;
+struct HandTracker;
 struct TimelineEpoch;
 
 inline constexpr uint64_t kInstanceMagic = 0x415852494E535441ULL;
@@ -57,6 +58,7 @@ inline constexpr uint64_t kSpaceMagic = 0x4158525350414345ULL;
 inline constexpr uint64_t kActionSetMagic = 0x4158524153545345ULL;
 inline constexpr uint64_t kActionMagic = 0x415852414354494FULL;
 inline constexpr uint64_t kSwapchainMagic = 0x4158525357415043ULL;
+inline constexpr uint64_t kHandTrackerMagic = 0x41585248414E4454ULL;
 inline constexpr size_t kMaxOutstandingFrames = 1024;
 
 struct Vec3
@@ -99,9 +101,7 @@ struct SimState
 	bool focused = true;
 	TrackedPose head;
 	TrackedPose leftGrip;
-	TrackedPose leftAim;
 	TrackedPose rightGrip;
-	TrackedPose rightAim;
 	ControllerState left;
 	ControllerState right;
 };
@@ -109,6 +109,33 @@ struct SimState
 SimState DefaultSimState();
 XrPosef ToXrPose(const TrackedPose& pose);
 TrackedPose FromXrPose(const XrPosef& pose);
+
+enum class Interpolation : uint8_t
+{
+	Step,
+	Linear,
+	EaseIn,
+	EaseOut,
+	EaseInOut
+};
+
+// Rigid, device-specific poses of the aim and palm spaces expressed in the grip space.
+// Measured from a physical runtime by the calibration tool; see LoadDeviceProfile.
+struct HandProfile
+{
+	XrPosef aimFromGrip;
+	XrPosef palmFromGrip;
+};
+
+struct DeviceProfile
+{
+	HandProfile left;
+	HandProfile right;
+};
+
+// Reads profiles/oculus-touch-controller.json next to the runtime DLL. On failure logs the expected path and the calibration command and returns false.
+bool LoadDeviceProfile();
+DeviceProfile GetDeviceProfile();
 
 struct DiscreteChange
 {
@@ -122,6 +149,7 @@ struct DiscreteChange
 struct TimelineSample
 {
 	int64_t offsetNs = 0;
+	Interpolation interpolation = Interpolation::Linear;
 	SimState state;
 };
 
@@ -129,7 +157,7 @@ struct TimelineEpoch
 {
 	uint64_t id = 0;
 	int64_t durationNs = 0;
-	uint32_t sampleRateHz = 90;
+	// Authored waypoints. Each sample's interpolation shapes the segment that ends at it.
 	std::vector<TimelineSample> samples;
 	std::vector<DiscreteChange> digitalChanges;
 };
@@ -268,6 +296,7 @@ enum class SpaceKind : uint8_t
 enum class InputKind : uint8_t
 {
 	Button,
+	Proximity,
 	Touch,
 	Trigger,
 	Squeeze,
@@ -309,7 +338,17 @@ struct Instance
 	std::atomic<bool> closing{false};
 	bool d3d12Enabled = false;
 	std::atomic<bool> graphicsRequirementsQueried{false};
+	// Core 1.1 (or XR_EXT_local_floor on a 1.0 instance) exposes LOCAL_FLOOR.
 	bool localFloorEnabled = false;
+	// True when the application created the instance with apiVersion 1.1.
+	bool version11 = false;
+	bool compositionLayerDepthEnabled = false;
+	bool palmPoseEnabled = false;
+	bool activeActionSetPriorityEnabled = false;
+	bool handTrackingEnabled = false;
+	bool eyeGazeEnabled = false;
+	bool locateSpacesEnabled = false;
+	bool maintenance1Enabled = false;
 	XrSystemId systemId = 1;
 	std::string instanceId;
 	std::filesystem::path manifestPath;
@@ -392,6 +431,7 @@ struct Session
 	std::vector<XrSpace> spaces;
 	std::vector<XrActionSet> actionSets;
 	std::vector<XrSwapchain> swapchains;
+	std::vector<XrHandTrackerEXT> handTrackers;
 	Compositor* compositor = nullptr;
 	ID3D12Device* device = nullptr;
 	ID3D12CommandQueue* queue = nullptr;
@@ -424,6 +464,31 @@ struct Space
 	XrAction action = XR_NULL_HANDLE;
 	XrPath subactionPath = XR_NULL_PATH;
 };
+
+struct HandTracker
+{
+	XrHandTrackerEXT_T* handle = nullptr;
+	Session* session = nullptr;
+	XrHandEXT hand = XR_HAND_LEFT_EXT;
+};
+
+// Pose of `space` in `base` at `time`, with the velocity of that relative pose.
+// velocityFlags stay zero unless withVelocity is set and the pose was valid at time and time +/- 0.5 ms.
+struct RelativeMotion
+{
+	XrSpaceLocationFlags locationFlags = 0;
+	XrPosef pose{{0.0f, 0.0f, 0.0f, 1.0f}, {0.0f, 0.0f, 0.0f}};
+	XrSpaceVelocityFlags velocityFlags = 0;
+	XrVector3f linearVelocity{0.0f, 0.0f, 0.0f};
+	XrVector3f angularVelocity{0.0f, 0.0f, 0.0f};
+};
+
+// Returns XR_ERROR_TIME_INVALID for an unlocatable time; handles must already be validated and share a session.
+XrResult LocateRelative(Space& space, Space& base, XrTime time, bool withVelocity, RelativeMotion& motion);
+
+// The single path -> tracking-origin pose resolver. Handles /user/head and /user/hand/{left,right}/input/{grip,aim,palm_ext,grip_surface}/pose.
+// Aim and palm poses are grip composed with the device profile. Unknown paths and inactive controllers yield an untracked, invalid pose.
+TrackedPose ResolveInputPose(const SimState& state, std::string_view path);
 
 struct ActionSet
 {
@@ -477,6 +542,7 @@ struct Swapchain
 	std::deque<uint32_t> waitedIndices;
 	uint32_t lastReleasedIndex = UINT32_MAX;
 	bool staticImage = false;
+	bool depth = false;
 	bool destroyed = false;
 };
 
@@ -610,6 +676,7 @@ bool IsValidSpace(XrSpace handle);
 bool IsValidActionSet(XrActionSet handle);
 bool IsValidAction(XrAction handle);
 bool IsValidSwapchain(XrSwapchain handle);
+bool IsValidHandTracker(XrHandTrackerEXT handle);
 XrResult CheckType(const void* structure, XrStructureType expected);
 XrResult CheckOutput(void* structure, XrStructureType expected);
 XrResult EnumerateArray(uint32_t capacity, uint32_t* count, void* values, size_t elementSize, const void* source, uint32_t sourceCount);
@@ -660,6 +727,13 @@ struct XrSwapchain_T
 	bool alive = true;
 };
 
+struct XrHandTrackerEXT_T
+{
+	uint64_t magic = agentxr::kHandTrackerMagic;
+	agentxr::HandTracker* object = nullptr;
+	bool alive = true;
+};
+
 #define AGENTXR_API __declspec(dllexport)
 
 extern "C"
@@ -683,6 +757,7 @@ AGENTXR_API XRAPI_ATTR XrResult XRAPI_CALL xrCreateReferenceSpace(XrSession sess
 AGENTXR_API XRAPI_ATTR XrResult XRAPI_CALL xrGetReferenceSpaceBoundsRect(XrSession session, XrReferenceSpaceType referenceSpaceType, XrExtent2Df* bounds);
 AGENTXR_API XRAPI_ATTR XrResult XRAPI_CALL xrCreateActionSpace(XrSession session, const XrActionSpaceCreateInfo* createInfo, XrSpace* space);
 AGENTXR_API XRAPI_ATTR XrResult XRAPI_CALL xrLocateSpace(XrSpace space, XrSpace baseSpace, XrTime time, XrSpaceLocation* location);
+AGENTXR_API XRAPI_ATTR XrResult XRAPI_CALL xrLocateSpaces(XrSession session, const XrSpacesLocateInfo* locateInfo, XrSpaceLocations* spaceLocations);
 AGENTXR_API XRAPI_ATTR XrResult XRAPI_CALL xrDestroySpace(XrSpace space);
 AGENTXR_API XRAPI_ATTR XrResult XRAPI_CALL xrEnumerateViewConfigurations(XrInstance instance, XrSystemId systemId, uint32_t capacity, uint32_t* count, XrViewConfigurationType* types);
 AGENTXR_API XRAPI_ATTR XrResult XRAPI_CALL xrGetViewConfigurationProperties(XrInstance instance, XrSystemId systemId, XrViewConfigurationType type, XrViewConfigurationProperties* properties);
@@ -721,5 +796,8 @@ AGENTXR_API XRAPI_ATTR XrResult XRAPI_CALL xrGetInputSourceLocalizedName(XrSessi
 AGENTXR_API XRAPI_ATTR XrResult XRAPI_CALL xrApplyHapticFeedback(XrSession session, const XrHapticActionInfo* actionInfo, const XrHapticBaseHeader* feedback);
 AGENTXR_API XRAPI_ATTR XrResult XRAPI_CALL xrStopHapticFeedback(XrSession session, const XrHapticActionInfo* actionInfo);
 AGENTXR_API XRAPI_ATTR XrResult XRAPI_CALL xrGetD3D12GraphicsRequirementsKHR(XrInstance instance, XrSystemId systemId, XrGraphicsRequirementsD3D12KHR* requirements);
+AGENTXR_API XRAPI_ATTR XrResult XRAPI_CALL xrCreateHandTrackerEXT(XrSession session, const XrHandTrackerCreateInfoEXT* createInfo, XrHandTrackerEXT* handTracker);
+AGENTXR_API XRAPI_ATTR XrResult XRAPI_CALL xrDestroyHandTrackerEXT(XrHandTrackerEXT handTracker);
+AGENTXR_API XRAPI_ATTR XrResult XRAPI_CALL xrLocateHandJointsEXT(XrHandTrackerEXT handTracker, const XrHandJointsLocateInfoEXT* locateInfo, XrHandJointLocationsEXT* locations);
 AGENTXR_API XRAPI_ATTR XrResult XRAPI_CALL xrNegotiateLoaderRuntimeInterface(const XrNegotiateLoaderInfo* loaderInfo, XrNegotiateRuntimeRequest* runtimeRequest);
 }

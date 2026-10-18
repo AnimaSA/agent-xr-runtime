@@ -7,8 +7,8 @@ AgentXR does not replace the machine-wide OpenXR runtime. Launch helpers set `XR
 ## Current scope
 
 - Windows x64
-- OpenXR 1.0 runtime interface
-- `XR_KHR_D3D12_enable`
+- OpenXR 1.0 and 1.1 runtime interface
+- Extensions: `XR_KHR_D3D12_enable`, `XR_EXT_local_floor`, `XR_KHR_composition_layer_depth`, `XR_EXT_palm_pose`, `XR_EXT_active_action_set_priority`, `XR_EXT_hand_tracking`, `XR_EXT_eye_gaze_interaction`, `XR_KHR_locate_spaces`, `XR_KHR_maintenance1`
 - Primary stereo view configuration
 - `LOCAL`, `STAGE`, `VIEW`, and `LOCAL_FLOOR_EXT` spaces
 - Binding validation for nine OpenXR 1.0 core interaction profiles; input emulation for `/interaction_profiles/oculus/touch_controller`
@@ -16,7 +16,9 @@ AgentXR does not replace the machine-wide OpenXR runtime. Launch helpers set `XR
 - Deterministic schema-version-1 timelines
 - Local named-pipe control, MCP orchestration, frame reports, and PNG capture
 
-Not implemented: headset display hardware, passthrough, hand tracking, eye tracking, audio, Vulkan, OpenGL, or non-Windows platforms.
+`XR_EXT_hand_tracking` is exposed with hand joints always inactive (controllers are held). `XR_EXT_eye_gaze_interaction` is exposed with `supportsEyeGazeInteraction` false.
+
+Not implemented: headset display hardware, passthrough, audio, Vulkan, OpenGL, or non-Windows platforms.
 
 ## Requirements
 
@@ -45,6 +47,9 @@ Installed files:
 - `dist/agent-xr-smoke.exe` — native smoke runner
 - `dist/launch-agentxr-editor.ps1` — process-scoped shortcut launcher
 - `dist/examples/*.json` — generic timeline examples
+- `dist/agent-xr-calibrate.exe` — device calibration tool
+- `dist/profiles/oculus-touch-controller.json` — measured device profile; installed only when `profiles/oculus-touch-controller.json` exists in the source tree (see [Device calibration](#device-calibration))
+- `dist/test-fixtures/oculus-touch-controller.json` — non-identity test profile used by `agent-xr-smoke` only
 
 Manifest uses `runtime.library_path: "./AgentXRRuntime.dll"` so vendored loader resolves DLL beside manifest. Bare DLL names use DLL search order. Use absolute `library_path` when comparing separate runtime builds; launch helpers already generate absolute paths.
 
@@ -136,7 +141,6 @@ Root fields:
 {
   "schemaVersion": 1,
   "durationSeconds": 2.0,
-  "sampleRateHz": 90,
   "interpolation": "linear",
   "initial": {},
   "keyframes": []
@@ -153,7 +157,7 @@ Supported interpolation modes:
 - `ease_out`
 - `ease_in_out`
 
-Pose validity and tracking default to `true`. Tracked state requires corresponding valid state. Digital input and tracking changes occur discretely at keyframe time.
+Pose validity and tracking default to `true`. Tracked state requires corresponding valid state. Poses follow the interpolation mode between keyframes. Digital input, analog input (trigger, squeeze, thumbstick), activity, and tracking changes occur discretely at keyframe time; author intermediate keyframes for an analog ramp.
 
 `initial.focused` and `keyframes[].state.focused` accept optional Boolean values, defaulting to `true`. Focus changes are discrete under every interpolation mode. `false` changes session from `FOCUSED` to `VISIBLE` during `xrWaitFrame`; frames and composition continue. `true` restores `FOCUSED` without changing session generation. No `xrSyncActions` call is needed to apply focus transitions. Cancellation or replacement resets focus and neutralizes input before the next timeline applies.
 
@@ -163,11 +167,33 @@ Controller inputs follow core Oculus Touch profile:
 
 - Left buttons: `x`, `y`, `menu`, `thumbstick`
 - Right buttons: `a`, `b`, `thumbstick`
-- Touches: face buttons, `thumbstick`, `trigger`
+- Touches: face buttons, `thumbstick`, `trigger`, `thumbrest`
 - Analog: `trigger`, `squeeze`, `thumbstick`
-- Poses: `grip`, `aim`
+- Poses: `grip` only. Aim and palm poses are derived from grip with the device profile (`/user/hand/{left,right}/input/aim/pose`, `palm_ext/pose`, `grip_surface/pose`); the timeline has no `aim` key.
+
+Pose model:
+
+- Pose at any `XrTime` is the exact evaluation of the authored curve at that time. There is no sample-rate quantization and no `sampleRateHz` field.
+- `xrLocateSpace` reports real linear and angular velocity of the located space relative to the base space (central difference of the exact evaluator over ±0.5 ms). Velocity validity flags are set only when velocity is computed.
+- Oculus Touch cannot press, pull, or deflect a control without touching it. Effective touch is authored touch OR implied touch: trigger value above zero implies trigger touch; an `a`, `b`, `x`, or `y` click implies that button's touch; a thumbstick click or nonzero deflection implies thumbstick touch.
 
 See `examples/neutral.json`, `examples/motion-and-input.json`, `examples/tracking-recovery.json`, and `examples/focus-recovery.json`.
+
+## Device calibration
+
+On a real runtime, aim and palm poses are rigid, device-specific offsets of the grip pose. AgentXR derives both from grip using a measured profile and refuses to create an instance without it.
+
+`agent-xr-calibrate` measures those offsets for physical Oculus Touch controllers: per hand it locates aim and palm (`grip_surface` on OpenXR 1.1, `palm_ext` with `XR_EXT_palm_pose` on 1.0) in grip space, collects samples while both controllers are fully tracked, rejects the run if any sample deviates from the mean by more than 1 mm or 0.5°, and writes the averaged offsets.
+
+```powershell
+./dist/agent-xr-calibrate.exe --out ./profiles/oculus-touch-controller.json [--samples 300]
+```
+
+Run it once, with the physical headset worn and the physical runtime (SteamVR, Meta, Virtual Desktop, ...) active; hold both controllers naturally and keep them tracked. It refuses to run against AgentXR, requires `/interaction_profiles/oculus/touch_controller` on both hands, and writes no file on failure. Exit codes: `0` success, `1` measurement or runtime failure, `2` usage error.
+
+Runtime loads the profile in `xrCreateInstance` from the file named by the `AGENTXR_DEVICE_PROFILE` environment variable when it is set and non-empty, otherwise from `<runtime DLL dir>/profiles/oculus-touch-controller.json`. A missing or invalid file fails `xrCreateInstance` with `XR_ERROR_RUNTIME_FAILURE`; stderr and the debugger output name the resolved absolute path, say whether it came from `AGENTXR_DEVICE_PROFILE`, and give the calibration command. There are no fallback values.
+
+`dist/profiles/` is populated only from calibration: save the calibration output to `profiles/oculus-touch-controller.json` in the source tree and re-run `cmake --install`. The installed `dist/test-fixtures/` profile is not a device profile; `agent-xr-smoke` sets `AGENTXR_DEVICE_PROFILE` to it (process-local) unless the variable is already set or `--device-profile <path>` is given.
 
 ## Native smoke checks
 
@@ -179,6 +205,7 @@ See `examples/neutral.json`, `examples/motion-and-input.json`, `examples/trackin
 ./dist/agent-xr-smoke.exe --runtime ./dist/agent-xr.json --scenario stereo-composition
 ./dist/agent-xr-smoke.exe --runtime ./dist/agent-xr.json --scenario timeline-actions
 ./dist/agent-xr-smoke.exe --runtime ./dist/agent-xr.json --scenario tracking-recovery
+./dist/agent-xr-smoke.exe --runtime ./dist/agent-xr.json --scenario pose-model
 ./dist/agent-xr-smoke.exe --runtime ./dist/agent-xr.json --scenario invalid-input
 ./dist/agent-xr-smoke.exe --runtime ./dist/agent-xr.json --scenario session-restart
 ./dist/agent-xr-smoke.exe --runtime ./dist/agent-xr.json --scenario pipelined-swapchain
@@ -187,9 +214,8 @@ See `examples/neutral.json`, `examples/motion-and-input.json`, `examples/trackin
 ./dist/agent-xr-smoke.exe --runtime ./dist/agent-xr.json --scenario report-lifetime
 ./dist/agent-xr-smoke.exe --runtime ./dist/agent-xr.json --scenario capture-wait
 ./dist/agent-xr-smoke.exe --runtime ./dist/agent-xr.json --scenario idle-client-shutdown
+./dist/agent-xr-smoke.exe --runtime ./dist/agent-xr.json --scenario openxr-11
 ```
-
-Smoke runner deliberately probes unsupported OpenXR 1.1 instance creation before falling back to 1.0; loader may print expected failed-create diagnostics while scenario still exits `0`.
 
 Smoke runner prints actual loaded runtime DLL and rejects a module that differs from manifest selection. Use absolute executable and manifest paths when comparing builds.
 
@@ -198,6 +224,7 @@ The smoke scenarios check:
 - `focus-recovery` checks VISIBLE rendering, unfocused input/haptic suppression, event-driven recovery with and without action sync, exact edge/timestamp semantics, cancellation, and replacement.
 - `binding-contract` checks strict paths, atomic suggestions, componentless conversion, ignored incompatible bindings, current profiles, ever-attached errors, and combined-hand Boolean edges.
 - `inactive-controller` checks neutral inactive values, recovery, and native pose validity/tracking independent from input activity.
+- `pose-model` checks that pose at an off-frame time is the exact timeline evaluation, that grip velocity is nonzero and matches the authored motion, that the aim pose equals grip composed with the device profile's `aimFromGrip`, that a trigger value without authored touch reports touch, and that `aim` and `sampleRateHz` timeline keys are rejected.
 - `stereo-composition` decodes the captured PNG with WIC, checks red left-eye and blue right-eye pixels, and verifies that a capture taken while a newer frame is waited but unended still matches the last completed frame's pixels and metadata.
 - `session-restart` checks inactive discovery (`sessionGeneration: 0`, `sessionRunning: false`, and `sessionState` present) and confirms a prior-generation binding is rejected after restarting the same session handle.
 - `report-lifetime` inserts a 60 ms stall during the run, then checks exact report equality after another 60 ms pause and ten live frames. Snapshot IDs and fresh captures advance; the later capture has `timelineId: 0`.
@@ -217,7 +244,7 @@ Each `RunReport` owns bounded per-run `frames`, `actionSyncs`, and `haptics`. Th
 
 `missedFrameCount` sums periods only for frames assigned to the run, saturates rather than wrapping, and sets `overflow` if the total exceeds its representable range.
 
-`focusTransitions`, `validityTransitions`, and `trackingTransitions` count applied frame-state changes, not authored keyframes that never reach a frame. Validity and tracking counters compare position/orientation flags across head and both hands' grip/aim poses. Digital edges occurring while unfocused or on an inactive controller remain unobserved rather than falsely delivered.
+`focusTransitions`, `validityTransitions`, and `trackingTransitions` count applied frame-state changes, not authored keyframes that never reach a frame. Validity and tracking counters compare position/orientation flags across head and both hands' grip poses. Digital edges occurring while unfocused or on an inactive controller remain unobserved rather than falsely delivered.
 
 Treat runtime error, stale capture, missed required input edge, or graphics-device failure as failed XR run even when application state appears correct.
 
